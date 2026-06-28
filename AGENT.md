@@ -1,7 +1,7 @@
 # AGENT.md — Workflow & Operating Guide
 
 This document is **for Claude (or any agent)** working on the digital twin platform.
-Read digital-twin/CLAUDE.md first — that is the law. This explains *how* to work within it.
+Read CLAUDE.md first — that is the law. This explains *how* to work within it.
 
 ---
 
@@ -277,7 +277,7 @@ When you finish a phase:
 
 ## 10. When you're stuck
 
-- **Reread digital-twin/CLAUDE.md.** Violations of the non-negotiables are common mistakes.
+- **Reread CLAUDE.md.** Violations of the non-negotiables are common mistakes.
 - **Check the folder structure.** Files go in specific places.
 - **Golden-result test first.** Write the test before the backend.
 - **Start with stubs.** Implement the interface, then fill it in.

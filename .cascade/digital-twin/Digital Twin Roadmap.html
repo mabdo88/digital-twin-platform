@@ -88,11 +88,11 @@
   <div class="cards">
     <div class="card">
       <div class="card-label">Rechecked against</div>
-      <p>Actual repo state on 2026-06-28: code, <code>zig build test</code> output, and <code>backend-audit.md</code> — not assumed from the original task list.</p>
+      <p>Actual repo state on 2026-06-29: code, <code>zig build test</code> / <code>zig build bench</code> output, and <code>backend-audit.md</code> — not assumed from the original task list.</p>
     </div>
     <div class="card">
       <div class="card-label">Known gap</div>
-      <p>HierarchicalStorage (2.3) is marked incomplete: its tree is built but never exploited by any query.</p>
+      <p>Phases 6 (synthetic generator), 7 (cost/recommendation layer), and 8 (DuckDB calibration) haven't been started yet.</p>
     </div>
   </div>
 
@@ -161,8 +161,8 @@ var PHASES = [
       { code: '4.3', title: 'Sensor placement rules', done: true, note: 'sensor_placer.zig DEFAULT_RULES implemented, matches spec §7.3.' },
       { code: '4.4', title: 'Validate against a real IFC file', done: true,
         note: 'ifc_validation_test.zig runs both real Revit IFC files in assets/IFC/ end-to-end (2490 + 364 sensors placed).' },
-      { code: '4.5', title: 'Document supported / skipped IFC types', done: false,
-        note: 'docs/IFC_SUPPORT.md does not exist yet.' }
+      { code: '4.5', title: 'Document supported / skipped IFC types', done: true,
+        note: 'docs/IFC_SUPPORT.md added 2026-06-29: entity-type table, supported relationships, position-resolution rules (rotation ignored, IfcSite not promoted), equipment/zone metadata extraction (area_m2 and age_days/efficiency always 0 — not extracted), sensor-eligible vs parsed-only types, malformed-input behavior, and the real-file validation numbers.' }
     ]
   },
   {
@@ -197,7 +197,7 @@ var PHASES = [
       { code: '7.2', title: 'Per-sensor-type recommendation', done: false, note: 'Not started.' },
       { code: '7.3', title: 'Cost model + formula', done: false, note: 'Not started — engine/benchmark/cost_model.zig does not exist.' },
       { code: '7.4', title: 'Naive vs optimised cost comparison', done: false, note: 'Not started.' },
-      { code: '7.5', title: 'JSON + Markdown output', done: false, note: 'Benchmark latency results already emit JSON + Markdown, but the Phase-7 report/recommendation layer does not exist yet.' }
+      { code: '7.5', title: 'JSON + Markdown output', done: false, note: 'Benchmark latency results emit JSON, Markdown, and now an interactive HTML dashboard too (engine/benchmark/report.zig, split out of runner.zig on 2026-06-28 to match the CLAUDE.md folder spec) — but the Phase-7 report/recommendation layer (winner-by-cost, not just winner-by-latency) still does not exist.' }
     ]
   },
   {
@@ -226,7 +226,7 @@ function render() {
   var donePct = Math.round((doneTasks / totalTasks) * 100);
 
   document.getElementById('subtitle').textContent =
-    'Headless storage-benchmarking engine · Zig + ECS · 8 phases · ' + totalTasks + ' tasks · rechecked 2026-06-28';
+    'Headless storage-benchmarking engine · Zig + ECS · 8 phases · ' + totalTasks + ' tasks · rechecked 2026-06-29';
   document.getElementById('donePct').textContent = donePct + '% complete';
   document.getElementById('doneFrac').textContent = doneTasks + ' / ' + totalTasks;
   document.getElementById('overallBar').style.width = donePct + '%';

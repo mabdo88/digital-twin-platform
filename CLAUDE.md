@@ -191,18 +191,34 @@ Reusable, repeatable procedures live in `.cascade/digital-twin/`:
 
 Follow these verbatim when the task matches; they encode the review checklist.
 
+The same folder also holds **status docs** (read as current state, not as procedures):
+
+- **`backend-audit.md`** — per-backend correctness verdict, rechecked against live
+  benchmark output. Read before touching a backend's internals.
+- **`Digital Twin Roadmap.html`** — the phase-by-phase completion tracker, rechecked
+  against actual repo state each time it's updated. Treat this as more current than
+  `AGENT.md`'s phase checklists, which have drifted from what was actually built
+  (e.g. `AGENT.md`'s Phase 3 query list no longer matches `queries.zig`).
+
 ---
 
 ## 10. Open decisions (track, don't silently assume)
 
-- **IFC wrapper:** prefer wrapping IfcOpenShell via Zig C-interop; fall back to a
-  minimal subset parser if integration is painful.
+- **IFC wrapper — resolved:** went with a hand-rolled subset parser (`ifc_parser.zig`),
+  not an IfcOpenShell C-interop wrapper. Validated end-to-end against two real Revit
+  IFC exports (see the Roadmap, Phase 4).
 - **Scale ceiling:** target 100,000 sensors for Phase 1; keep allocation strategy
-  able to grow.
-- **Report format:** emit **both** JSON and a human-readable Markdown report.
+  able to grow. Not yet exercised — the standalone synthetic generator (Phase 6)
+  doesn't exist yet, so the largest sensor count tested today is the benchmark
+  suite's "Large" tier (100 sensors, 500 readings each = 50,000 readings total).
+- **Report format:** emit JSON, a human-readable Markdown report, **and** an
+  interactive HTML dashboard — all three written by `engine/benchmark/report.zig`
+  (`latency.json`, `latency.md`, `benchmark.html`).
 - **Tiered strategies:** the platform *recommends* mixed strategies but only
   *benchmarks* single backends; recommendations come from per-query winners + cost.
-- **Calibration:** DuckDB is the primary calibration; vendor benchmarks are optional metadata.
+  Not yet built (Phase 7).
+- **Calibration:** DuckDB is the primary calibration; vendor benchmarks are optional
+  metadata. Not yet built (Phase 8).
 
 If a task forces one of these decisions, surface it in the PR description rather than
 quietly hard-coding a choice.
