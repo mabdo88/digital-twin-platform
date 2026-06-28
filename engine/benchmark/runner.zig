@@ -23,6 +23,7 @@ const ringbuffer = @import("../ecs/storage/backends/ringbuffer_storage.zig");
 const World = @import("../ecs/world.zig").World;
 const queries = @import("queries.zig");
 const metrics = @import("../ecs/systems/metrics_system.zig");
+const report = @import("report.zig");
 
 // ---------------------------------------------------------------------------
 // Backend registry — the canonical list of all storage backends.
@@ -602,15 +603,6 @@ fn printRow(scale_label: []const u8, query_name: []const u8, backend_name: []con
     });
 }
 
-/// One latency-table row, decoupled from how it's rendered.
-const RunRow = struct {
-    scale: []const u8,
-    query: []const u8,
-    backend: []const u8,
-    memory_bytes: usize,
-    stats: metrics.LatencyStats,
-};
-
 /// Time one (query, backend) pair on a freshly-ingested world and append its row.
 /// `spec` and `b` are comptime so World(b.T) and spec.func resolve statically.
 fn benchOne(
@@ -621,7 +613,7 @@ fn benchOne(
     iterations: u32,
     readings: []const sb.SensorReading,
     scale_label: []const u8,
-    rows: *std.ArrayList(RunRow),
+    rows: *std.ArrayList(report.RunRow),
 ) !void {
     var world = try World(b.T).init(allocator);
     defer world.deinit();
@@ -635,7 +627,7 @@ fn benchOne(
         .{&world} ++ spec.args,
     );
 
-    const row = RunRow{
+    const row = report.RunRow{
         .scale = scale_label,
         .query = spec.name,
         .backend = b.name,
@@ -657,7 +649,7 @@ pub const RunConfig = struct {
 /// Markdown + JSON. Callable outside a test so the Phase 7 report generator
 /// can drive it directly (Task 3.6 / 3.7).
 pub fn run(allocator: std.mem.Allocator, io: std.Io, config: RunConfig) !void {
-    var rows: std.ArrayList(RunRow) = .empty;
+    var rows: std.ArrayList(report.RunRow) = .empty;
     defer rows.deinit(allocator);
 
     std.debug.print("\n=== Multi-Scale Benchmark Suite ===\n", .{});
@@ -694,170 +686,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, config: RunConfig) !void {
     std.debug.print("=== end suite ===\n", .{});
 
     if (config.output_dir) |dir_path| {
-        try writeReports(allocator, io, dir_path, rows.items);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Report writers — Markdown (human-readable) + JSON (machine-readable).
-// Same data both ways, per spec 11 / CLAUDE.md §10 (Phase 7 will grow into
-// these; this is the minimum viable persistence today).
-// ---------------------------------------------------------------------------
-
-fn writeReports(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    dir_path: []const u8,
-    rows: []const RunRow,
-) !void {
-    const cwd = std.Io.Dir.cwd();
-    cwd.createDirPath(io, dir_path) catch |err| switch (err) {
-        error.PathAlreadyExists => {},
-        else => return err,
-    };
-
-    var dir = try cwd.openDir(io, dir_path, .{});
-    defer dir.close(io);
-
-    // ---- Markdown ----
-    var md: std.ArrayList(u8) = .empty;
-    defer md.deinit(allocator);
-
-    try md.print(allocator, "# Digital Twin — Multi-Scale Benchmark Results\n\n", .{});
-    try md.print(allocator, "- Seed: `{d}`\n", .{fixtures.SEED});
-    try md.print(allocator, "- Scale tiers: {d}\n", .{scale_tiers.len});
-    for (scale_tiers) |ds| {
-        const total = ds.num_sensors * ds.readings_per_sensor;
-        try md.print(allocator, "  - **{s}**: {d} sensors × {d} readings = {d} total, {d} iterations\n", .{
-            ds.name, ds.num_sensors, ds.readings_per_sensor, total, ds.iterations,
-        });
-    }
-    try md.print(allocator, "- Backends: TimeSeries, Columnar, Hierarchical, RingBuffer\n", .{});
-    try md.print(allocator, "- Historical rollups (Q7, Q8) exclude RingBuffer (evicts old data).\n\n", .{});
-
-    try md.print(allocator, "> Honesty headline: **relative rankings are reliable; absolute numbers are approximate.**\n\n", .{});
-
-    // Per-scale sections
-    for (scale_tiers) |ds| {
-        try md.print(allocator, "## Scale: {s} ({d} sensors × {d} readings = {d} total)\n\n", .{
-            ds.name, ds.num_sensors, ds.readings_per_sensor, ds.num_sensors * ds.readings_per_sensor,
-        });
-        try md.print(allocator, "| Query | Backend | median µs | p95 µs | p99 µs | mean µs | throughput (ops/s) | memory (KB) |\n", .{});
-        try md.print(allocator, "|---|---|---:|---:|---:|---:|---:|---:|\n", .{});
-
-        for (rows) |r| {
-            if (!std.mem.eql(u8, r.scale, ds.name)) continue;
-            try md.print(allocator, "| {s} | {s} | {d:.1} | {d:.1} | {d:.1} | {d:.1} | {d:.0} | {d:.1} |\n", .{
-                r.query,
-                r.backend,
-                @as(f64, @floatFromInt(r.stats.median_ns)) / 1000.0,
-                @as(f64, @floatFromInt(r.stats.p95_ns)) / 1000.0,
-                @as(f64, @floatFromInt(r.stats.p99_ns)) / 1000.0,
-                @as(f64, @floatFromInt(r.stats.mean_ns)) / 1000.0,
-                r.stats.throughputOpsPerSec(),
-                @as(f64, @floatFromInt(r.memory_bytes)) / 1024.0,
-            });
-        }
-
-        try md.print(allocator, "\n### Per-query winner (lowest median)\n\n", .{});
-        try md.print(allocator, "| Query | Winner | Median µs | Runner-up | Median µs | Speedup |\n", .{});
-        try md.print(allocator, "|---|---|---:|---|---:|---:|\n", .{});
-        try writeWinners(&md, allocator, rows, ds.name);
-
-        try md.print(allocator, "\n", .{});
-    }
-
-    try dir.writeFile(io, .{ .sub_path = "latency.md", .data = md.items });
-
-    // ---- JSON ----
-    var js: std.ArrayList(u8) = .empty;
-    defer js.deinit(allocator);
-
-    try js.print(allocator, "{{\n", .{});
-    try js.print(allocator, "  \"seed\": {d},\n", .{fixtures.SEED});
-    try js.print(allocator, "  \"scale_tiers\": [\n", .{});
-    for (scale_tiers, 0..) |ds, i| {
-        try js.print(allocator, "    {{\"name\": \"{s}\", \"sensors\": {d}, \"readings_per_sensor\": {d}, \"iterations\": {d}}}{s}\n", .{
-            ds.name,                                   ds.num_sensors, ds.readings_per_sensor, ds.iterations,
-            if (i + 1 == scale_tiers.len) "" else ",",
-        });
-    }
-    try js.print(allocator, "  ],\n", .{});
-    try js.print(allocator, "  \"results\": [\n", .{});
-    for (rows, 0..) |r, i| {
-        try js.print(
-            allocator,
-            "    {{\"scale\": \"{s}\", \"query\": \"{s}\", \"backend\": \"{s}\", \"memory_bytes\": {d}, \"median_ns\": {d}, \"p95_ns\": {d}, \"p99_ns\": {d}, \"mean_ns\": {d}, \"min_ns\": {d}, \"max_ns\": {d}, \"throughput_ops_per_sec\": {d:.2}}}{s}\n",
-            .{
-                r.scale,                       r.query,
-                r.backend,                     r.memory_bytes,
-                r.stats.median_ns,             r.stats.p95_ns,
-                r.stats.p99_ns,                r.stats.mean_ns,
-                r.stats.min_ns,                r.stats.max_ns,
-                r.stats.throughputOpsPerSec(), if (i + 1 == rows.len) "" else ",",
-            },
-        );
-    }
-    try js.print(allocator, "  ]\n}}\n", .{});
-
-    try dir.writeFile(io, .{ .sub_path = "latency.json", .data = js.items });
-
-    std.debug.print("\nWrote {s}/latency.md and {s}/latency.json\n", .{ dir_path, dir_path });
-}
-
-/// For each unique query within a given scale, find the backend with the
-/// lowest median latency and the runner-up; emit a Markdown row.
-fn writeWinners(w: *std.ArrayList(u8), allocator: std.mem.Allocator, rows: []const RunRow, scale: []const u8) !void {
-    var seen_count: usize = 0;
-    var seen: [query_specs.len][]const u8 = undefined;
-
-    for (rows) |r| {
-        if (!std.mem.eql(u8, r.scale, scale)) continue;
-
-        var already = false;
-        for (seen[0..seen_count]) |s| {
-            if (std.mem.eql(u8, s, r.query)) {
-                already = true;
-                break;
-            }
-        }
-        if (already) continue;
-        seen[seen_count] = r.query;
-        seen_count += 1;
-
-        var best_idx: ?usize = null;
-        var second_idx: ?usize = null;
-        for (rows, 0..) |candidate, i| {
-            if (!std.mem.eql(u8, candidate.scale, scale)) continue;
-            if (!std.mem.eql(u8, candidate.query, r.query)) continue;
-            if (best_idx == null or candidate.stats.median_ns < rows[best_idx.?].stats.median_ns) {
-                second_idx = best_idx;
-                best_idx = i;
-            } else if (second_idx == null or candidate.stats.median_ns < rows[second_idx.?].stats.median_ns) {
-                second_idx = i;
-            }
-        }
-
-        if (best_idx) |bi| {
-            const best = rows[bi];
-            const best_us = @as(f64, @floatFromInt(best.stats.median_ns)) / 1000.0;
-            if (second_idx) |si| {
-                const second = rows[si];
-                const second_us = @as(f64, @floatFromInt(second.stats.median_ns)) / 1000.0;
-                const speedup = if (best.stats.median_ns > 0)
-                    @as(f64, @floatFromInt(second.stats.median_ns)) /
-                        @as(f64, @floatFromInt(best.stats.median_ns))
-                else
-                    0.0;
-                try w.print(allocator, "| {s} | **{s}** | {d:.1} | {s} | {d:.1} | {d:.2}× |\n", .{
-                    r.query, best.backend, best_us, second.backend, second_us, speedup,
-                });
-            } else {
-                try w.print(allocator, "| {s} | **{s}** | {d:.1} | — | — | — |\n", .{
-                    r.query, best.backend, best_us,
-                });
-            }
-        }
+        try report.writeReports(allocator, io, dir_path, rows.items);
     }
 }
 
