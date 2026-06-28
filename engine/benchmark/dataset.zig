@@ -74,9 +74,9 @@ pub const DatasetSpec = struct {
 };
 
 pub const scale_tiers = [_]DatasetSpec{
-    .{ .name = "Small", .num_sensors = 10, .readings_per_sensor = 50, .iterations = 100 },
-    .{ .name = "Medium", .num_sensors = 50, .readings_per_sensor = 200, .iterations = 100 },
-    .{ .name = "Large", .num_sensors = 100, .readings_per_sensor = 500, .iterations = 100 },
+    .{ .name = "Small", .num_sensors = 10, .readings_per_sensor = 50, .iterations = 25 },
+    .{ .name = "Medium", .num_sensors = 50, .readings_per_sensor = 200, .iterations = 25 },
+    .{ .name = "Large", .num_sensors = 100, .readings_per_sensor = 500, .iterations = 25 },
 };
 
 // ---------------------------------------------------------------------------

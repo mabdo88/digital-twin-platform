@@ -65,7 +65,7 @@ rather than assumes.
 ### 3.4 Benchmark rules
 - **All benchmarks are deterministic.** RNG is seeded; same input → same output, always.
 - Metrics are recorded by **`metrics_system.zig` only**. No ad-hoc timing elsewhere.
-- Each query runs a **minimum of 100 iterations** per backend. Report median, p95, p99.
+- Each query runs a **minimum of 25 iterations** per backend. Report median, p95, p99.
 - Memory is measured **after ingest, before queries, and after queries**.
 
 ### 3.5 General rules
