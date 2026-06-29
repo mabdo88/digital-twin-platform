@@ -149,11 +149,31 @@ pub fn generateDatasetScaled(
     return readings;
 }
 
-/// Insert a dataset into a world in slice order. Both equivalence partners
-/// must receive readings in the same order — deterministic insertion is
-/// critical for golden-result comparison.
+/// Insert a dataset into a world in slice order, and register each
+/// sensor's zone/floor per this fixture's topology convention (sensor_id
+/// / SENSORS_PER_ZONE, zone_id / ZONES_PER_FLOOR) — the same shape every
+/// zone/floor-aware query now expects to come from real registration
+/// (registerZone/registerFloor), not from arithmetic baked into the query
+/// itself. This is the ONE place that convention is allowed to live: a
+/// synthetic benchmark fixture choosing its own made-up topology, exactly
+/// the same way a real pipeline would call registerZone/registerFloor
+/// from sensor_placer.zig's real ZoneLocation/ZoneMetadata instead.
+/// Both equivalence partners must receive readings in the same order —
+/// deterministic insertion is critical for golden-result comparison.
 pub fn insertDataset(world: anytype, readings: []const sb.SensorReading) !void {
-    for (readings) |r| try world.insert(r);
+    var registered = std.AutoHashMap(u32, void).init(world.allocator);
+    defer registered.deinit();
+
+    for (readings) |r| {
+        try world.insert(r);
+        if (!registered.contains(r.sensor_id)) {
+            try registered.put(r.sensor_id, {});
+            const zone_id = r.sensor_id / SENSORS_PER_ZONE;
+            const floor_id = zone_id / ZONES_PER_FLOOR;
+            try world.registerZone(r.sensor_id, zone_id);
+            try world.registerFloor(zone_id, floor_id);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -19,6 +19,7 @@
 
 const std = @import("std");
 const sb = @import("../storage_backend.zig");
+const ZoneIndex = @import("../zone_index.zig");
 
 const SensorReading = sb.SensorReading;
 const SensorType = sb.SensorType;
@@ -41,6 +42,7 @@ allocator: std.mem.Allocator,
 sensors: std.AutoHashMap(u32, SensorBuffer),
 capacity_per_sensor: usize,
 total_count: usize,
+zone_index: ZoneIndex,
 
 pub fn init(allocator: std.mem.Allocator) !Self {
     return .{
@@ -48,6 +50,7 @@ pub fn init(allocator: std.mem.Allocator) !Self {
         .sensors = std.AutoHashMap(u32, SensorBuffer).init(allocator),
         .capacity_per_sensor = DEFAULT_CAPACITY_PER_SENSOR,
         .total_count = 0,
+        .zone_index = ZoneIndex.init(allocator),
     };
 }
 
@@ -57,6 +60,7 @@ pub fn deinit(self: *Self) void {
         self.allocator.free(entry.value_ptr.buffer);
     }
     self.sensors.deinit();
+    self.zone_index.deinit();
     self.* = undefined;
 }
 
@@ -96,7 +100,7 @@ pub fn memoryUsed(self: *const Self) usize {
     while (it.next()) |_| {
         total += self.capacity_per_sensor * @sizeOf(SensorReading);
     }
-    return total;
+    return total + self.zone_index.memoryUsed();
 }
 
 /// Iteration order: sorted by (timestamp asc, sensor_id asc).
@@ -164,20 +168,26 @@ pub fn rangeByTime(self: *const Self, allocator: std.mem.Allocator, q: RangeQuer
     return result.toOwnedSlice(allocator);
 }
 
-/// Unlike every other backend, this needs no scan at all: `sensors` is
-/// already keyed by sensor_id, so group membership is a direct filter over
-/// the hashmap's keys — O(num_sensors), not O(num_readings).
-pub fn sensorIdsByGroup(self: *const Self, allocator: std.mem.Allocator, group_id: u32, divisor: u32) ![]u32 {
-    var result: std.ArrayList(u32) = .empty;
-    defer result.deinit(allocator);
+/// Zone/floor topology bookkeeping delegates to the shared ZoneIndex — see
+/// storage_backend.zig's doc comment for the contract.
+pub fn registerZone(self: *Self, sensor_id: u32, zone_id: u32) !void {
+    return self.zone_index.registerZone(sensor_id, zone_id);
+}
 
-    var it = self.sensors.keyIterator();
-    while (it.next()) |sid| {
-        if (sid.* / divisor == group_id) try result.append(allocator, sid.*);
-    }
+pub fn registerFloor(self: *Self, zone_id: u32, floor_id: u32) !void {
+    return self.zone_index.registerFloor(zone_id, floor_id);
+}
 
-    std.mem.sort(u32, result.items, {}, std.sort.asc(u32));
-    return result.toOwnedSlice(allocator);
+pub fn sensorIdsByZone(self: *const Self, allocator: std.mem.Allocator, zone_id: u32) ![]u32 {
+    return self.zone_index.sensorIdsByZone(allocator, zone_id);
+}
+
+pub fn sensorIdsByFloor(self: *const Self, allocator: std.mem.Allocator, floor_id: u32) ![]u32 {
+    return self.zone_index.sensorIdsByFloor(allocator, floor_id);
+}
+
+pub fn floorOfZone(self: *const Self, zone_id: u32) ?u32 {
+    return self.zone_index.floorOfZone(zone_id);
 }
 
 // ---------------------------------------------------------------------------
@@ -272,6 +282,44 @@ test "RingBuffer: rangeByTime with sensor filter" {
     try std.testing.expectEqual(@as(usize, 2), result.len);
     try std.testing.expectEqual(@as(u32, 1), result[0].sensor_id);
     try std.testing.expectEqual(@as(u32, 1), result[1].sensor_id);
+}
+
+test "RingBuffer: sensorIdsByZone/sensorIdsByFloor reflect real (non-arithmetic) registration" {
+    var backend = try Self.init(std.testing.allocator);
+    defer backend.deinit();
+
+    try backend.insert(.{ .sensor_id = 7, .timestamp = 0, .value = 1.0, .sensor_type = .temperature });
+    try backend.insert(.{ .sensor_id = 2, .timestamp = 0, .value = 1.0, .sensor_type = .temperature });
+    try backend.registerZone(7, 4291);
+    try backend.registerZone(2, 4291);
+    try backend.registerFloor(4291, 3);
+
+    const zone = try backend.sensorIdsByZone(std.testing.allocator, 4291);
+    defer std.testing.allocator.free(zone);
+    try std.testing.expectEqualSlices(u32, &.{ 2, 7 }, zone);
+
+    const floor = try backend.sensorIdsByFloor(std.testing.allocator, 3);
+    defer std.testing.allocator.free(floor);
+    try std.testing.expectEqualSlices(u32, &.{ 2, 7 }, floor);
+
+    try std.testing.expectEqual(@as(?u32, 3), backend.floorOfZone(4291));
+
+    const empty = try backend.sensorIdsByZone(std.testing.allocator, 99);
+    defer std.testing.allocator.free(empty);
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
+}
+
+test "RingBuffer: getLatestBySensor is deterministic across repeated calls when timestamps tie" {
+    var backend = try Self.init(std.testing.allocator);
+    defer backend.deinit();
+
+    try backend.insert(.{ .sensor_id = 1, .timestamp = 100, .value = 10.0, .sensor_type = .temperature });
+    try backend.insert(.{ .sensor_id = 1, .timestamp = 100, .value = 20.0, .sensor_type = .temperature });
+
+    const first = backend.getLatestBySensor(1).?;
+    const second = backend.getLatestBySensor(1).?;
+    try std.testing.expectEqual(@as(i64, 100), first.timestamp);
+    try std.testing.expectEqual(first.value, second.value);
 }
 
 test "RingBuffer: empty backend" {

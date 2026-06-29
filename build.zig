@@ -12,6 +12,7 @@ pub fn build(b: *std.Build) void {
         "engine/benchmark_test.zig",
         "engine/metrics_test.zig",
         "engine/bim_test.zig",
+        "engine/synthetic_test.zig",
     };
 
     for (targets) |t| {
@@ -42,4 +43,18 @@ pub fn build(b: *std.Build) void {
     const run_bench = b.addRunArtifact(bench_exe);
     const bench_step = b.step("bench", "Run the benchmark suite and write reports to ./benchmark-results/");
     bench_step.dependOn(&run_bench.step);
+
+    // Main entrypoint — parse a real IFC file, place sensors, benchmark
+    // every backend against the building profile's query mix, write reports.
+    const main_exe = b.addExecutable(.{
+        .name = "digital-twin",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("engine/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_main = b.addRunArtifact(main_exe);
+    const run_step = b.step("run", "Parse an IFC file, place sensors, and benchmark storage backends (run zig-out/bin/digital-twin directly to pass --bim/--type/--out flags)");
+    run_step.dependOn(&run_main.step);
 }

@@ -60,8 +60,24 @@ pub fn World(comptime Backend: type) type {
             return self.backend.rangeByTime(self.allocator, q);
         }
 
-        pub fn sensorIdsByGroup(self: *const Self, group_id: u32, divisor: u32) ![]u32 {
-            return self.backend.sensorIdsByGroup(self.allocator, group_id, divisor);
+        pub fn registerZone(self: *Self, sensor_id: u32, zone_id: u32) !void {
+            return self.backend.registerZone(sensor_id, zone_id);
+        }
+
+        pub fn registerFloor(self: *Self, zone_id: u32, floor_id: u32) !void {
+            return self.backend.registerFloor(zone_id, floor_id);
+        }
+
+        pub fn sensorIdsByZone(self: *const Self, zone_id: u32) ![]u32 {
+            return self.backend.sensorIdsByZone(self.allocator, zone_id);
+        }
+
+        pub fn sensorIdsByFloor(self: *const Self, floor_id: u32) ![]u32 {
+            return self.backend.sensorIdsByFloor(self.allocator, floor_id);
+        }
+
+        pub fn floorOfZone(self: *const Self, zone_id: u32) ?u32 {
+            return self.backend.floorOfZone(zone_id);
         }
     };
 }
@@ -73,7 +89,10 @@ pub fn World(comptime Backend: type) type {
 
 const aos = @import("storage/backends/aos_storage.zig");
 const soa = @import("storage/backends/soa_storage.zig");
+const timeseries = @import("storage/backends/timeseries_storage.zig");
 const columnar = @import("storage/backends/columnar_storage.zig");
+const hierarchical = @import("storage/backends/hierarchical_storage.zig");
+const ringbuffer = @import("storage/backends/ringbuffer_storage.zig");
 const query_system = @import("systems/query_system.zig");
 
 fn insertTestData(world: anytype) !void {
@@ -87,141 +106,59 @@ fn insertTestData(world: anytype) !void {
     for (readings) |r| try world.insert(r);
 }
 
-test "World(AoS) instantiates and basic operations work" {
+// World(T) is a pure pass-through (every method is one line calling the
+// same-named backend method) — it has no branching of its own to cover per
+// backend. One instantiation smoke test is enough to prove the generic
+// wires up correctly; per-backend correctness is the backends' own test
+// files' job, and cross-backend agreement on the full seeded benchmark
+// dataset is runner.zig's "equivalence" suite, which covers all six
+// backends rather than just two.
+test "World(T) instantiates and wires through to the backend" {
+    var world = try World(hierarchical).init(std.testing.allocator);
+    defer world.deinit();
+
+    try insertTestData(&world);
+    try std.testing.expectEqual(@as(usize, 5), world.count());
+
+    const latest = world.getLatestBySensor(1).?;
+    try std.testing.expectEqual(@as(i64, 300), latest.timestamp);
+    try std.testing.expectEqual(@as(f32, 30.0), latest.value);
+}
+
+test "query_system functions work on World(T)" {
     var world = try World(aos).init(std.testing.allocator);
     defer world.deinit();
-
     try insertTestData(&world);
-    try std.testing.expectEqual(@as(usize, 5), world.count());
 
-    const latest = world.getLatestBySensor(1).?;
-    try std.testing.expectEqual(@as(i64, 300), latest.timestamp);
-    try std.testing.expectEqual(@as(f32, 30.0), latest.value);
+    try std.testing.expectEqual(@as(usize, 5), query_system.totalCount(&world));
+
+    const avg = try query_system.averageValue(&world);
+    try std.testing.expectApproxEqAbs(@as(f32, 20.0), avg, 0.01);
+
+    const avg_range = try query_system.averageValueInRange(&world, .{ .start_time = 100, .end_time = 200 });
+    try std.testing.expectApproxEqAbs(@as(f32, 15.0), avg_range, 0.01);
 }
 
-test "World(SoA) instantiates and basic operations work" {
-    var world = try World(soa).init(std.testing.allocator);
-    defer world.deinit();
-
-    try insertTestData(&world);
-    try std.testing.expectEqual(@as(usize, 5), world.count());
-
-    const latest = world.getLatestBySensor(1).?;
-    try std.testing.expectEqual(@as(i64, 300), latest.timestamp);
-    try std.testing.expectEqual(@as(f32, 30.0), latest.value);
-}
-
-test "World(Columnar) instantiates and basic operations work" {
-    var world = try World(columnar).init(std.testing.allocator);
-    defer world.deinit();
-
-    try insertTestData(&world);
-    try std.testing.expectEqual(@as(usize, 5), world.count());
-
-    const latest = world.getLatestBySensor(1).?;
-    try std.testing.expectEqual(@as(i64, 300), latest.timestamp);
-    try std.testing.expectEqual(@as(f32, 30.0), latest.value);
-}
-
-test "World(AoS) and World(SoA) produce identical query results" {
-    var world_aos = try World(aos).init(std.testing.allocator);
-    defer world_aos.deinit();
-    var world_soa = try World(soa).init(std.testing.allocator);
-    defer world_soa.deinit();
-
-    try insertTestData(&world_aos);
-    try insertTestData(&world_soa);
-
-    // count
-    try std.testing.expectEqual(world_aos.count(), world_soa.count());
-
-    // getLatestBySensor
-    const latest_aos = world_aos.getLatestBySensor(1).?;
-    const latest_soa = world_soa.getLatestBySensor(1).?;
-    try std.testing.expectEqual(latest_aos.timestamp, latest_soa.timestamp);
-    try std.testing.expectEqual(latest_aos.value, latest_soa.value);
-
-    // rangeByTime
-    const range_aos = try world_aos.rangeByTime(.{ .start_time = 100, .end_time = 200 });
-    defer world_aos.allocator.free(range_aos);
-    const range_soa = try world_soa.rangeByTime(.{ .start_time = 100, .end_time = 200 });
-    defer world_soa.allocator.free(range_soa);
-
-    try std.testing.expectEqual(range_aos.len, range_soa.len);
-    for (0..range_aos.len) |i| {
-        try std.testing.expectEqual(range_aos[i].sensor_id, range_soa[i].sensor_id);
-        try std.testing.expectEqual(range_aos[i].timestamp, range_soa[i].timestamp);
-        try std.testing.expectEqual(range_aos[i].value, range_soa[i].value);
+// Closes a real gap: before this, only AoS and Columnar had any assertion
+// that memoryUsed() is nonzero after insert — SoA, TimeSeries, Hierarchical,
+// and RingBuffer had zero coverage of this despite memoryUsed() feeding
+// directly into every benchmark report and the (future) cost model.
+//
+// NOTE: "zero bytes when empty" is NOT a cross-backend invariant — it was
+// an unstated assumption baked into the two pre-existing tests this one
+// replaces, true only because AoS/Columnar happen to allocate lazily.
+// Hierarchical pre-allocates a root tree node in init() (224 bytes before
+// any insert), which is real, intentional overhead, not a bug. The only
+// property every backend's contract actually promises is that memoryUsed()
+// reflects what's stored — so the universal check is growth, not a zero
+// floor.
+test "World(T) memoryUsed strictly grows after insert, for all six backends" {
+    const all_backends = .{ aos, soa, timeseries, columnar, hierarchical, ringbuffer };
+    inline for (all_backends) |Backend| {
+        var world = try World(Backend).init(std.testing.allocator);
+        defer world.deinit();
+        const before = world.memoryUsed();
+        try insertTestData(&world);
+        try std.testing.expect(world.memoryUsed() > before);
     }
-
-    // iterateAll
-    const all_aos = try world_aos.iterateAll();
-    defer world_aos.allocator.free(all_aos);
-    const all_soa = try world_soa.iterateAll();
-    defer world_soa.allocator.free(all_soa);
-
-    try std.testing.expectEqual(all_aos.len, all_soa.len);
-    for (0..all_aos.len) |i| {
-        try std.testing.expectEqual(all_aos[i].sensor_id, all_soa[i].sensor_id);
-        try std.testing.expectEqual(all_aos[i].timestamp, all_soa[i].timestamp);
-        try std.testing.expectEqual(all_aos[i].value, all_soa[i].value);
-    }
-}
-
-test "query_system functions work unchanged on World(AoS)" {
-    var world = try World(aos).init(std.testing.allocator);
-    defer world.deinit();
-    try insertTestData(&world);
-
-    try std.testing.expectEqual(@as(usize, 5), query_system.totalCount(&world));
-
-    const avg = try query_system.averageValue(&world);
-    try std.testing.expectApproxEqAbs(@as(f32, 20.0), avg, 0.01);
-
-    const avg_range = try query_system.averageValueInRange(&world, .{ .start_time = 100, .end_time = 200 });
-    try std.testing.expectApproxEqAbs(@as(f32, 15.0), avg_range, 0.01);
-}
-
-test "query_system functions work unchanged on World(SoA)" {
-    var world = try World(soa).init(std.testing.allocator);
-    defer world.deinit();
-    try insertTestData(&world);
-
-    try std.testing.expectEqual(@as(usize, 5), query_system.totalCount(&world));
-
-    const avg = try query_system.averageValue(&world);
-    try std.testing.expectApproxEqAbs(@as(f32, 20.0), avg, 0.01);
-
-    const avg_range = try query_system.averageValueInRange(&world, .{ .start_time = 100, .end_time = 200 });
-    try std.testing.expectApproxEqAbs(@as(f32, 15.0), avg_range, 0.01);
-}
-
-test "query_system functions work unchanged on World(Columnar)" {
-    var world = try World(columnar).init(std.testing.allocator);
-    defer world.deinit();
-    try insertTestData(&world);
-
-    try std.testing.expectEqual(@as(usize, 5), query_system.totalCount(&world));
-
-    const avg = try query_system.averageValue(&world);
-    try std.testing.expectApproxEqAbs(@as(f32, 20.0), avg, 0.01);
-
-    const avg_range = try query_system.averageValueInRange(&world, .{ .start_time = 100, .end_time = 200 });
-    try std.testing.expectApproxEqAbs(@as(f32, 15.0), avg_range, 0.01);
-}
-
-test "World(AoS) memoryUsed reports nonzero after insert" {
-    var world = try World(aos).init(std.testing.allocator);
-    defer world.deinit();
-    try std.testing.expectEqual(@as(usize, 0), world.memoryUsed());
-    try insertTestData(&world);
-    try std.testing.expect(world.memoryUsed() > 0);
-}
-
-test "World(Columnar) memoryUsed reports nonzero after insert" {
-    var world = try World(columnar).init(std.testing.allocator);
-    defer world.deinit();
-    try std.testing.expectEqual(@as(usize, 0), world.memoryUsed());
-    try insertTestData(&world);
-    try std.testing.expect(world.memoryUsed() > 0);
 }

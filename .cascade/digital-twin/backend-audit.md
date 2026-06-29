@@ -2,6 +2,7 @@
 
 _Reviewed Jun 28 2026 against benchmark results (3 scale tiers, 100 iterations each)._
 _Hierarchical re-verified 2026-06-28: tree-exploitation fix confirmed in code + benchmark, see update below._
+_Hierarchical revised again 2026-06-29: zone/floor grouping was coupled to dataset.zig's synthetic sensor_id arithmetic, which never matched a real building's actual zone assignment — see update below._
 
 ## Verdict per backend
 
@@ -11,7 +12,7 @@ _Hierarchical re-verified 2026-06-28: tree-exploitation fix confirmed in code + 
 | SoA | ✅ Correct | Parallel column layout genuinely different from AoS |
 | TimeSeries | ✅ Correct | Binary search on sorted log works correctly |
 | Columnar | ✅ Fixed | Delta compression now implemented and used — see update below |
-| Hierarchical | ✅ Fixed | Tree now exploited via `sensorIdsByGroup` — see update below |
+| Hierarchical | ✅ Fixed | Tree exploited via real registerZone/registerFloor topology, not sensor_id arithmetic — see update below |
 | RingBuffer | ✅ Correct | High memory by design (pre-allocated per sensor) |
 
 ---
@@ -41,3 +42,13 @@ All four original complaints are resolved in the current code:
 `query_avg_zone_type` / `query_floor_stats` are only modestly faster on Hierarchical (these aggregate per-reading values within a zone, not just list sensor IDs, so the `sensorIdsByGroup` shortcut helps less there) — that's expected and not a defect.
 
 A new test, `"Hierarchical: tree structure creates correct zone hierarchy"`, exercises the subtree-walk fast path directly and asserts it returns exactly the sensors in the target zone/floor, nothing from sibling subtrees.
+
+---
+
+## Hierarchical (and the whole zone/floor query family) — real registration replaces synthetic arithmetic (2026-06-29)
+
+Point 3 above ("zone mapping ... fixed") turned out to be the wrong fix. `SENSORS_PER_ZONE=5` / `SENSORS_PER_FLOOR=10` matched `dataset.zig`'s own made-up benchmark fixture by construction — but a real building's zones (from `sensor_placer.place()`'s `ZoneLocation`) hold a *variable* number of sensors with *arbitrary* ids (the source IFC entity id), never a fixed-width block. Pointing the old code at a real IFC-derived dataset wouldn't have crashed — it would have silently grouped "zone 3" as whichever 5 sequential sensor_ids happened to land there, with zero relationship to any real space in the building. Same problem in `queries.zig`'s `query_avg_zone_type`, `query_floor_stats`, `query_latest_zone`, `query_daily_zone_rollup`, which inlined `sensor_id / SENSORS_PER_ZONE` directly instead of going through `sensorIdsByGroup` at all.
+
+Fixed by replacing the divisor-based `sensorIdsByGroup(group_id, divisor)` with explicit topology registration: `registerZone(sensor_id, zone_id)` / `registerFloor(zone_id, floor_id)` (mirroring `ZoneLocation`/`ZoneMetadata.floor_level` from the real BIM pipeline) plus `sensorIdsByZone`/`sensorIdsByFloor`/`floorOfZone` lookups — no arithmetic relationship between sensor_id and zone_id assumed anywhere. The five flat backends share one `ZoneIndex` helper (`engine/ecs/storage/zone_index.zig`) so the bookkeeping isn't copy-pasted five times; Hierarchical's tree now keys nodes by the real registered zone_id/floor_id (with two "unassigned" catch-all branches for sensors/zones inserted before registration) instead of `sensor_id / N`.
+
+`dataset.zig`'s `insertDataset` is the one place the old fixed-width convention is still allowed to live — it now calls `registerZone`/`registerFloor` explicitly using that same convention, exactly the way a real pipeline calls them from real placement data. Every golden-result test that depended on the synthetic topology kept its expected values unchanged, since `insertDataset` reproduces the same grouping it always implied — it's just explicit now instead of buried in every backend and query.

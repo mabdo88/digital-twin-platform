@@ -36,6 +36,10 @@ rather than assumes.
 - **Domain:** Digital twin / building IoT.
 - **No external database dependencies.** Every storage backend is pure in-process Zig.
 - **Headless.** No Vulkan, no GLFW, no rendering of any kind.
+- **Cross-platform.** Must build and run unmodified on Windows, Linux, and macOS.
+  Use only `std.fs` / `std.process` / `std.Io` — no OS-specific APIs, no shell-outs
+  to platform tools, no hard-coded path separators (use `std.fs.path` helpers).
+  File selection is a CLI argument (`--bim <path>`), not a GUI file picker.
 
 ---
 
