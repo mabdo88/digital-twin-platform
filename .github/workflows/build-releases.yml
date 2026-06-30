@@ -1,0 +1,84 @@
+name: Build Executables
+
+on:
+  push:
+    branches: [master, dev]
+    tags: ['v*']
+  pull_request:
+    branches: [master, dev]
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-windows-gnu
+            output: dt.exe
+          - target: x86_64-linux-gnu
+            output: dt-linux
+          - target: x86_64-macos
+            output: dt-macos-x86_64
+          - target: aarch64-macos
+            output: dt-macos-aarch64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: master
+
+      - name: Build ${{ matrix.target }}
+        run: |
+          zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }}
+          mkdir -p dist
+          cp zig-out/bin/${{ matrix.output }} dist/ || cp zig-out/bin/dt dist/${{ matrix.output }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: ${{ matrix.target }}
+          path: dist/${{ matrix.output }}
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v3
+        with:
+          path: artifacts
+
+      - name: Flatten artifacts
+        run: |
+          mkdir -p release-bin
+          find artifacts -type f -name "dt*" -exec cp {} release-bin/ \;
+          ls -lh release-bin/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: release-bin/*
+          body: |
+            Pre-built executables for Digital Twin Optimization Platform.
+
+            Download the executable for your platform and run:
+            ```
+            ./dt-linux --bim model.ifc --type office
+            ```
+
+            See [HOW_TO_USE.md](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/HOW_TO_USE.md) for full documentation.
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
