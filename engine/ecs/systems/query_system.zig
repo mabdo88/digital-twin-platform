@@ -25,7 +25,8 @@ pub fn latestReading(world: anytype, sensor_id: u32) ?sb.SensorReading {
     return world.getLatestBySensor(sensor_id);
 }
 
-/// All readings in insertion order. Caller must free via world.allocator.
+/// All readings, cached at the World level until the next insert(). Do NOT
+/// free the returned slice — see World(T).iterateAll's doc comment.
 pub fn allReadings(world: anytype) ![]const sb.SensorReading {
     return world.iterateAll();
 }
@@ -38,8 +39,8 @@ pub fn readingsInRange(world: anytype, q: sb.RangeQuery) ![]const sb.SensorReadi
 
 /// Average value across all readings. Returns 0.0 when empty.
 pub fn averageValue(world: anytype) !f32 {
+    // world.iterateAll() is cached/borrowed at the World level — do not free.
     const all = try world.iterateAll();
-    defer world.allocator.free(all);
     if (all.len == 0) return 0.0;
     var sum: f32 = 0;
     for (all) |r| sum += r.value;

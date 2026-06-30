@@ -4,8 +4,10 @@
 
 const queries = @import("benchmark/queries.zig");
 const runner = @import("benchmark/runner.zig");
+const schematic = @import("benchmark/schematic.zig");
 
 comptime {
     _ = queries;
     _ = runner;
+    _ = schematic;
 }

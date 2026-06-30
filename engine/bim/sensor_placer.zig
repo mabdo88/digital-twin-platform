@@ -26,6 +26,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const components = @import("components.zig");
+const synthetic = @import("../synthetic/generator.zig");
 
 pub const BuildingElement = components.BuildingElement;
 pub const ZoneMetadata = components.ZoneMetadata;
@@ -38,40 +39,39 @@ pub const Vec3 = components.Vec3;
 /// One placement rule — declarative. The placer evaluates every element
 /// against this set; the first rule whose `element_type` matches wins.
 /// (No rule chaining — we keep one rule per element type to avoid the
-/// ordering games that come with priority systems. Profiles override
-/// wholesale, not by layering.)
+/// ordering games that come with priority systems.)
+///
+/// No density_per_100m2 or frequency_hz here — both are sensor-hardware
+/// facts, not placement decisions, and belong to the sensor TYPE, not to
+/// whichever rule happens to place it (a rule can list multiple
+/// sensor_types, and a single density/frequency shared across all of them
+/// was the actual bug: it forced e.g. temperature/humidity/occupancy on
+/// the same space to share one frequency, and energy/structural density
+/// to be guessed per building profile with no grounding — see
+/// synthetic/generator.zig's header comment). Both come from
+/// synthetic/generator.zig's profileFor, the single canonical source, per
+/// individual sensor_type.
 pub const PlacementRule = struct {
     element_type: ElementType,
-    /// Sensor kinds to spawn per replication slot. With density 2.0 / 100m²
-    /// on a 100 m² space, count_per_type = 2 → 2 × len(sensor_types) total
-    /// sensors are emitted for that element.
+    /// Sensor kinds to spawn on every matching element.
     sensor_types: []const SensorType,
-    /// Spawn density in sensors-per-type per 100 m² of effective area.
-    density_per_100m2: f32,
-    /// Sampling frequency stamped onto every sensor this rule produces.
-    frequency_hz: f32,
 };
 
-/// Spec §7.3 defaults. Profiles in Phase 5 are just different slices of this
-/// same shape — the placer reads `rules`, never this constant directly.
+/// Spec §7.3 defaults — the only rule set; there is no per-building-type
+/// override anymore (see PlacementRule's doc comment for why density
+/// moved out of here).
 pub const DEFAULT_RULES = [_]PlacementRule{
     .{
         .element_type = .space,
         .sensor_types = &.{ .temperature, .humidity, .occupancy },
-        .density_per_100m2 = 1.0,
-        .frequency_hz = 0.1,
     },
     .{
         .element_type = .flow_segment,
         .sensor_types = &.{ .flow, .temperature },
-        .density_per_100m2 = 2.0,
-        .frequency_hz = 1.0,
     },
     .{
         .element_type = .beam,
-        .sensor_types = &.{ .structural },
-        .density_per_100m2 = 0.5,
-        .frequency_hz = 10.0,
+        .sensor_types = &.{.structural},
     },
     // NOT in the original spec §7.3 list (space/flow_segment/beam only) —
     // added after validating against the real Revit exports in assets/IFC/:
@@ -80,13 +80,10 @@ pub const DEFAULT_RULES = [_]PlacementRule{
     // (see components.zig's ElementType.equipment doc comment) — without
     // this rule that file places exactly 0 sensors despite being a real,
     // fully-populated building. Energy + vibration is a generic pair for
-    // monitoring MEP/electrical equipment (draw + mechanical wear); Phase
-    // 5 building-type profiles are expected to override this wholesale.
+    // monitoring MEP/electrical equipment (draw + mechanical wear).
     .{
         .element_type = .equipment,
         .sensor_types = &.{ .energy, .vibration },
-        .density_per_100m2 = 1.0,
-        .frequency_hz = 1.0,
     },
 };
 
@@ -143,15 +140,6 @@ pub fn place(
         const raw_area: f64 = area_of.get(elem.ifc_id) orelse 0;
         const eff_area: f64 = if (raw_area > 0) raw_area else config.default_unknown_area_m2;
 
-        // Sensors per type. Round to nearest, clamped to at least 1 — every
-        // rule-matching element gets at least one sensor of each kind, even
-        // for tiny areas / low densities. Without this clamp, a 10 m² space
-        // at density 0.5 would emit zero structural sensors, which silently
-        // hides whole element classes from the benchmark.
-        const fcount: f64 = eff_area * @as(f64, rule.density_per_100m2) / 100.0;
-        const rounded: u32 = @intFromFloat(@round(fcount));
-        const count_per_type: u32 = @max(@as(u32, 1), rounded);
-
         // Containing zone for ZoneLocation:
         //   - if elem IS a zone (storey/space), zone_id = elem.ifc_id
         //   - else use elem.parent_id when it points at a known zone
@@ -163,6 +151,20 @@ pub fn place(
         };
 
         for (rule.sensor_types) |st| {
+            // Sensors for this specific type. Round to nearest, clamped to
+            // at least 1 — every rule-matching element gets at least one
+            // sensor of each kind it's rated for, even at tiny areas / low
+            // densities. Without this clamp, a 10 m² space at density 0.5
+            // would emit zero structural sensors, which silently hides
+            // whole element classes from the benchmark. Density comes from
+            // the TYPE (synthetic.profileFor), not the rule — see
+            // PlacementRule's doc comment for why a single density shared
+            // across a rule's sensor_types was the bug.
+            const density = synthetic.profileFor(st).density_per_100m2;
+            const fcount: f64 = eff_area * @as(f64, density) / 100.0;
+            const rounded: u32 = @intFromFloat(@round(fcount));
+            const count_per_type: u32 = @max(@as(u32, 1), rounded);
+
             var n: u32 = 0;
             while (n < count_per_type) : (n += 1) {
                 const sid = next_id;
@@ -170,7 +172,7 @@ pub fn place(
                 try sensors.append(ar, .{
                     .sensor_id = sid,
                     .sensor_type = st,
-                    .frequency_hz = rule.frequency_hz,
+                    .frequency_hz = synthetic.profileFor(st).frequency_hz,
                     .element_id = elem.ifc_id,
                 });
                 try locations.append(ar, .{
@@ -201,21 +203,18 @@ fn findRule(rules: []const PlacementRule, etype: ElementType) ?PlacementRule {
 const testing = std.testing;
 const ifc = @import("ifc_parser.zig");
 
-test "DEFAULT_RULES match spec §7.3 (types, densities, frequencies)" {
+test "DEFAULT_RULES match spec §7.3 (types only — density/frequency are sensor-type facts now, not rule fields)" {
     const space_rule = findRule(&DEFAULT_RULES, .space).?;
     try testing.expectEqual(@as(usize, 3), space_rule.sensor_types.len);
     try testing.expectEqual(SensorType.temperature, space_rule.sensor_types[0]);
     try testing.expectEqual(SensorType.humidity, space_rule.sensor_types[1]);
     try testing.expectEqual(SensorType.occupancy, space_rule.sensor_types[2]);
-    try testing.expectEqual(@as(f32, 1.0), space_rule.density_per_100m2);
 
     const flow_rule = findRule(&DEFAULT_RULES, .flow_segment).?;
-    try testing.expectEqual(@as(f32, 2.0), flow_rule.density_per_100m2);
-    try testing.expectEqual(@as(f32, 1.0), flow_rule.frequency_hz);
+    try testing.expectEqual(@as(usize, 2), flow_rule.sensor_types.len);
 
     const beam_rule = findRule(&DEFAULT_RULES, .beam).?;
-    try testing.expectEqual(@as(f32, 0.5), beam_rule.density_per_100m2);
-    try testing.expectEqual(@as(f32, 10.0), beam_rule.frequency_hz);
+    try testing.expectEqual(@as(usize, 1), beam_rule.sensor_types.len);
 
     // Equipment is an addition beyond the original §7.3 list (see its
     // DEFAULT_RULES entry's doc comment) — verify it's present and shaped
@@ -224,8 +223,6 @@ test "DEFAULT_RULES match spec §7.3 (types, densities, frequencies)" {
     try testing.expectEqual(@as(usize, 2), equipment_rule.sensor_types.len);
     try testing.expectEqual(SensorType.energy, equipment_rule.sensor_types[0]);
     try testing.expectEqual(SensorType.vibration, equipment_rule.sensor_types[1]);
-    try testing.expectEqual(@as(f32, 1.0), equipment_rule.density_per_100m2);
-    try testing.expectEqual(@as(f32, 1.0), equipment_rule.frequency_hz);
 
     // Walls/slabs are unsupported by default — no surprise placement.
     try testing.expect(findRule(&DEFAULT_RULES, .wall) == null);
@@ -257,13 +254,16 @@ test "places sensors on a parsed building (end-to-end through IFC parser)" {
     var p = try place(testing.allocator, model.building_elements, model.zones, .{});
     defer p.deinit();
 
-    // With default 100 m² fallback and DEFAULT_RULES:
-    //   Space (1.0/100m²)        -> 1 of each of 3 types = 3
-    //   FlowSegment (2.0/100m²)  -> 2 of each of 2 types = 4
-    //   Beam (0.5/100m²)         -> max(1, round(0.5)) = 1 of structural = 1
-    //                                                                    = 8
-    try testing.expectEqual(@as(usize, 8), p.sensors.len);
-    try testing.expectEqual(@as(usize, 8), p.locations.len);
+    // With default 100 m² fallback and DEFAULT_RULES — density now comes
+    // per individual sensor type (synthetic.profileFor), not shared across
+    // a rule's whole sensor_types list, so flow_segment's two types
+    // (flow, temperature) no longer share one number:
+    //   Space: temperature(1.0)=1, humidity(1.0)=1, occupancy(1.0)=1   = 3
+    //   FlowSegment: flow(1.5)=round(1.5)=2, temperature(1.0)=1        = 3
+    //   Beam: structural(0.5)=max(1,round(0.5))=1                     = 1
+    //                                                                  = 7
+    try testing.expectEqual(@as(usize, 7), p.sensors.len);
+    try testing.expectEqual(@as(usize, 7), p.locations.len);
 
     // sensor_ids are dense and monotonic.
     for (p.sensors, 0..) |s, i| try testing.expectEqual(@as(u32, @intCast(i)), s.sensor_id);
@@ -288,7 +288,7 @@ test "places sensors on a parsed building (end-to-end through IFC parser)" {
         }
     }
     try testing.expectEqual(@as(usize, 3), space_sensors);
-    try testing.expectEqual(@as(usize, 5), storey_sensors);
+    try testing.expectEqual(@as(usize, 4), storey_sensors);
 }
 
 test "density math: real area_m2 overrides the default fallback" {
@@ -323,20 +323,23 @@ test "elements without a matching rule are skipped silently" {
     try testing.expectEqual(@as(usize, 0), p.sensors.len);
 }
 
-test "custom rules slice fully overrides defaults (Phase 5 profile shape)" {
+test "custom rules slice fully overrides defaults" {
     const elements = [_]BuildingElement{
         .{ .ifc_id = 1, .name = "W", .element_type = .wall, .parent_id = null, .position = .{ .x = 0, .y = 0, .z = 0 } },
     };
-    // Hypothetical "structural-monitoring" profile that places vibration
+    // Hypothetical "structural-monitoring" rule set that places vibration
     // sensors on walls instead of the default empty.
     const custom_rules = [_]PlacementRule{
-        .{ .element_type = .wall, .sensor_types = &.{.vibration}, .density_per_100m2 = 1.0, .frequency_hz = 50.0 },
+        .{ .element_type = .wall, .sensor_types = &.{.vibration} },
     };
     var p = try place(testing.allocator, &elements, &.{}, .{ .rules = &custom_rules });
     defer p.deinit();
     try testing.expectEqual(@as(usize, 1), p.sensors.len);
     try testing.expectEqual(SensorType.vibration, p.sensors[0].sensor_type);
-    try testing.expectEqual(@as(f32, 50.0), p.sensors[0].frequency_hz);
+    // frequency_hz comes from the canonical per-type table now, not the
+    // rule — confirms place() actually wires it through, not just that the
+    // field happens to be present.
+    try testing.expectEqual(synthetic.profileFor(.vibration).frequency_hz, p.sensors[0].frequency_hz);
 }
 
 test "tiny area still gets one sensor per type (clamped, never silently zero)" {

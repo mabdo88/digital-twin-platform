@@ -33,7 +33,7 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     const bench_exe = b.addExecutable(.{
-        .name = "dt-bench",
+        .name = "dtb",
         .root_module = b.createModule(.{
             .root_source_file = b.path("engine/bench_main.zig"),
             .target = target,
@@ -47,7 +47,7 @@ pub fn build(b: *std.Build) void {
     // Main entrypoint — parse a real IFC file, place sensors, benchmark
     // every backend against the building profile's query mix, write reports.
     const main_exe = b.addExecutable(.{
-        .name = "digital-twin",
+        .name = "dt",
         .root_module = b.createModule(.{
             .root_source_file = b.path("engine/main.zig"),
             .target = target,
@@ -55,6 +55,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_main = b.addRunArtifact(main_exe);
-    const run_step = b.step("run", "Parse an IFC file, place sensors, and benchmark storage backends (run zig-out/bin/digital-twin directly to pass --bim/--type/--out flags)");
+    b.installArtifact(main_exe);
+    const run_step = b.step("run", "Build dt (run zig-out/bin/dt directly to pass --bim/--type/--out flags)");
     run_step.dependOn(&run_main.step);
 }

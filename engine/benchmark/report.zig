@@ -8,7 +8,7 @@
 const std = @import("std");
 const metrics = @import("../ecs/systems/metrics_system.zig");
 const fixtures = @import("dataset.zig");
-const profiles = @import("../bim/profiles.zig");
+const queries = @import("queries.zig");
 
 /// One latency-table row, decoupled from how it's rendered.
 pub const RunRow = struct {
@@ -19,17 +19,9 @@ pub const RunRow = struct {
     stats: metrics.LatencyStats,
 };
 
-/// Every building type profiles.zig defines — explicit list rather than
-/// std.enums.values, matching the same literal pattern profiles.zig's own
-/// tests already use.
-const BUILDING_TYPES = [_]profiles.BuildingType{ .hospital, .office, .warehouse, .manufacturing, .campus };
-
-/// Maps a profiles.QueryName to the exact query-name string runner.zig's
-/// query_specs use. Kept here, not in profiles.zig, because profiles.zig
-/// deliberately has no dependency on the benchmark layer (see its own
-/// header comment) — this mapping IS a benchmark-layer concern: "the
-/// benchmark runner decides what to do with [query_mix]."
-fn queryNameStr(qn: profiles.QueryName) []const u8 {
+/// Maps a queries.QueryName to the exact query-name string runner.zig's
+/// query_specs use.
+fn queryNameStr(qn: queries.QueryName) []const u8 {
     return switch (qn) {
         .avg_window => "query_avg_window",
         .avg_zone_type => "query_avg_zone_type",
@@ -65,17 +57,19 @@ pub const Recommendation = struct {
     winner: []const u8,
 };
 
-/// Weight every query in `profile.query_mix` by its declared importance and
+/// Weight every query in `query_mix` by its declared importance and
 /// rank every backend present in `rows` at `scale` by how close it comes to
-/// the per-query winner across that weighted mix. This is the "scoring"
-/// half of AGENT.md's Phase 5.2 — `profile.rules` already slots into sensor
-/// placement (sensor_placer.zig); this is what makes `query_mix` do
-/// something. Caller owns `result.scores` (free with `allocator`).
+/// the per-query winner across that weighted mix. `query_mix` is whatever
+/// the caller derived it to be — main.zig builds it from the union of
+/// `relevant_queries` across whichever sensor types actually got placed
+/// (synthetic/generator.zig's per-type canonical table), not a
+/// building-profile guess. Caller owns `result.scores` (free with
+/// `allocator`).
 pub fn recommendBackend(
     allocator: std.mem.Allocator,
     rows: []const RunRow,
     scale: []const u8,
-    profile: profiles.BuildingProfile,
+    query_mix: []const queries.QueryWeight,
 ) !Recommendation {
     var backend_names: std.ArrayList([]const u8) = .empty;
     defer backend_names.deinit(allocator);
@@ -99,7 +93,7 @@ pub fn recommendBackend(
         var covered_weight: f64 = 0;
         var total_weight: f64 = 0;
 
-        for (profile.query_mix) |qw| {
+        for (query_mix) |qw| {
             total_weight += qw.weight;
             const qname = queryNameStr(qw.query);
 
@@ -211,31 +205,14 @@ pub fn writeReports(
         try md.print(allocator, "\n", .{});
     }
 
-    try md.print(allocator, "## Recommended Backend by Building Type\n\n", .{});
-    try md.print(allocator, "Per CLAUDE.md §1 (\"a hospital is not a factory\"): each building-type profile " ++
-        "declares its own expected query mix (`bim/profiles.zig`). This weights every query a profile cares " ++
-        "about by its declared importance and ranks backends by how close their median latency comes to the " ++
-        "per-query winner across that weighted mix. **Score 1.00 = wins every weighted query; higher is worse.** " ++
-        "**Coverage** below 100% means the backend has no data for one or more weighted queries (e.g. RingBuffer " ++
-        "on historical rollups) — a low score at partial coverage is winning by omission, not speed.\n\n", .{});
-
-    for (fixtures.scale_tiers) |ds| {
-        try md.print(allocator, "### Scale: {s}\n\n", .{ds.name});
-        for (BUILDING_TYPES) |bt| {
-            const profile = profiles.getProfile(bt);
-            const rec = try recommendBackend(allocator, rows, ds.name, profile);
-            defer allocator.free(rec.scores);
-
-            try md.print(allocator, "**{s}** — winner: **{s}**\n\n", .{ @tagName(bt), rec.winner });
-            if (rec.scores.len > 0) {
-                try md.print(allocator, "| Backend | Score | Coverage |\n|---|---:|---:|\n", .{});
-                for (rec.scores) |s| {
-                    try md.print(allocator, "| {s} | {d:.2} | {d:.0}% |\n", .{ s.backend, s.score, s.coverage * 100.0 });
-                }
-                try md.print(allocator, "\n", .{});
-            }
-        }
-    }
+    // No per-building-type recommendation section here — this internal
+    // suite runs against dataset.zig's shared synthetic fixture, not a
+    // real parsed building, so there's no real set of placed sensor types
+    // to derive a query mix from. Real recommendations (main.zig) build
+    // query_mix from whatever a real IFC actually contains; recommending
+    // backends for five hypothetical, hand-picked "building types" against
+    // the same generic dataset was exactly the guessing this whole
+    // redesign removed.
 
     try dir.writeFile(io, .{ .sub_path = "latency.md", .data = md.items });
 
@@ -268,30 +245,7 @@ pub fn writeReports(
             },
         );
     }
-    try js.print(allocator, "  ],\n", .{});
-
-    try js.print(allocator, "  \"recommendations\": [\n", .{});
-    var first_rec = true;
-    for (fixtures.scale_tiers) |ds| {
-        for (BUILDING_TYPES) |bt| {
-            const profile = profiles.getProfile(bt);
-            const rec = try recommendBackend(allocator, rows, ds.name, profile);
-            defer allocator.free(rec.scores);
-
-            if (!first_rec) try js.print(allocator, ",\n", .{});
-            first_rec = false;
-            try js.print(allocator, "    {{\"scale\": \"{s}\", \"building_type\": \"{s}\", \"winner\": \"{s}\", \"scores\": [", .{
-                ds.name, @tagName(bt), rec.winner,
-            });
-            for (rec.scores, 0..) |s, i| {
-                try js.print(allocator, "{{\"backend\": \"{s}\", \"score\": {d:.4}, \"coverage\": {d:.4}}}{s}", .{
-                    s.backend, s.score, s.coverage, if (i + 1 == rec.scores.len) "" else ", ",
-                });
-            }
-            try js.print(allocator, "]}}", .{});
-        }
-    }
-    try js.print(allocator, "\n  ]\n}}\n", .{});
+    try js.print(allocator, "  ]\n}}\n", .{});
 
     try dir.writeFile(io, .{ .sub_path = "latency.json", .data = js.items });
 
@@ -659,17 +613,12 @@ test "recommendBackend: weighting toward a backend's strong query picks it as wi
         testRow("Small", "query_daily_zone_rollup", "B", 10),
     };
 
-    const hot_profile = profiles.BuildingProfile{
-        .building_type = .hospital,
-        .rules = &.{},
-        .query_mix = &.{
-            .{ .query = .threshold_breach, .weight = 10.0, .hot = true },
-            .{ .query = .daily_zone_rollup, .weight = 1.0, .hot = false },
-        },
-        .retention_days = 1,
+    const hot_mix = [_]queries.QueryWeight{
+        .{ .query = .threshold_breach, .weight = 10.0, .hot = true },
+        .{ .query = .daily_zone_rollup, .weight = 1.0, .hot = false },
     };
 
-    const rec = try recommendBackend(testing.allocator, &rows, "Small", hot_profile);
+    const rec = try recommendBackend(testing.allocator, &rows, "Small", &hot_mix);
     defer testing.allocator.free(rec.scores);
     try testing.expectEqualStrings("A", rec.winner);
 }
@@ -682,17 +631,12 @@ test "recommendBackend: swapping the weights flips the winner" {
         testRow("Small", "query_daily_zone_rollup", "B", 10),
     };
 
-    const cold_profile = profiles.BuildingProfile{
-        .building_type = .warehouse,
-        .rules = &.{},
-        .query_mix = &.{
-            .{ .query = .threshold_breach, .weight = 1.0, .hot = true },
-            .{ .query = .daily_zone_rollup, .weight = 10.0, .hot = false },
-        },
-        .retention_days = 1,
+    const cold_mix = [_]queries.QueryWeight{
+        .{ .query = .threshold_breach, .weight = 1.0, .hot = true },
+        .{ .query = .daily_zone_rollup, .weight = 10.0, .hot = false },
     };
 
-    const rec = try recommendBackend(testing.allocator, &rows, "Small", cold_profile);
+    const rec = try recommendBackend(testing.allocator, &rows, "Small", &cold_mix);
     defer testing.allocator.free(rec.scores);
     try testing.expectEqualStrings("B", rec.winner);
 }
@@ -706,17 +650,12 @@ test "recommendBackend: a backend missing data for a weighted query gets partial
         // excluded from historical rollups in runner.zig's real data.
     };
 
-    const profile = profiles.BuildingProfile{
-        .building_type = .campus,
-        .rules = &.{},
-        .query_mix = &.{
-            .{ .query = .threshold_breach, .weight = 1.0, .hot = true },
-            .{ .query = .daily_zone_rollup, .weight = 1.0, .hot = false },
-        },
-        .retention_days = 1,
+    const mix = [_]queries.QueryWeight{
+        .{ .query = .threshold_breach, .weight = 1.0, .hot = true },
+        .{ .query = .daily_zone_rollup, .weight = 1.0, .hot = false },
     };
 
-    const rec = try recommendBackend(testing.allocator, &rows, "Small", profile);
+    const rec = try recommendBackend(testing.allocator, &rows, "Small", &mix);
     defer testing.allocator.free(rec.scores);
 
     try testing.expectEqual(@as(usize, 2), rec.scores.len);
@@ -733,28 +672,40 @@ test "recommendBackend: no rows at the requested scale returns an empty, non-cra
     const rows = [_]RunRow{
         testRow("Large", "query_threshold_breach", "A", 10),
     };
-    const profile = profiles.getProfile(.hospital);
+    const mix = [_]queries.QueryWeight{
+        .{ .query = .threshold_breach, .weight = 1.0, .hot = true },
+    };
 
-    const rec = try recommendBackend(testing.allocator, &rows, "Small", profile);
+    const rec = try recommendBackend(testing.allocator, &rows, "Small", &mix);
     defer testing.allocator.free(rec.scores);
 
     try testing.expectEqual(@as(usize, 0), rec.scores.len);
     try testing.expectEqualStrings("none", rec.winner);
 }
 
-test "recommendBackend: real Hospital profile resolves against real query_specs names to a clear winner" {
-    // Exercises queryNameStr's mapping against every QueryName the real
-    // Hospital profile actually weights, with rows shaped like a real
-    // runner.zig run (every weighted query name present, for two backends).
-    const hospital = profiles.getProfile(.hospital);
+test "recommendBackend: a real per-type query mix resolves against real query_specs names to a clear winner" {
+    // Exercises queryNameStr's mapping against every QueryName a real
+    // canonical per-type table weights (synthetic/generator.zig's
+    // STRUCTURAL_QUERIES — equipment-health type, exercises
+    // anomalies/threshold_breach/avg_zone_type), with rows shaped like a
+    // real runner.zig run (every weighted query name present, for two
+    // backends).
+    const structural_mix = [_]queries.QueryWeight{
+        .{ .query = .latest_single, .weight = 2.0, .hot = true },
+        .{ .query = .avg_zone_type, .weight = 2.0, .hot = false },
+        .{ .query = .daily_zone_rollup, .weight = 2.0, .hot = false },
+        .{ .query = .anomalies, .weight = 5.0, .hot = true },
+        .{ .query = .threshold_breach, .weight = 4.0, .hot = true },
+        .{ .query = .spatial_radius, .weight = 2.0, .hot = true },
+    };
     var rows: std.ArrayList(RunRow) = .empty;
     defer rows.deinit(testing.allocator);
-    for (hospital.query_mix) |qw| {
+    for (structural_mix) |qw| {
         try rows.append(testing.allocator, testRow("Small", queryNameStr(qw.query), "TimeSeries", 50));
         try rows.append(testing.allocator, testRow("Small", queryNameStr(qw.query), "Columnar", 100));
     }
 
-    const rec = try recommendBackend(testing.allocator, rows.items, "Small", hospital);
+    const rec = try recommendBackend(testing.allocator, rows.items, "Small", &structural_mix);
     defer testing.allocator.free(rec.scores);
 
     try testing.expectEqualStrings("TimeSeries", rec.winner);

@@ -6,11 +6,9 @@
 const ifc_parser = @import("bim/ifc_parser.zig");
 const sensor_placer = @import("bim/sensor_placer.zig");
 const ifc_validation_test = @import("bim/ifc_validation_test.zig");
-const profiles = @import("bim/profiles.zig");
 
 comptime {
     _ = ifc_parser;
     _ = sensor_placer;
     _ = ifc_validation_test;
-    _ = profiles;
 }

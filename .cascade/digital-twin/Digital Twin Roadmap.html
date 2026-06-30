@@ -88,11 +88,11 @@
   <div class="cards">
     <div class="card">
       <div class="card-label">Rechecked against</div>
-      <p>Actual repo state on 2026-06-29: code, <code>zig build test</code> / <code>zig build bench</code> output, and <code>backend-audit.md</code> — not assumed from the original task list.</p>
+      <p>Actual repo state on 2026-06-30: code, <code>zig build test</code> / <code>zig build bench</code> output, and <code>backend-audit.md</code> — not assumed from the original task list.</p>
     </div>
     <div class="card">
       <div class="card-label">Known gap</div>
-      <p>Phase 6 done except sensor failure modes (6.2 — dropout/stale/drift). Phase 7: per-query winner table and a per-building-type recommendation now exist; a $-cost model, naive-vs-optimised comparison, and per-sensor-type recommendation still don't. Phase 8 (DuckDB calibration) hasn't been started.</p>
+      <p>Phase 5 (building-type profiles) deliberately removed 2026-06-30 — superseded by per-sensor-type canonical data, see Phase 5 notes. Phase 6 done except sensor failure modes (6.2 — dropout/stale/drift). Phase 7: per-query winner table and a per-sensor-type recommendation now exist; a $-cost model and naive-vs-optimised comparison still don't. <code>recommendBackend()</code>'s score ignores a backend's data-coverage gaps (RingBuffer eviction) — disclosed, not penalized; open, unauthorized fix. Phase 8 (DuckDB calibration) hasn't been started.</p>
     </div>
   </div>
 
@@ -166,15 +166,15 @@ var PHASES = [
     ]
   },
   {
-    id: 'p5', num: '5', title: 'Building-Type Profiles',
-    goal: 'Make "a hospital is not a factory" real: profiles tune placement, weights, retention.',
+    id: 'p5', num: '5', title: 'Building-Type Profiles (removed)',
+    goal: 'Make "a hospital is not a factory" real — superseded 2026-06-30 by per-sensor-type canonical data, not building archetypes.',
     tasks: [
       { code: '5.1', title: 'BuildingProfile struct + lookup', done: true,
-        note: 'engine/bim/profiles.zig — getProfile(BuildingType) table lookup, data only, no branching logic. Added 2026-06-28.' },
+        note: 'REMOVED 2026-06-30 (engine/bim/profiles.zig deleted). Originally added 2026-06-28: getProfile(BuildingType) table lookup for density/query-mix/retention per building archetype. Replaced because density, query relevance, and retention are now derived per sensor type (synthetic.profileFor) and per actually-placed-sensor data, not guessed from a building label. The --type CLI flag is gone; run label is derived from the IFC filename.' },
       { code: '5.2', title: 'Integrate profiles into placement + scoring', done: true,
-        note: 'Profile.rules slots into PlacementConfig (tested). Scoring closed 2026-06-29: engine/benchmark/report.zig\'s recommendBackend() weights query_mix against existing per-query latency data (no $-cost model needed) — did not actually depend on Phase 7\'s cost model, just on report.zig having per-query results to weight, which it already did.' },
+        note: 'Superseded 2026-06-30 along with 5.1. recommendBackend() still weights a query mix against per-query latency (the scoring mechanism itself is unchanged and correct) — only the source of the query mix changed, from a profile\'s declared mix to deriveQueryMix() unioning relevant_queries across every sensor type actually placed.' },
       { code: '5.3', title: 'Default profiles for all building types', done: true,
-        note: 'Five profiles exist (Hospital, Office, Warehouse, Manufacturing, Campus). Deviation from an earlier external spec list (Office/Hospital/Factory/Data Centre/Laboratory) accepted as closed: AGENT.md itself — the in-repo authoritative task list — already canonicalizes this 5-type list, so there is no live open decision left to track.' }
+        note: 'Superseded 2026-06-30: the five building-type profiles (Hospital, Office, Warehouse, Manufacturing, Campus) no longer exist. Per-sensor-type canonical facts replaced per-building-type guesses entirely — see Phase 6.1.' }
     ]
   },
   {
@@ -182,7 +182,7 @@ var PHASES = [
     goal: 'Deterministic, physically-plausible sensor streams from 100 to 100,000 sensors.',
     tasks: [
       { code: '6.1', title: 'Statistical models per sensor type', done: true,
-        note: 'engine/synthetic/generator.zig — profileFor(SensorType) returns one SensorProfile (base value, daily amplitude, peak hour, noise stddev, physical bounds) per type: a sine-wave-plus-Gaussian-noise model as a data table, not branching code. Added 2026-06-29.' },
+        note: 'Redesigned 2026-06-30, research-grounded (was: one shared sine-wave-plus-Gaussian-noise model for all 9 types, added 2026-06-29). engine/synthetic/generator.zig — profileFor(SensorType) now returns frequency_hz, a Shape (diurnal_continuous / binary_event / stepwise_discrete / bursty_impulsive), density_per_100m2, retention_days, and relevant_queries per type, sourced from real-world practice (AMI 15-min smart-meter sampling, SHM 1-15min static monitoring, PIR binary occupancy, burst-capture vibration monitoring) instead of one arbitrary shared shape. Still a data table, not branching code.' },
       { code: '6.2', title: 'Failure modes', done: false,
         note: 'Not implemented. generator.zig models normal operation (daily cycle + noise, clamped to physical bounds) but not sensor dropout, stale/stuck readings, or drift/miscalibration — a real, still-open gap.' },
       { code: '6.3', title: 'Validation checks (validator.zig)', done: true,
@@ -233,7 +233,7 @@ function render() {
   var donePct = Math.round((doneTasks / totalTasks) * 100);
 
   document.getElementById('subtitle').textContent =
-    'Headless storage-benchmarking engine · Zig + ECS · 8 phases · ' + totalTasks + ' tasks · rechecked 2026-06-29';
+    'Headless storage-benchmarking engine · Zig + ECS · 8 phases · ' + totalTasks + ' tasks · rechecked 2026-06-30';
   document.getElementById('donePct').textContent = donePct + '% complete';
   document.getElementById('doneFrac').textContent = doneTasks + ' / ' + totalTasks;
   document.getElementById('overallBar').style.width = donePct + '%';

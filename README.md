@@ -22,15 +22,22 @@ apples-to-apples through one shared interface.
 
 ## Rules and roadmap
 
-- [`CLAUDE.md`](CLAUDE.md) — non-negotiable project rules (read this first).
+- [`HOW_TO_USE.md`](HOW_TO_USE.md) — step-by-step usage guide (start here to run the tool).
+- [`CLAUDE.md`](CLAUDE.md) — non-negotiable project rules (read this first if contributing).
 - [`AGENT.md`](AGENT.md) — phase-by-phase workflow and task checklist.
 - [`.cascade/digital-twin/backend-audit.md`](.cascade/digital-twin/backend-audit.md) — known issues per backend.
 
-## Build & test
+## Quick start
+
+**For end users:** Download a pre-built executable from [`releases/`](releases/) and run it from the terminal (see [`releases/README.md`](releases/README.md)).
+
+**For developers:** Clone the repo and build with Zig:
 
 ```sh
-zig build test    # run all unit + golden-result equivalence tests
-zig build bench   # run the full benchmark suite, write reports to ./benchmark-results/
+zig build                # compile to zig-out/bin/
+zig build test           # run all unit + golden-result equivalence tests
+zig build bench          # run the full benchmark suite, write reports to ./benchmark-results/
+zig build -Doptimize=ReleaseFast  # release build (faster on large datasets)
 ```
 
 Requires Zig master (tested against 0.16.0 / 0.17.0-dev). No external
