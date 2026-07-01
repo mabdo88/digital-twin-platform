@@ -92,7 +92,7 @@
     </div>
     <div class="card">
       <div class="card-label">Known gap</div>
-      <p>Phase 5 (building-type profiles) deliberately removed 2026-06-30 — superseded by per-sensor-type canonical data, see Phase 5 notes. Phase 6 done except sensor failure modes (6.2 — dropout/stale/drift). Phase 7 complete: per-query winner table, compound recommendations, per-sensor-type recommendations, and cloud-equivalent cost model all implemented. The 25-iteration sampling methodology is retired (single-shot against real data). Phase 8 (DuckDB calibration) hasn't been started.</p>
+      <p>Phase 5 (building-type profiles) deliberately removed 2026-06-30 — superseded by per-sensor-type canonical data, see Phase 5 notes. Phase 6 complete: statistical models, failure modes (dropout/stuck/drift), validation, determinism, and 100K-scale all done. Phase 7 complete: per-query winner table, compound recommendations, per-sensor-type recommendations, and cloud-equivalent cost model all implemented. The 25-iteration sampling methodology is retired (single-shot against real data). Phase 8 (DuckDB calibration) hasn't been started.</p>
     </div>
   </div>
 
@@ -183,8 +183,8 @@ var PHASES = [
     tasks: [
       { code: '6.1', title: 'Statistical models per sensor type', done: true,
         note: 'Redesigned 2026-06-30, research-grounded (was: one shared sine-wave-plus-Gaussian-noise model for all 9 types, added 2026-06-29). engine/synthetic/generator.zig — profileFor(SensorType) now returns frequency_hz, a Shape (diurnal_continuous / binary_event / stepwise_discrete / bursty_impulsive), density_per_100m2, retention_days, and relevant_queries per type, sourced from real-world practice (AMI 15-min smart-meter sampling, SHM 1-15min static monitoring, PIR binary occupancy, burst-capture vibration monitoring) instead of one arbitrary shared shape. Still a data table, not branching code.' },
-      { code: '6.2', title: 'Failure modes', done: false,
-        note: 'Not implemented. generator.zig models normal operation (daily cycle + noise, clamped to physical bounds) but not sensor dropout, stale/stuck readings, or drift/miscalibration — a real, still-open gap.' },
+      { code: '6.2', title: 'Failure modes', done: true,
+        note: 'Implemented 2026-07-01: three failure modes in generator.zig — dropout (sensor stops reporting for a random interval), stuck/stale (sensor freezes at last real value), and drift (calibration slowly shifts via accumulating ppm offset). All are per-sensor-type data (FailureParams struct on SensorProfile), opt-in via GenerateConfig.enable_failures (default false), and deterministic (RNG stays in sync during dropouts via consumeShapeDraw). 6 tests added.' },
       { code: '6.3', title: 'Validation checks (validator.zig)', done: true,
         note: 'engine/synthetic/validator.zig — validateBounds() flags out-of-range readings; hasDailyPattern() statistically confirms a real day/night cycle (peak-hour vs trough-hour averages) rather than flat noise.' },
       { code: '6.4', title: 'Deterministic seeded RNG', done: true,

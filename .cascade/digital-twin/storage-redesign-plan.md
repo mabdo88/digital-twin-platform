@@ -279,7 +279,6 @@ Columnar/TimeSeries's indexing overhead isn't worth paying for.
 - Retire the AoS/SoA-only equivalence tests' assumption of small uniform data — low priority.
 - Time-compression factor for the live simulator — undecided, not needed until live-tick real-time matters.
 - DuckDB calibration — Phase 8, not started.
-- Sensor failure modes (dropout, stale, drift) — Phase 6.2, not started.
 
 ## Handoff (2026-07-01) — redesign complete
 

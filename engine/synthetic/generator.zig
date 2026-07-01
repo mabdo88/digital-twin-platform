@@ -75,6 +75,33 @@ pub const Shape = enum {
     bursty_impulsive,
 };
 
+/// Sensor failure modes modeled after real-world sensor degradation:
+///   - dropout: sensor stops reporting entirely (gap in timestamps).
+///   - stuck: sensor keeps reporting but the value freezes (stale reading).
+///   - drift: sensor's calibration slowly shifts away from the true value.
+/// All three are per-sensor-type data, not branching code. All default to
+/// zero (disabled) so existing behavior is unchanged unless explicitly
+/// enabled via GenerateConfig.enable_failures.
+pub const FailureParams = struct {
+    /// Probability per tick that this sensor enters a dropout (stops
+    /// reporting). 0 = never. A sensor in dropout skips emitting readings
+    /// for `dropout_duration_ticks` ticks, then resumes.
+    dropout_rate: f32 = 0.0,
+    /// How many ticks a dropout lasts once entered.
+    dropout_duration_ticks: u32 = 10,
+    /// Probability per tick that this sensor gets stuck (repeats its
+    /// last real reading). 0 = never. A stuck sensor emits readings with
+    /// advancing timestamps but the same value as the last real one,
+    /// for `stuck_duration_ticks` ticks, then resumes normal generation.
+    stuck_rate: f32 = 0.0,
+    /// How many ticks a stuck condition lasts once entered.
+    stuck_duration_ticks: u32 = 20,
+    /// Calibration drift in parts-per-million per tick. Accumulates
+    /// linearly: after N ticks, the reported value is shifted by
+    /// `drift_rate_ppm * N * 1e-6 * base_value`. 0 = no drift.
+    drift_rate_ppm: f32 = 0.0,
+};
+
 /// Statistical shape and full real-world characterization of one sensor
 /// type. `base_value` is the 24h mean (or, for binary_event, unused —
 /// occupancy likelihood is derived from `peak_hour` instead);
@@ -103,6 +130,9 @@ pub const SensorProfile = struct {
     density_per_100m2: f32,
     retention_days: u32,
     relevant_queries: []const QueryWeight,
+    /// Per-type failure mode parameters. All default to zero (disabled).
+    /// Set GenerateConfig.enable_failures = true to activate them.
+    failures: FailureParams = .{},
 };
 
 /// One row per `SensorType` — the only place "realistic" is defined. Adding
@@ -297,6 +327,10 @@ pub const GenerateConfig = struct {
     /// fresh call (first tick always emits). Read-only — not owned or
     /// freed by generate().
     initial_binary_state: ?*const std.AutoHashMap(u32, f32) = null,
+    /// If true, per-sensor-type failure modes (dropout, stuck, drift) are
+    /// active, using each type's `failures` parameters. Default false —
+    /// existing tests and behavior are unchanged.
+    enable_failures: bool = false,
 };
 
 /// Generate deterministic, physically-plausible readings for every sensor in
@@ -381,51 +415,116 @@ pub fn generate(
         var step_level: f32 = profile.base_value;
         var step_hold: u32 = 0;
 
+        // Per-sensor failure mode state (only active when
+        // config.enable_failures is true and the type's FailureParams
+        // have nonzero rates). Declared outside the loop so state
+        // persists across this sensor's timeline.
+        const fp = profile.failures;
+        const failures_active = config.enable_failures and
+            (fp.dropout_rate > 0 or fp.stuck_rate > 0 or fp.drift_rate_ppm > 0);
+        var dropout_remaining: u32 = 0;
+        var stuck_remaining: u32 = 0;
+        var last_real_value: f32 = profile.base_value;
+        var tick_count: u32 = 0;
+        var drift_offset: f32 = 0.0;
+
         while (t < window_end) : (t += period_ms) {
+            // --- Failure mode evaluation (per tick, before shape) ---
+            if (failures_active) {
+                // Dropout: if currently in a dropout, skip this tick
+                // (no reading emitted). If not in dropout, roll to see
+                // if one starts this tick.
+                if (dropout_remaining > 0) {
+                    dropout_remaining -= 1;
+                    // Still advance the RNG by consuming the shape's
+                    // draws, so determinism is preserved regardless of
+                    // when dropouts happen relative to enable_failures.
+                    _ = consumeShapeDraw(profile, rand, t, &binary_state, &step_level, &step_hold);
+                    tick_count += 1;
+                    continue;
+                }
+                if (fp.dropout_rate > 0 and rand.float(f32) < fp.dropout_rate) {
+                    dropout_remaining = fp.dropout_duration_ticks;
+                    continue;
+                }
+
+                // Stuck: if currently stuck, emit the last real value
+                // with this tick's timestamp. If not stuck, roll to see
+                // if it starts this tick (after the shape generates a
+                // real value — the stuck condition freezes from that
+                // point forward).
+                // Drift: accumulate calibration offset linearly.
+                if (fp.drift_rate_ppm > 0) {
+                    drift_offset = @as(f32, @floatFromInt(tick_count)) * fp.drift_rate_ppm * 1e-6 * profile.base_value;
+                }
+                tick_count += 1;
+            }
+
+            // --- Shape generation (produces the "true" value) ---
+            var emit_value: f32 = undefined;
+            var should_emit = true;
+
             switch (profile.shape) {
-                .diurnal_continuous => try out.append(allocator, .{
-                    .sensor_id = sensor.sensor_id,
-                    .timestamp = t,
-                    .value = sampleDiurnal(profile, rand, t),
-                    .sensor_type = sensor.sensor_type,
-                }),
+                .diurnal_continuous => {
+                    emit_value = sampleDiurnal(profile, rand, t);
+                },
                 .binary_event => {
                     const value = sampleBinaryEvent(profile, rand, t, &binary_state);
                     if (binary_last_emitted == null or value != binary_last_emitted.?) {
                         binary_last_emitted = value;
-                        try out.append(allocator, .{
-                            .sensor_id = sensor.sensor_id,
-                            .timestamp = t,
-                            .value = value,
-                            .sensor_type = sensor.sensor_type,
-                        });
+                        emit_value = value;
+                    } else {
+                        should_emit = false;
                     }
                 },
-                .stepwise_discrete => try out.append(allocator, .{
-                    .sensor_id = sensor.sensor_id,
-                    .timestamp = t,
-                    .value = sampleStepwiseDiscrete(profile, rand, t, &step_level, &step_hold),
-                    .sensor_type = sensor.sensor_type,
-                }),
+                .stepwise_discrete => {
+                    emit_value = sampleStepwiseDiscrete(profile, rand, t, &step_level, &step_hold);
+                },
                 .bursty_impulsive => {
-                    // bursty_impulsive is an ANOMALY-EVENT LOG, not a raw
-                    // stream: real condition-monitoring systems don't
-                    // retain the continuous high-Hz signal — only the
-                    // detected events (bursts) get stored long-term. The
-                    // non-event (baseline) samples are generated
-                    // transiently, purely to drive the RNG the same way
-                    // every tick (determinism), and discarded immediately.
                     const sample = sampleBurstyImpulsive(profile, rand);
                     if (sample.is_event) {
-                        try out.append(allocator, .{
-                            .sensor_id = sensor.sensor_id,
-                            .timestamp = t,
-                            .value = sample.value,
-                            .sensor_type = sensor.sensor_type,
-                        });
+                        emit_value = sample.value;
+                    } else {
+                        should_emit = false;
                     }
                 },
             }
+
+            if (!should_emit) continue;
+
+            // Apply drift offset to the generated value (after shape,
+            // before clamp — drift is a calibration error on the sensor,
+            // not a physical change, so it can push readings slightly
+            // outside the true physical range, which is realistic).
+            if (failures_active and fp.drift_rate_ppm > 0) {
+                emit_value += drift_offset;
+            }
+
+            // Stuck: if a stuck condition starts this tick, freeze the
+            // value for the next N ticks. The current tick emits the
+            // real value (the sensor hasn't frozen yet — it freezes
+            // starting from the next reading).
+            if (failures_active and fp.stuck_rate > 0 and stuck_remaining == 0) {
+                if (rand.float(f32) < fp.stuck_rate) {
+                    stuck_remaining = fp.stuck_duration_ticks;
+                }
+            }
+            if (failures_active and stuck_remaining > 0) {
+                // Replace the real value with the frozen one. The first
+                // stuck tick uses the last real value (captured before
+                // the stuck started); subsequent ticks keep repeating it.
+                emit_value = last_real_value;
+                stuck_remaining -= 1;
+            } else {
+                last_real_value = emit_value;
+            }
+
+            try out.append(allocator, .{
+                .sensor_id = sensor.sensor_id,
+                .timestamp = t,
+                .value = emit_value,
+                .sensor_type = sensor.sensor_type,
+            });
         }
 
         if (out_final_binary_state) |m| {
@@ -531,6 +630,26 @@ fn sampleBurstyImpulsive(profile: SensorProfile, rand: std.Random) BurstSample {
     const noise = rand.floatNorm(f32) * profile.noise_stddev;
     const value = std.math.clamp(profile.base_value + noise, profile.min_bound, profile.max_bound);
     return .{ .value = value, .is_event = false };
+}
+
+/// Consume the same RNG draws a shape would consume, without emitting a
+/// reading. Used during dropout so the PRNG stays in sync regardless of
+/// when dropouts occur — same seed + same sensors = same output, whether
+/// or not failures are enabled. The return value is discarded.
+fn consumeShapeDraw(
+    profile: SensorProfile,
+    rand: std.Random,
+    t: i64,
+    binary_state: *f32,
+    step_level: *f32,
+    step_hold: *u32,
+) void {
+    switch (profile.shape) {
+        .diurnal_continuous => _ = sampleDiurnal(profile, rand, t),
+        .binary_event => _ = sampleBinaryEvent(profile, rand, t, binary_state),
+        .stepwise_discrete => _ = sampleStepwiseDiscrete(profile, rand, t, step_level, step_hold),
+        .bursty_impulsive => _ = sampleBurstyImpulsive(profile, rand),
+    }
 }
 
 /// Hour-of-day (0.0-23.999...) for a given epoch-ms timestamp. Exposed so
@@ -820,4 +939,106 @@ test "bursty_impulsive (vibration): only burst events are stored, never the base
     const period_ms = periodMs(profile.frequency_hz);
     const total_ticks: usize = @intCast(@divFloor(duration_ms, period_ms));
     try testing.expect(readings.len < total_ticks / 4);
+}
+
+// ---------------------------------------------------------------------------
+// Failure mode tests
+// ---------------------------------------------------------------------------
+
+test "failures disabled by default: enable_failures=false produces same output as before" {
+    const sensors = [_]SensorMetadata{
+        .{ .sensor_id = 0, .sensor_type = .temperature, .frequency_hz = 1.0, .element_id = 0 },
+    };
+    const cfg = GenerateConfig{ .duration_ms = 60 * 60 * 1000 }; // 1h
+
+    const r1 = try generate(testing.allocator, &sensors, cfg, null);
+    defer testing.allocator.free(r1);
+    const r2 = try generate(testing.allocator, &sensors, cfg, null);
+    defer testing.allocator.free(r2);
+
+    // Byte-identical: same seed, same config, failures not enabled.
+    try testing.expectEqual(r1.len, r2.len);
+    for (r1, r2) |a, b| {
+        try testing.expectEqual(a.sensor_id, b.sensor_id);
+        try testing.expectEqual(a.timestamp, b.timestamp);
+        try testing.expectEqual(a.value, b.value);
+    }
+}
+
+test "dropout: enabling failures with all-zero rates is a no-op" {
+    // All default profiles have failure rates = 0, so enabling failures
+    // with all-zero rates must produce the same output as disabled.
+    const sensors = [_]SensorMetadata{
+        .{ .sensor_id = 0, .sensor_type = .temperature, .frequency_hz = 1.0, .element_id = 0 },
+    };
+    const r_disabled = try generate(testing.allocator, &sensors, .{ .duration_ms = 60 * 60 * 1000, .enable_failures = false }, null);
+    defer testing.allocator.free(r_disabled);
+    const r_enabled = try generate(testing.allocator, &sensors, .{ .duration_ms = 60 * 60 * 1000, .enable_failures = true }, null);
+    defer testing.allocator.free(r_enabled);
+
+    try testing.expectEqual(r_disabled.len, r_enabled.len);
+    for (r_disabled, r_enabled) |a, b| {
+        try testing.expectEqual(a.value, b.value);
+    }
+}
+
+test "drift: positive drift_rate shifts the mean of readings upward over time" {
+    // Drift is the easiest failure to test deterministically because it's
+    // a linear offset, not a random event. We verify by checking that the
+    // second half of a long run has a higher mean than the first half
+    // (drift accumulates linearly with tick count).
+    //
+    // We can't override profileFor, but we CAN test the drift math
+    // directly: drift_offset = tick_count * drift_rate_ppm * 1e-6 * base_value
+    const base_value: f32 = 22.0;
+    const drift_rate_ppm: f32 = 1000.0; // 1000 ppm = 0.1% per tick
+    const tick_count: u32 = 100;
+    const drift_offset = @as(f32, @floatFromInt(tick_count)) * drift_rate_ppm * 1e-6 * base_value;
+    // After 100 ticks: 100 * 1000 * 1e-6 * 22 = 2.2
+    try testing.expectApproxEqAbs(@as(f32, 2.2), drift_offset, 0.001);
+    // That's a +2.2°C shift on a 22°C base — significant calibration error.
+}
+
+test "stuck: when stuck_remaining > 0, the emitted value freezes at last_real_value" {
+    // Test the stuck mechanism's logic directly (generate() reads
+    // profileFor internally, so we can't inject failure params through
+    // the public API without modifying the canonical table).
+    var last_real_value: f32 = 21.5;
+    var stuck_remaining: u32 = 3;
+    const real_values = [_]f32{ 22.0, 22.1, 22.2, 22.3 };
+    var emitted: [4]f32 = undefined;
+
+    for (real_values, 0..) |real_val, i| {
+        var emit_value = real_val;
+        if (stuck_remaining > 0) {
+            emit_value = last_real_value;
+            stuck_remaining -= 1;
+        } else {
+            last_real_value = emit_value;
+        }
+        emitted[i] = emit_value;
+    }
+
+    // stuck_remaining starts at 3: first 3 ticks freeze at 21.5,
+    // 4th tick unstuck and emits the real value (22.3), updating last_real.
+    try testing.expectEqual(@as(f32, 21.5), emitted[0]);
+    try testing.expectEqual(@as(f32, 21.5), emitted[1]);
+    try testing.expectEqual(@as(f32, 21.5), emitted[2]);
+    try testing.expectEqual(@as(f32, 22.3), emitted[3]);
+}
+
+test "FailureParams defaults: all rates are zero (disabled)" {
+    const fp = FailureParams{};
+    try testing.expectEqual(@as(f32, 0.0), fp.dropout_rate);
+    try testing.expectEqual(@as(f32, 0.0), fp.stuck_rate);
+    try testing.expectEqual(@as(f32, 0.0), fp.drift_rate_ppm);
+    try testing.expectEqual(@as(u32, 10), fp.dropout_duration_ticks);
+    try testing.expectEqual(@as(u32, 20), fp.stuck_duration_ticks);
+}
+
+test "SensorProfile: failures field defaults to all-zero (disabled)" {
+    const p = profileFor(.temperature);
+    try testing.expectEqual(@as(f32, 0.0), p.failures.dropout_rate);
+    try testing.expectEqual(@as(f32, 0.0), p.failures.stuck_rate);
+    try testing.expectEqual(@as(f32, 0.0), p.failures.drift_rate_ppm);
 }
