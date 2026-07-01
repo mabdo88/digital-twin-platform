@@ -156,6 +156,28 @@ pub fn floorOfZone(self: *const Self, zone_id: u32) ?u32 {
     return self.zone_index.floorOfZone(zone_id);
 }
 
+/// Removes every reading of `sensor_type` older than `cutoff_timestamp` via
+/// an in-place stable compaction across all four parallel arrays (readings
+/// of other types, and this backend's zone/floor topology, are untouched).
+/// See storage_backend.zig's pruneOlderThan contract.
+pub fn pruneOlderThan(self: *Self, sensor_type: SensorType, cutoff_timestamp: i64) !void {
+    var write: usize = 0;
+    for (self.sensor_ids.items, 0..) |sid, i| {
+        const ts = self.timestamps.items[i];
+        const st = self.sensor_types.items[i];
+        if (st == sensor_type and ts < cutoff_timestamp) continue;
+        self.sensor_ids.items[write] = sid;
+        self.timestamps.items[write] = ts;
+        self.values.items[write] = self.values.items[i];
+        self.sensor_types.items[write] = st;
+        write += 1;
+    }
+    self.sensor_ids.shrinkRetainingCapacity(write);
+    self.timestamps.shrinkRetainingCapacity(write);
+    self.values.shrinkRetainingCapacity(write);
+    self.sensor_types.shrinkRetainingCapacity(write);
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -304,6 +326,33 @@ test "SoA: empty backend" {
     const rng = try backend.rangeByTime(std.testing.allocator, .{ .start_time = 0, .end_time = 100 });
     defer std.testing.allocator.free(rng);
     try std.testing.expectEqual(@as(usize, 0), rng.len);
+}
+
+test "SoA: pruneOlderThan removes only the matching type older than cutoff" {
+    var backend = try Self.init(std.testing.allocator);
+    defer backend.deinit();
+
+    try backend.insert(.{ .sensor_id = 1, .timestamp = 50, .value = 1.0, .sensor_type = .temperature });
+    try backend.insert(.{ .sensor_id = 1, .timestamp = 150, .value = 2.0, .sensor_type = .temperature });
+    try backend.insert(.{ .sensor_id = 2, .timestamp = 50, .value = 3.0, .sensor_type = .humidity });
+
+    try backend.pruneOlderThan(.temperature, 100);
+
+    try std.testing.expectEqual(@as(usize, 2), backend.count());
+    const all = try backend.iterateAll(std.testing.allocator);
+    defer std.testing.allocator.free(all);
+
+    var found_old_temp = false;
+    var found_new_temp = false;
+    var found_humidity = false;
+    for (all) |r| {
+        if (r.sensor_type == .temperature and r.timestamp == 50) found_old_temp = true;
+        if (r.sensor_type == .temperature and r.timestamp == 150) found_new_temp = true;
+        if (r.sensor_type == .humidity and r.timestamp == 50) found_humidity = true;
+    }
+    try std.testing.expect(!found_old_temp);
+    try std.testing.expect(found_new_temp);
+    try std.testing.expect(found_humidity);
 }
 
 test "AoS and SoA produce identical results" {

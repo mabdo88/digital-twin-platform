@@ -86,6 +86,7 @@ pub fn assertImplements(comptime T: type) void {
     if (!@hasDecl(T, "sensorIdsByZone")) @compileError("StorageBackend: " ++ @typeName(T) ++ " missing pub fn sensorIdsByZone");
     if (!@hasDecl(T, "sensorIdsByFloor")) @compileError("StorageBackend: " ++ @typeName(T) ++ " missing pub fn sensorIdsByFloor");
     if (!@hasDecl(T, "floorOfZone")) @compileError("StorageBackend: " ++ @typeName(T) ++ " missing pub fn floorOfZone");
+    if (!@hasDecl(T, "pruneOlderThan")) @compileError("StorageBackend: " ++ @typeName(T) ++ " missing pub fn pruneOlderThan");
 }
 
 // ---------------------------------------------------------------------------
@@ -203,6 +204,28 @@ pub fn assertImplements(comptime T: type) void {
 //      The floor_id most recently registered (via registerFloor) for
 //      zone_id, or null if that zone has never been registered to a
 //      floor. No allocation — a value lookup, like getLatestBySensor.
+//
+//  pub fn pruneOlderThan(self: *T, sensor_type: SensorType, cutoff_timestamp: i64) !void
+//
+//      Remove every stored reading of `sensor_type` whose timestamp is
+//      strictly less than `cutoff_timestamp`. Readings of other sensor
+//      types, and zone/floor topology (registerZone/registerFloor), are
+//      untouched — topology is independent of how many readings a sensor
+//      has (see registerZone's contract above).
+//
+//      This models real per-sensor-type retention: a single backend
+//      instance holds every sensor type at once, but each type's
+//      retention window differs (e.g. temperature 90 days vs. structural
+//      7 years), so the caller prunes per type with that type's own
+//      cutoff, not once globally for the whole backend.
+//
+//      Fallible like insert(): most backends compact in place with no
+//      allocation, but RingBuffer's circular layout needs a small
+//      scratch allocation (bounded by one sensor's own capacity, not the
+//      dataset) to compact safely without corrupting entries not yet
+//      read. Safe to call when no reading of that type is old enough to
+//      remove (a no-op). Does not affect readings of other sensor types
+//      or a sensor's zone/floor registration.
 
 // ---------------------------------------------------------------------------
 // Tests — verify the interface types and assertImplements compile.
@@ -265,6 +288,7 @@ const StubBackend = struct {
     pub fn floorOfZone(_: *const StubBackend, _: u32) ?u32 {
         return null;
     }
+    pub fn pruneOlderThan(_: *StubBackend, _: SensorType, _: i64) !void {}
 };
 
 test "assertImplements accepts a valid backend" {
@@ -311,6 +335,7 @@ const ExtendedBackend = struct {
     pub fn floorOfZone(_: *const ExtendedBackend, _: u32) ?u32 {
         return null;
     }
+    pub fn pruneOlderThan(_: *ExtendedBackend, _: SensorType, _: i64) !void {}
     // Not part of the StorageBackend interface — should not affect the check.
     pub fn debugDump(_: *const ExtendedBackend) void {}
 };

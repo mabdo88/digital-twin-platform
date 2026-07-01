@@ -46,6 +46,10 @@ pub fn World(comptime Backend: type) type {
         /// type. Same shape as sensor_index, keyed by type instead of
         /// sensor_id. See readingsForType's doc comment.
         type_index: ?std.AutoHashMap(sb.SensorType, std.ArrayList(u32)) = null,
+        /// Every distinct sensor_id present in cached_all, sorted ascending.
+        /// Derived from sensor_index's key set (built once, invalidated
+        /// alongside it on insert()). See allSensorIds's doc comment.
+        all_sensor_ids: ?[]const u32 = null,
 
         const Self = @This();
 
@@ -81,11 +85,19 @@ pub fn World(comptime Backend: type) type {
             }
         }
 
+        fn freeAllSensorIds(self: *Self) void {
+            if (self.all_sensor_ids) |ids| {
+                self.allocator.free(ids);
+                self.all_sensor_ids = null;
+            }
+        }
+
         pub fn deinit(self: *Self) void {
             if (self.cached_all) |all| self.allocator.free(all);
             self.freeSensorIndex();
             self.freeTypeStats();
             self.freeTypeIndex();
+            self.freeAllSensorIds();
             self.backend.deinit();
         }
 
@@ -97,6 +109,7 @@ pub fn World(comptime Backend: type) type {
             self.freeSensorIndex();
             self.freeTypeStats();
             self.freeTypeIndex();
+            self.freeAllSensorIds();
             return self.backend.insert(reading);
         }
 
@@ -176,6 +189,35 @@ pub fn World(comptime Backend: type) type {
             const result = try self.allocator.alloc(sb.SensorReading, indices.items.len);
             for (indices.items, 0..) |i, j| result[j] = all[i];
             return result;
+        }
+
+        /// Every distinct sensor_id present in the dataset, sorted ascending
+        /// — cached until the next insert(), borrowed (do not free), same
+        /// convention as iterateAll().
+        ///
+        /// Why this exists: query_spatial_radius used to call iterateAll()
+        /// and dedupe by sensor_id while recomputing that sensor's position
+        /// once per READING — at real per-sensor-type volume (tens of
+        /// thousands of readings per sensor) that's the same distance
+        /// calculation repeated tens of thousands of times for one sensor,
+        /// when the answer only ever depends on the distinct sensor count.
+        /// This index is built once from sensor_index's key set (itself
+        /// already cached), so the query becomes O(distinct sensors)
+        /// instead of O(total readings).
+        pub fn allSensorIds(self: *Self) ![]const u32 {
+            if (self.all_sensor_ids) |ids| return ids;
+            const idx = try self.ensureSensorIndex();
+            var ids = try self.allocator.alloc(u32, idx.count());
+            var it = idx.keyIterator();
+            var i: usize = 0;
+            while (it.next()) |k| : (i += 1) ids[i] = k.*;
+            std.mem.sort(u32, ids, {}, struct {
+                fn lt(_: void, a: u32, b: u32) bool {
+                    return a < b;
+                }
+            }.lt);
+            self.all_sensor_ids = ids;
+            return ids;
         }
 
         /// Population mean/std-dev/count for every reading of `sensor_type`,
@@ -280,6 +322,24 @@ pub fn World(comptime Backend: type) type {
 
         pub fn rangeByTime(self: *const Self, q: sb.RangeQuery) ![]const sb.SensorReading {
             return self.backend.rangeByTime(self.allocator, q);
+        }
+
+        /// Removes every reading of `sensor_type` older than
+        /// `cutoff_timestamp` from the backend. Invalidates every
+        /// World-level cache (cached_all, sensor_index, type_stats,
+        /// type_index, all_sensor_ids) exactly like insert() does — pruning
+        /// changes the underlying dataset just as much as adding to it, and
+        /// nothing here is safe to keep serving from a stale snapshot.
+        pub fn pruneOlderThan(self: *Self, sensor_type: sb.SensorType, cutoff_timestamp: i64) !void {
+            if (self.cached_all) |all| {
+                self.allocator.free(all);
+                self.cached_all = null;
+            }
+            self.freeSensorIndex();
+            self.freeTypeStats();
+            self.freeTypeIndex();
+            self.freeAllSensorIds();
+            return self.backend.pruneOlderThan(sensor_type, cutoff_timestamp);
         }
 
         pub fn registerZone(self: *Self, sensor_id: u32, zone_id: u32) !void {

@@ -203,6 +203,14 @@ The same folder also holds **status docs** (read as current state, not as proced
   against actual repo state each time it's updated. Treat this as more current than
   `AGENT.md`'s phase checklists, which have drifted from what was actually built
   (e.g. `AGENT.md`'s Phase 3 query list no longer matches `queries.zig`).
+- **`storage-redesign-plan.md`** — agreed 2026-06-30, **not yet implemented**: real
+  retention-bound per-sensor datasets (no toy 1h dataset, no sampling/replication
+  across sibling sensors), real eviction across every backend (not just
+  RingBuffer), a live tick-based simulator, and no backend-eligibility assumptions
+  (every backend races every query, empirical winner reported). This plan
+  explicitly supersedes §3.4's "minimum 25 iterations" rule below once
+  implemented — read it before touching `synthetic/generator.zig`,
+  `ecs/storage/*`, `benchmark/queries.zig`, or `main.zig`'s orchestration.
 
 ---
 
@@ -226,3 +234,13 @@ The same folder also holds **status docs** (read as current state, not as proced
 
 If a task forces one of these decisions, surface it in the PR description rather than
 quietly hard-coding a choice.
+
+## graphify
+
+This project has a knowledge graph at graphify-out/ with god nodes, community structure, and cross-file relationships.
+
+Rules:
+- For codebase questions, first run `graphify query "<question>"` when graphify-out/graph.json exists. Use `graphify path "<A>" "<B>"` for relationships and `graphify explain "<concept>"` for focused concepts. These return a scoped subgraph, usually much smaller than GRAPH_REPORT.md or raw grep output.
+- If graphify-out/wiki/index.md exists, use it for broad navigation instead of raw source browsing.
+- Read graphify-out/GRAPH_REPORT.md only for broad architecture review or when query/path/explain do not surface enough context.
+- After modifying code, run `graphify update .` to keep the graph current (AST-only, no API cost).

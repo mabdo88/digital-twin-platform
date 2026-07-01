@@ -190,6 +190,53 @@ pub fn floorOfZone(self: *const Self, zone_id: u32) ?u32 {
     return self.zone_index.floorOfZone(zone_id);
 }
 
+/// Removes every reading of `sensor_type` older than `cutoff_timestamp`,
+/// per sensor. Unlike the flat backends, RingBuffer's storage is a fixed
+/// circular buffer indexed by `head`/`len` — physical slot order and
+/// logical (oldest-to-newest) order only coincide when there's been no
+/// wraparound, so an in-place sequential compaction (like the flat
+/// backends use) can overwrite an entry before it's been read. This uses
+/// a small scratch allocation bounded by that one sensor's own `len` (not
+/// the dataset) to walk logical order safely, then rewrites the buffer
+/// starting at index 0. `latest` is recomputed only if it was itself
+/// pruned. Zone/floor topology is untouched. See storage_backend.zig's
+/// pruneOlderThan contract.
+pub fn pruneOlderThan(self: *Self, sensor_type: SensorType, cutoff_timestamp: i64) !void {
+    var it = self.sensors.iterator();
+    while (it.next()) |entry| {
+        const sensor_buf = entry.value_ptr;
+        if (sensor_buf.len == 0) continue;
+
+        var scratch = try std.ArrayList(SensorReading).initCapacity(self.allocator, sensor_buf.len);
+        defer scratch.deinit(self.allocator);
+
+        const start = (sensor_buf.head + self.capacity_per_sensor - sensor_buf.len) % self.capacity_per_sensor;
+        for (0..sensor_buf.len) |i| {
+            const r = sensor_buf.buffer[(start + i) % self.capacity_per_sensor];
+            if (r.sensor_type == sensor_type and r.timestamp < cutoff_timestamp) continue;
+            scratch.appendAssumeCapacity(r);
+        }
+
+        const removed = sensor_buf.len - scratch.items.len;
+        if (removed == 0) continue;
+
+        for (scratch.items, 0..) |r, i| sensor_buf.buffer[i] = r;
+        sensor_buf.len = scratch.items.len;
+        sensor_buf.head = scratch.items.len % self.capacity_per_sensor;
+        self.total_count -= removed;
+
+        if (sensor_buf.latest) |latest| {
+            if (latest.sensor_type == sensor_type and latest.timestamp < cutoff_timestamp) {
+                var new_latest: ?SensorReading = null;
+                for (scratch.items) |r| {
+                    if (new_latest == null or r.timestamp > new_latest.?.timestamp) new_latest = r;
+                }
+                sensor_buf.latest = new_latest;
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -480,4 +527,47 @@ test "RingBuffer and TimeSeries produce identical results when data fits in buff
         try std.testing.expectEqual(ts_all[i].value, rb_all[i].value);
         try std.testing.expectEqual(ts_all[i].sensor_type, rb_all[i].sensor_type);
     }
+}
+
+test "RingBuffer: pruneOlderThan handles a wrapped buffer (physical order != logical order)" {
+    var backend = try Self.init(std.testing.allocator);
+    defer backend.deinit();
+    // Force wraparound with only 4 inserts instead of 1000+.
+    backend.capacity_per_sensor = 3;
+
+    // Sensor 1's ring (capacity 3) after these 4 inserts has wrapped:
+    // physically buf[0]=t40(temp, overwrote t10), buf[1]=t20(humidity),
+    // buf[2]=t30(temp) -- logical oldest-to-newest order is t20, t30, t40.
+    try backend.insert(.{ .sensor_id = 1, .timestamp = 10, .value = 1.0, .sensor_type = .temperature });
+    try backend.insert(.{ .sensor_id = 1, .timestamp = 20, .value = 2.0, .sensor_type = .humidity });
+    try backend.insert(.{ .sensor_id = 1, .timestamp = 30, .value = 3.0, .sensor_type = .temperature });
+    try backend.insert(.{ .sensor_id = 1, .timestamp = 40, .value = 4.0, .sensor_type = .temperature });
+
+    try std.testing.expectEqual(@as(usize, 3), backend.count());
+
+    // Prune temperature < 35: removes t30 (temperature, 30<35), keeps
+    // t20 (different type) and t40 (temperature, but 40>=35).
+    try backend.pruneOlderThan(.temperature, 35);
+
+    try std.testing.expectEqual(@as(usize, 2), backend.count());
+
+    const all = try backend.iterateAll(std.testing.allocator);
+    defer std.testing.allocator.free(all);
+    try std.testing.expectEqual(@as(usize, 2), all.len);
+
+    var found_20 = false;
+    var found_30 = false;
+    var found_40 = false;
+    for (all) |r| {
+        if (r.timestamp == 20) found_20 = true;
+        if (r.timestamp == 30) found_30 = true;
+        if (r.timestamp == 40) found_40 = true;
+    }
+    try std.testing.expect(found_20);
+    try std.testing.expect(!found_30);
+    try std.testing.expect(found_40);
+
+    // latest survives unchanged (40 wasn't pruned).
+    const latest = backend.getLatestBySensor(1).?;
+    try std.testing.expectEqual(@as(i64, 40), latest.timestamp);
 }

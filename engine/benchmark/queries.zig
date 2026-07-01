@@ -521,35 +521,24 @@ fn vec3DistSq(a: Vec3, b: Vec3) f32 {
 ///
 /// Pure: calls only world.iterateAll() — no backend-specific code.
 pub fn query_spatial_radius(world: anytype, center: Vec3, radius_m: f32) ![]EntityId {
-    // world.iterateAll() is cached/borrowed at the World level — do not free.
-    const all = try world.iterateAll();
+    // world.allSensorIds() is cached/borrowed at the World level, already
+    // sorted ascending — do not free. Position is per-sensor, not
+    // per-reading, so this only computes each sensor's distance once,
+    // regardless of how many readings that sensor has (see allSensorIds's
+    // doc comment for why iterating readings here was wrong at real scale).
+    const sensor_ids = try world.allSensorIds();
 
     const radius_sq = radius_m * radius_m;
-
-    var seen = std.AutoHashMap(EntityId, void).init(world.allocator);
-    defer seen.deinit();
-
-    for (all) |r| {
-        if (seen.contains(r.sensor_id)) continue;
-        const pos = sensorPosition(r.sensor_id);
-        if (vec3DistSq(pos, center) <= radius_sq) {
-            try seen.put(r.sensor_id, {});
-        }
-    }
 
     var result: std.ArrayList(EntityId) = .empty;
     defer result.deinit(world.allocator);
 
-    var it = seen.keyIterator();
-    while (it.next()) |k| {
-        try result.append(world.allocator, k.*);
-    }
-
-    std.mem.sort(EntityId, result.items, {}, struct {
-        fn lt(_: void, lhs: EntityId, rhs: EntityId) bool {
-            return lhs < rhs;
+    for (sensor_ids) |sid| {
+        const pos = sensorPosition(sid);
+        if (vec3DistSq(pos, center) <= radius_sq) {
+            try result.append(world.allocator, sid);
         }
-    }.lt);
+    }
 
     return try result.toOwnedSlice(world.allocator);
 }
@@ -584,24 +573,15 @@ pub fn query_zone_hierarchy(world: anytype, zone_id: u32, depth: u32) ![]EntityI
             return world.sensorIdsByFloor(floor_id);
         },
         else => {
-            // world.iterateAll() is cached/borrowed at the World level — do not free.
-            const all = try world.iterateAll();
-
-            var seen = std.AutoHashMap(EntityId, void).init(world.allocator);
-            defer seen.deinit();
-            for (all) |r| try seen.put(r.sensor_id, {});
-
-            var result: std.ArrayList(EntityId) = .empty;
-            defer result.deinit(world.allocator);
-            var it = seen.keyIterator();
-            while (it.next()) |k| try result.append(world.allocator, k.*);
-
-            std.mem.sort(EntityId, result.items, {}, struct {
-                fn lt(_: void, lhs: EntityId, rhs: EntityId) bool {
-                    return lhs < rhs;
-                }
-            }.lt);
-            return try result.toOwnedSlice(world.allocator);
+            // world.allSensorIds() is cached/borrowed at the World level,
+            // already deduped and sorted ascending (see its doc comment) —
+            // clone into an owned slice since this function's contract
+            // (unlike depth 0/1's own sensorIdsByZone/Floor calls) is that
+            // the caller frees the result unconditionally regardless of
+            // depth. Cloning a per-sensor list is far cheaper than the old
+            // iterateAll()+hashset+sort over every reading.
+            const sensor_ids = try world.allSensorIds();
+            return try world.allocator.dupe(EntityId, sensor_ids);
         },
     }
 }
@@ -784,31 +764,34 @@ pub fn query_latest_zone(world: anytype, zone_id: u32) ![]const sb.SensorReading
 /// Q3: Latest reading per sensor of a given type.
 /// Returns one reading per sensor matching sensor_type, sorted by sensor_id
 /// ascending. Caller owns the returned slice (free with world.allocator).
-/// Pure: calls only world.iterateAll — no backend-specific code.
+/// Pure: calls only world.readingsForType — no backend-specific code.
 pub fn query_latest_by_type(world: anytype, sensor_type: sb.SensorType) ![]const sb.SensorReading {
-    // world.iterateAll() is cached/borrowed at the World level — do not free.
-    const all = try world.iterateAll();
+    // world.readingsForType is an index lookup scoped to this type (not a
+    // full-dataset scan via iterateAll — see readingsForType's doc
+    // comment). Owned; must free.
+    const type_readings = try world.readingsForType(sensor_type);
+    defer world.allocator.free(type_readings);
+
+    // Track latest-per-sensor via a hash map, not a linear scan of the
+    // result list: at real per-sensor-type volume (hundreds of sensors,
+    // tens of thousands of readings each) a linear "already seen?" scan
+    // over the growing result list made this O(readings x distinct
+    // sensors) instead of O(readings).
+    var latest = std.AutoHashMap(u32, sb.SensorReading).init(world.allocator);
+    defer latest.deinit();
+
+    for (type_readings) |r| {
+        const gop = try latest.getOrPut(r.sensor_id);
+        if (!gop.found_existing or r.timestamp > gop.value_ptr.timestamp) {
+            gop.value_ptr.* = r;
+        }
+    }
 
     var result: std.ArrayList(sb.SensorReading) = .empty;
     defer result.deinit(world.allocator);
 
-    for (all) |r| {
-        if (r.sensor_type != sensor_type) continue;
-
-        var found = false;
-        for (result.items) |*existing| {
-            if (existing.sensor_id == r.sensor_id) {
-                if (r.timestamp > existing.timestamp) {
-                    existing.* = r;
-                }
-                found = true;
-                break;
-            }
-        }
-        if (!found) {
-            try result.append(world.allocator, r);
-        }
-    }
+    var it = latest.valueIterator();
+    while (it.next()) |v| try result.append(world.allocator, v.*);
 
     std.mem.sort(sb.SensorReading, result.items, {}, struct {
         fn lt(_: void, lhs: sb.SensorReading, rhs: sb.SensorReading) bool {

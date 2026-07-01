@@ -212,6 +212,35 @@ pub fn rangeByTime(self: *const Self, allocator: std.mem.Allocator, q: RangeQuer
     return result;
 }
 
+/// Removes every reading of `sensor_type` older than `cutoff_timestamp` via
+/// an in-place stable compaction across all columns (readings of other
+/// types, and this backend's zone/floor topology, are untouched). Preserves
+/// whatever sort order the columns were already in, so `sorted` doesn't
+/// need to change — but `ts_deltas` encodes each row's delta from its
+/// PREVIOUS row, so removing rows invalidates every delta after the first
+/// removed one; marking `ts_compressed = false` forces `ensureCompressed`
+/// to rebuild it from the (correct) raw `timestamps` column on next use,
+/// same as a fresh insert already does. See storage_backend.zig's
+/// pruneOlderThan contract.
+pub fn pruneOlderThan(self: *Self, sensor_type: SensorType, cutoff_timestamp: i64) !void {
+    var write: usize = 0;
+    for (self.sensor_ids.items, 0..) |sid, i| {
+        const ts = self.timestamps.items[i];
+        const st = self.sensor_types.items[i];
+        if (st == sensor_type and ts < cutoff_timestamp) continue;
+        self.sensor_ids.items[write] = sid;
+        self.timestamps.items[write] = ts;
+        self.values.items[write] = self.values.items[i];
+        self.sensor_types.items[write] = st;
+        write += 1;
+    }
+    self.sensor_ids.shrinkRetainingCapacity(write);
+    self.timestamps.shrinkRetainingCapacity(write);
+    self.values.shrinkRetainingCapacity(write);
+    self.sensor_types.shrinkRetainingCapacity(write);
+    self.ts_compressed = false;
+}
+
 /// Zone/floor topology bookkeeping delegates to the shared ZoneIndex — see
 /// storage_backend.zig's doc comment for the contract.
 pub fn registerZone(self: *Self, sensor_id: u32, zone_id: u32) !void {
@@ -673,4 +702,32 @@ test "Columnar: memoryUsed reflects compressed timestamp footprint, not raw" {
     // And memoryUsed must actually reflect that drop, not just compute it
     // and ignore it.
     try std.testing.expect(mem_after < mem_before);
+}
+
+test "Columnar: pruneOlderThan removes only the matching type older than cutoff and invalidates compression" {
+    var backend = try Self.init(std.testing.allocator);
+    defer backend.deinit();
+
+    try backend.insert(.{ .sensor_id = 1, .timestamp = 50, .value = 1.0, .sensor_type = .temperature });
+    try backend.insert(.{ .sensor_id = 1, .timestamp = 150, .value = 2.0, .sensor_type = .temperature });
+    try backend.insert(.{ .sensor_id = 2, .timestamp = 50, .value = 3.0, .sensor_type = .humidity });
+
+    backend.ensureSorted();
+    try backend.ensureCompressed();
+    try std.testing.expect(backend.ts_compressed);
+
+    try backend.pruneOlderThan(.temperature, 100);
+
+    // Removing rows invalidates the delta encoding (deltas are relative to
+    // the previous row) -- must be marked dirty, not left stale.
+    try std.testing.expect(!backend.ts_compressed);
+
+    try std.testing.expectEqual(@as(usize, 2), backend.count());
+    const rng = try backend.rangeByTime(std.testing.allocator, .{ .start_time = 0, .end_time = 1000 });
+    defer std.testing.allocator.free(rng);
+    try std.testing.expectEqual(@as(usize, 2), rng.len);
+    try std.testing.expectEqual(@as(i64, 50), rng[0].timestamp);
+    try std.testing.expectEqual(SensorType.humidity, rng[0].sensor_type);
+    try std.testing.expectEqual(@as(i64, 150), rng[1].timestamp);
+    try std.testing.expectEqual(SensorType.temperature, rng[1].sensor_type);
 }

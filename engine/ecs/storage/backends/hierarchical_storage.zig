@@ -299,6 +299,47 @@ pub fn floorOfZone(self: *const Self, zone_id: u32) ?u32 {
     return self.nodes.items[floor_node].key;
 }
 
+/// Removes every reading of `sensor_type` older than `cutoff_timestamp`,
+/// per sensor leaf, via the same in-place stable compaction the flat
+/// backends use — readings live per-leaf here, so each leaf's own
+/// `readings` list is compacted independently. `latest` is recomputed from
+/// the surviving readings only if the previous latest reading was itself
+/// pruned (cheap: bounded by that one sensor's own remaining reading
+/// count, not the tree). Tree structure, zone/floor topology, and
+/// `sensor_to_node`/`zone_to_node`/`floor_to_node` are untouched — pruning
+/// only ever removes readings, never a sensor's place in the tree. See
+/// storage_backend.zig's pruneOlderThan contract.
+pub fn pruneOlderThan(self: *Self, sensor_type: SensorType, cutoff_timestamp: i64) !void {
+    for (self.nodes.items) |*node| {
+        if (node.readings == null) continue;
+        const readings = &node.readings.?;
+        var write: usize = 0;
+        var removed: usize = 0;
+        for (readings.items) |r| {
+            if (r.sensor_type == sensor_type and r.timestamp < cutoff_timestamp) {
+                removed += 1;
+                continue;
+            }
+            readings.items[write] = r;
+            write += 1;
+        }
+        if (removed == 0) continue;
+        readings.shrinkRetainingCapacity(write);
+        self.total_count -= removed;
+
+        if (node.latest) |latest| {
+            if (latest.sensor_type == sensor_type and latest.timestamp < cutoff_timestamp) {
+                var new_latest: ?SensorReading = null;
+                for (readings.items) |r| {
+                    if (new_latest == null or r.timestamp > new_latest.?.timestamp) new_latest = r;
+                }
+                node.latest = new_latest;
+            }
+        }
+    }
+    self.cache_valid = false;
+}
+
 /// Walks straight to the zone node (O(1) hashmap lookup) and collects its
 /// leaf sensor_ids — never touches nodes outside that subtree.
 pub fn sensorIdsByZone(self: *const Self, allocator: std.mem.Allocator, zone_id: u32) ![]u32 {
@@ -718,4 +759,42 @@ test "Hierarchical and TimeSeries produce identical query results" {
         try std.testing.expectEqual(ts_all[i].value, hier_all[i].value);
         try std.testing.expectEqual(ts_all[i].sensor_type, hier_all[i].sensor_type);
     }
+}
+
+test "Hierarchical: pruneOlderThan removes only the matching type older than cutoff and recomputes latest" {
+    var backend = try Self.init(std.testing.allocator);
+    defer backend.deinit();
+
+    try backend.insert(.{ .sensor_id = 1, .timestamp = 50, .value = 1.0, .sensor_type = .temperature });
+    // This is sensor 1's latest reading, and it's the one that gets pruned
+    // -- latest must be recomputed from the surviving reading, not left
+    // stale or nulled out entirely.
+    try backend.insert(.{ .sensor_id = 1, .timestamp = 90, .value = 2.0, .sensor_type = .temperature });
+    try backend.insert(.{ .sensor_id = 1, .timestamp = 150, .value = 3.0, .sensor_type = .temperature });
+    try backend.insert(.{ .sensor_id = 2, .timestamp = 50, .value = 4.0, .sensor_type = .humidity });
+
+    try backend.pruneOlderThan(.temperature, 100);
+
+    try std.testing.expectEqual(@as(usize, 2), backend.count());
+
+    const latest = backend.getLatestBySensor(1).?;
+    try std.testing.expectEqual(@as(i64, 150), latest.timestamp);
+    try std.testing.expectEqual(@as(f32, 3.0), latest.value);
+
+    // Untouched: different type, different sensor.
+    const other_latest = backend.getLatestBySensor(2).?;
+    try std.testing.expectEqual(@as(i64, 50), other_latest.timestamp);
+}
+
+test "Hierarchical: pruneOlderThan that empties a sensor's readings nulls its latest" {
+    var backend = try Self.init(std.testing.allocator);
+    defer backend.deinit();
+
+    try backend.insert(.{ .sensor_id = 1, .timestamp = 50, .value = 1.0, .sensor_type = .temperature });
+    try backend.insert(.{ .sensor_id = 1, .timestamp = 90, .value = 2.0, .sensor_type = .temperature });
+
+    try backend.pruneOlderThan(.temperature, 100);
+
+    try std.testing.expectEqual(@as(usize, 0), backend.count());
+    try std.testing.expect(backend.getLatestBySensor(1) == null);
 }

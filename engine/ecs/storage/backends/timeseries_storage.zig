@@ -162,6 +162,22 @@ pub fn floorOfZone(self: *const Self, zone_id: u32) ?u32 {
     return self.zone_index.floorOfZone(zone_id);
 }
 
+/// Removes every reading of `sensor_type` older than `cutoff_timestamp` via
+/// an in-place stable compaction (readings of other types, and this
+/// backend's zone/floor topology, are untouched). Preserves whatever sort
+/// order `log` was already in — a stable filter never reorders survivors,
+/// so `sorted` doesn't need to change. See storage_backend.zig's
+/// pruneOlderThan contract.
+pub fn pruneOlderThan(self: *Self, sensor_type: SensorType, cutoff_timestamp: i64) !void {
+    var write: usize = 0;
+    for (self.log.items) |r| {
+        if (r.sensor_type == sensor_type and r.timestamp < cutoff_timestamp) continue;
+        self.log.items[write] = r;
+        write += 1;
+    }
+    self.log.shrinkRetainingCapacity(write);
+}
+
 // ---------------------------------------------------------------------------
 // Internal — sort maintenance
 // ---------------------------------------------------------------------------
@@ -324,6 +340,31 @@ test "TimeSeries: empty backend" {
     const rng = try backend.rangeByTime(std.testing.allocator, .{ .start_time = 0, .end_time = 100 });
     defer std.testing.allocator.free(rng);
     try std.testing.expectEqual(@as(usize, 0), rng.len);
+}
+
+test "TimeSeries: pruneOlderThan removes only the matching type older than cutoff, preserving sort order" {
+    var backend = try Self.init(std.testing.allocator);
+    defer backend.deinit();
+
+    // Inserted out of order, on purpose — pruning must not depend on the
+    // log already being sorted, and rangeByTime after pruning must still
+    // return correctly sorted results (ensureSorted still works post-prune).
+    try backend.insert(.{ .sensor_id = 1, .timestamp = 150, .value = 2.0, .sensor_type = .temperature });
+    try backend.insert(.{ .sensor_id = 1, .timestamp = 50, .value = 1.0, .sensor_type = .temperature });
+    try backend.insert(.{ .sensor_id = 2, .timestamp = 50, .value = 3.0, .sensor_type = .humidity });
+
+    try backend.pruneOlderThan(.temperature, 100);
+
+    try std.testing.expectEqual(@as(usize, 2), backend.count());
+
+    const rng = try backend.rangeByTime(std.testing.allocator, .{ .start_time = 0, .end_time = 1000 });
+    defer std.testing.allocator.free(rng);
+    try std.testing.expectEqual(@as(usize, 2), rng.len);
+    // Sorted ascending: humidity@50 then temperature@150.
+    try std.testing.expectEqual(@as(i64, 50), rng[0].timestamp);
+    try std.testing.expectEqual(SensorType.humidity, rng[0].sensor_type);
+    try std.testing.expectEqual(@as(i64, 150), rng[1].timestamp);
+    try std.testing.expectEqual(SensorType.temperature, rng[1].sensor_type);
 }
 
 test "TimeSeries: out-of-order inserts are sorted lazily" {

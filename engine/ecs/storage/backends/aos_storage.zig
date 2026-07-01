@@ -109,6 +109,20 @@ pub fn floorOfZone(self: *const Self, zone_id: u32) ?u32 {
     return self.zone_index.floorOfZone(zone_id);
 }
 
+/// Removes every reading of `sensor_type` older than `cutoff_timestamp` via
+/// an in-place stable compaction (readings of other types, and this
+/// backend's zone/floor topology, are untouched). See storage_backend.zig's
+/// pruneOlderThan contract.
+pub fn pruneOlderThan(self: *Self, sensor_type: SensorType, cutoff_timestamp: i64) !void {
+    var write: usize = 0;
+    for (self.readings.items) |r| {
+        if (r.sensor_type == sensor_type and r.timestamp < cutoff_timestamp) continue;
+        self.readings.items[write] = r;
+        write += 1;
+    }
+    self.readings.shrinkRetainingCapacity(write);
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -266,4 +280,33 @@ test "AoS: empty backend" {
     const rng = try backend.rangeByTime(std.testing.allocator, .{ .start_time = 0, .end_time = 100 });
     defer std.testing.allocator.free(rng);
     try std.testing.expectEqual(@as(usize, 0), rng.len);
+}
+
+test "AoS: pruneOlderThan removes only the matching type older than cutoff" {
+    var backend = try Self.init(std.testing.allocator);
+    defer backend.deinit();
+
+    try backend.insert(.{ .sensor_id = 1, .timestamp = 50, .value = 1.0, .sensor_type = .temperature });
+    try backend.insert(.{ .sensor_id = 1, .timestamp = 150, .value = 2.0, .sensor_type = .temperature });
+    // Same age as the pruned temperature reading, but a different type —
+    // must survive.
+    try backend.insert(.{ .sensor_id = 2, .timestamp = 50, .value = 3.0, .sensor_type = .humidity });
+
+    try backend.pruneOlderThan(.temperature, 100);
+
+    try std.testing.expectEqual(@as(usize, 2), backend.count());
+    const all = try backend.iterateAll(std.testing.allocator);
+    defer std.testing.allocator.free(all);
+
+    var found_old_temp = false;
+    var found_new_temp = false;
+    var found_humidity = false;
+    for (all) |r| {
+        if (r.sensor_type == .temperature and r.timestamp == 50) found_old_temp = true;
+        if (r.sensor_type == .temperature and r.timestamp == 150) found_new_temp = true;
+        if (r.sensor_type == .humidity and r.timestamp == 50) found_humidity = true;
+    }
+    try std.testing.expect(!found_old_temp);
+    try std.testing.expect(found_new_temp);
+    try std.testing.expect(found_humidity);
 }
