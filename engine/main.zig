@@ -325,6 +325,18 @@ const SIMULATED_NOW_MS: i64 = 1_700_000_000_000; // 2023-11-14T22:13:20Z
 /// a spurious transition on its first tick.
 const LIVE_TAIL_MS: i64 = 60 * 60 * 1000;
 
+/// RingBuffer is a deliberately tiny, real-time-only cache: a flat capacity
+/// of this many readings PER SENSOR for EVERY sensor type — no per-type,
+/// retention, or frequency math (explicit design decision 2026-07-01). The
+/// live tail writes at each type's own cadence and RingBuffer's existing
+/// eviction (the Nth+1 write drops the oldest) keeps only the most recent
+/// `RINGBUFFER_CAP`. `setRetentionHint` is a genuine no-op on every
+/// full-retention backend, so applying it unconditionally caps only
+/// RingBuffer. Because RingBuffer thus holds a fraction of the data most
+/// queries need, it competes only in the compound recommendation's
+/// real-time track (report.recommendCompound), never the historical one.
+const RINGBUFFER_CAP: usize = 10;
+
 /// Time one query ONCE (metrics.timeQuery with a single timed iteration)
 /// against the real ingested world, using one real sensor's args. This
 /// replaces the retired 25-iteration sample-cycling methodology (CLAUDE.md
@@ -395,6 +407,12 @@ fn benchProfile(
     // backend's world + the two source slices, not a third combined copy).
     var total_readings: usize = 0;
     for (read_parts) |part| total_readings += part.len;
+
+    // Cap every placed sensor type at RINGBUFFER_CAP BEFORE the first
+    // insert (RingBuffer sizes a sensor's buffer when it's first seen); a
+    // no-op on the full-retention backends. This is what makes RingBuffer
+    // a real-time-only cache rather than a full store.
+    for (type_samples) |group| try world.setRetentionHint(group.sensor_type, RINGBUFFER_CAP);
 
     std.debug.print("  [{s}] ingesting {d} readings + {d} zone/floor registrations...\n", .{ b.name, total_readings, locations.len });
     const ingest_start = std.Io.Clock.awake.now(io);
@@ -542,7 +560,19 @@ fn buildSchematicData(
 /// the building-level `report.Recommendation`, just filtered down to that
 /// type's own type-scoped queries (synthetic.profileFor(st).relevant_queries
 /// filtered through filterTypeScoped).
-const TypeRecommendation = struct { sensor_type: sb.SensorType, rec: report.Recommendation };
+const TypeCompoundRecommendation = struct {
+    sensor_type: sb.SensorType,
+    compound: report.CompoundRecommendation,
+};
+
+/// Comptime-extracted names of the full-retention backends
+/// (runner.supported_backends) — passed to `recommendCompound` as the
+/// eligible set for the historical track.
+const full_retention_names = blk: {
+    var names: [runner.supported_backends.len][]const u8 = undefined;
+    for (runner.supported_backends, 0..) |b, i| names[i] = b.name;
+    break :blk names;
+};
 
 fn isSupported(comptime b: runner.BackendEntry) bool {
     for (runner.supported_backends) |sup| {
@@ -662,19 +692,32 @@ pub fn main(init: std.process.Init) !void {
         );
     }
 
-    const recommendation = try report.recommendBackend(allocator, rows.items, scale_label, query_mix);
-    defer allocator.free(recommendation.scores);
+    const compound = try report.recommendCompound(allocator, rows.items, scale_label, query_mix, &full_retention_names);
+    defer allocator.free(compound.realtime.scores);
+    defer allocator.free(compound.historical.scores);
 
     std.debug.print("\n=== Recommendation ({s}) ===\n", .{scale_label});
+    std.debug.print("Real-time track (latest_* queries — all backends compete):\n", .{});
     std.debug.print("{s:<15} {s:>10} {s:>12}\n", .{ "Backend", "Score", "Coverage" });
-    for (recommendation.scores) |s| {
+    for (compound.realtime.scores) |s| {
         std.debug.print("{s:<15} {d:>10.3} {d:>11.0}%\n", .{ s.backend, s.score, s.coverage * 100 });
     }
-    std.debug.print("Winner: {s} (lowest weighted median across this building's query mix; 1.0 = won every query)\n", .{recommendation.winner});
+    std.debug.print("Real-time winner: {s}\n\n", .{compound.realtime.winner});
 
-    var type_recommendations: std.ArrayList(TypeRecommendation) = .empty;
+    std.debug.print("Historical track (aggregation/historical/spatial/anomaly — full-retention backends only):\n", .{});
+    std.debug.print("{s:<15} {s:>10} {s:>12}\n", .{ "Backend", "Score", "Coverage" });
+    for (compound.historical.scores) |s| {
+        std.debug.print("{s:<15} {d:>10.3} {d:>11.0}%\n", .{ s.backend, s.score, s.coverage * 100 });
+    }
+    std.debug.print("Historical winner: {s}\n", .{compound.historical.winner});
+    std.debug.print("\nDeployment combo: {s} (live) + {s} (historical)\n", .{ compound.realtime.winner, compound.historical.winner });
+
+    var type_recommendations: std.ArrayList(TypeCompoundRecommendation) = .empty;
     defer {
-        for (type_recommendations.items) |tr| allocator.free(tr.rec.scores);
+        for (type_recommendations.items) |tr| {
+            allocator.free(tr.compound.realtime.scores);
+            allocator.free(tr.compound.historical.scores);
+        }
         type_recommendations.deinit(allocator);
     }
 
@@ -686,18 +729,24 @@ pub fn main(init: std.process.Init) !void {
         defer allocator.free(type_scoped_mix);
         if (type_scoped_mix.len == 0) continue;
 
-        const rec = try report.recommendBackend(allocator, type_rows.items, @tagName(ts.sensor_type), type_scoped_mix);
-        try type_recommendations.append(allocator, .{ .sensor_type = ts.sensor_type, .rec = rec });
+        const tc = try report.recommendCompound(allocator, type_rows.items, @tagName(ts.sensor_type), type_scoped_mix, &full_retention_names);
+        try type_recommendations.append(allocator, .{ .sensor_type = ts.sensor_type, .compound = tc });
     }
 
     if (type_recommendations.items.len > 0) {
         std.debug.print("\n=== Recommendation by Sensor Type ({s}) ===\n", .{scale_label});
         for (type_recommendations.items) |tr| {
-            std.debug.print("{s:<14} winner: {s}\n", .{ @tagName(tr.sensor_type), tr.rec.winner });
+            if (tr.compound.realtime.scores.len > 0 and tr.compound.historical.scores.len > 0) {
+                std.debug.print("{s:<14} live: {s} | historical: {s}\n", .{ @tagName(tr.sensor_type), tr.compound.realtime.winner, tr.compound.historical.winner });
+            } else if (tr.compound.historical.scores.len > 0) {
+                std.debug.print("{s:<14} historical: {s}\n", .{ @tagName(tr.sensor_type), tr.compound.historical.winner });
+            } else if (tr.compound.realtime.scores.len > 0) {
+                std.debug.print("{s:<14} live: {s}\n", .{ @tagName(tr.sensor_type), tr.compound.realtime.winner });
+            }
         }
     }
 
-    try writeRecommendationReport(allocator, io, args.output_dir, args.bim_path, scale_label, model, placement, recommendation, rows.items, type_recommendations.items);
+    try writeRecommendationReport(allocator, io, args.output_dir, args.bim_path, scale_label, model, placement, compound, rows.items, type_recommendations.items);
     std.debug.print("Wrote recommendation.md to {s}/\n", .{args.output_dir});
 
     const sd = try buildSchematicData(allocator, model, placement, zone_floor);
@@ -726,9 +775,9 @@ fn writeRecommendationReport(
     scale_label: []const u8,
     model: ifc.ParsedModel,
     placement: placer.Placement,
-    recommendation: report.Recommendation,
+    compound: report.CompoundRecommendation,
     rows: []const report.RunRow,
-    type_recommendations: []const TypeRecommendation,
+    type_recommendations: []const TypeCompoundRecommendation,
 ) !void {
     var md: std.ArrayList(u8) = .empty;
     defer md.deinit(allocator);
@@ -754,15 +803,31 @@ fn writeRecommendationReport(
     try md.print(allocator, "\n> Honesty headline: relative rankings are reliable; absolute numbers are approximate (CLAUDE.md §6).\n\n", .{});
 
     try md.print(allocator, "## Recommendation\n\n", .{});
+    try md.print(allocator, "Recommendations are **compound** — split into two independently-won tracks, because no single backend " ++
+        "should serve both a tiny live cache's workload and a full-history store's workload:\n\n", .{});
+    try md.print(allocator, "1. **Real-time track** (`latest_single`, `latest_zone`, `latest_by_type`) — all backends compete; " ++
+        "the count-capped real-time cache (RingBuffer, 10 readings/sensor) legitimately wins here.\n", .{});
+    try md.print(allocator, "2. **Historical track** (aggregation, historical rollups, spatial, anomaly) — only full-retention " ++
+        "backends compete; the real-time cache is excluded because it evicts data these queries need.\n\n", .{});
     try md.print(allocator, "Score = weighted average of (this backend's median / the per-query winner's median) across " ++
-        "the building's effective query mix — the union of relevant_queries across every sensor type actually " ++
-        "placed (see synthetic/generator.zig). **1.00 = won every weighted query; higher is worse.** Coverage below " ++
-        "100% means the backend has no data for one or more weighted queries.\n\n", .{});
+        "that track's query mix. **1.00 = won every weighted query; higher is worse.** Coverage below 100% means " ++
+        "the backend has no data for one or more weighted queries.\n\n", .{});
+
+    try md.print(allocator, "### Real-time track\n\n", .{});
     try md.print(allocator, "| Backend | Score | Coverage |\n|---|---:|---:|\n", .{});
-    for (recommendation.scores) |s| {
+    for (compound.realtime.scores) |s| {
         try md.print(allocator, "| {s} | {d:.3} | {d:.0}% |\n", .{ s.backend, s.score, s.coverage * 100 });
     }
-    try md.print(allocator, "\n**Winner: {s}**\n\n", .{recommendation.winner});
+    try md.print(allocator, "\n**Real-time winner: {s}**\n\n", .{compound.realtime.winner});
+
+    try md.print(allocator, "### Historical track\n\n", .{});
+    try md.print(allocator, "| Backend | Score | Coverage |\n|---|---:|---:|\n", .{});
+    for (compound.historical.scores) |s| {
+        try md.print(allocator, "| {s} | {d:.3} | {d:.0}% |\n", .{ s.backend, s.score, s.coverage * 100 });
+    }
+    try md.print(allocator, "\n**Historical winner: {s}**\n\n", .{compound.historical.winner});
+
+    try md.print(allocator, "**Deployment combo: {s} (live) + {s} (historical)**\n\n", .{ compound.realtime.winner, compound.historical.winner });
 
     if (type_recommendations.len > 0) {
         try md.print(allocator, "## Recommendation by Sensor Type\n\n", .{});
@@ -776,10 +841,25 @@ fn writeRecommendationReport(
             type_recommendations.len,
         });
         for (type_recommendations) |tr| {
-            try md.print(allocator, "**{s}** — winner: **{s}**\n\n", .{ @tagName(tr.sensor_type), tr.rec.winner });
-            if (tr.rec.scores.len > 0) {
+            if (tr.compound.realtime.scores.len > 0 and tr.compound.historical.scores.len > 0) {
+                try md.print(allocator, "**{s}** — live: **{s}** | historical: **{s}**\n\n", .{ @tagName(tr.sensor_type), tr.compound.realtime.winner, tr.compound.historical.winner });
+            } else if (tr.compound.historical.scores.len > 0) {
+                try md.print(allocator, "**{s}** — historical: **{s}**\n\n", .{ @tagName(tr.sensor_type), tr.compound.historical.winner });
+            } else if (tr.compound.realtime.scores.len > 0) {
+                try md.print(allocator, "**{s}** — live: **{s}**\n\n", .{ @tagName(tr.sensor_type), tr.compound.realtime.winner });
+            }
+            if (tr.compound.realtime.scores.len > 0) {
+                try md.print(allocator, "Real-time:\n\n", .{});
                 try md.print(allocator, "| Backend | Score | Coverage |\n|---|---:|---:|\n", .{});
-                for (tr.rec.scores) |s| {
+                for (tr.compound.realtime.scores) |s| {
+                    try md.print(allocator, "| {s} | {d:.3} | {d:.0}% |\n", .{ s.backend, s.score, s.coverage * 100 });
+                }
+                try md.print(allocator, "\n", .{});
+            }
+            if (tr.compound.historical.scores.len > 0) {
+                try md.print(allocator, "Historical:\n\n", .{});
+                try md.print(allocator, "| Backend | Score | Coverage |\n|---|---:|---:|\n", .{});
+                for (tr.compound.historical.scores) |s| {
                     try md.print(allocator, "| {s} | {d:.3} | {d:.0}% |\n", .{ s.backend, s.score, s.coverage * 100 });
                 }
                 try md.print(allocator, "\n", .{});

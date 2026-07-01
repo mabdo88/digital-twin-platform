@@ -57,6 +57,31 @@ pub const Recommendation = struct {
     winner: []const u8,
 };
 
+/// One track of a compound recommendation — same shape as `Recommendation`,
+/// but scoped to one query family group (real-time vs. everything else) and
+/// possibly to a restricted set of eligible backends. Caller frees `scores`.
+pub const TrackRecommendation = struct {
+    scores: []BackendScore, // sorted ascending by score (best first)
+    winner: []const u8,
+};
+
+/// A building (or per-type) recommendation split into two independently-won
+/// tracks, because no single backend should be forced to serve both a tiny
+/// live cache's workload and a full-history store's workload:
+/// - `realtime`: the `real_time` query family (latest_*), scored across ALL
+///   backends — the tiny real-time cache legitimately competes here.
+/// - `historical`: every other family (aggregation/historical/spatial/
+///   anomaly), scored across ONLY the full-retention backends. A count-
+///   capped cache is excluded outright rather than being allowed to "win"
+///   by timing a query against the handful of readings it kept.
+/// The real deployment answer is the pair: "<realtime.winner> for live
+/// queries + <historical.winner> for everything else." Caller frees both
+/// `.scores` slices.
+pub const CompoundRecommendation = struct {
+    realtime: TrackRecommendation,
+    historical: TrackRecommendation,
+};
+
 /// How much each unit of *uncovered* query weight counts against a backend
 /// in `recommendBackend`'s score (1.0 = as good as tying the per-query
 /// winner; higher is worse). Set above the this/winner ratios functioning
@@ -81,10 +106,45 @@ pub fn recommendBackend(
     scale: []const u8,
     query_mix: []const queries.QueryWeight,
 ) !Recommendation {
+    const owned = try scoreBackends(allocator, rows, scale, query_mix, null);
+    return .{
+        .scores = owned,
+        .winner = if (owned.len > 0) owned[0].backend else "none",
+    };
+}
+
+/// True if `name` appears in `eligible`. Used to restrict a track to a
+/// subset of backends (e.g. the historical track excludes the count-capped
+/// real-time cache).
+fn backendEligible(eligible: ?[]const []const u8, name: []const u8) bool {
+    const list = eligible orelse return true; // null = every backend is eligible
+    for (list) |n| {
+        if (std.mem.eql(u8, n, name)) return true;
+    }
+    return false;
+}
+
+/// Core scorer behind both `recommendBackend` and `recommendCompound`. Ranks
+/// every backend present in `rows` at `scale` over the weighted `query_mix`,
+/// returning scores sorted ascending (best first; caller frees the slice).
+/// When `eligible` is non-null, backends outside that set are excluded
+/// entirely — not just from the ranking, but also from each query's
+/// per-query winner, so an ineligible-but-artificially-fast backend can't
+/// distort the eligible backends' ratios. `eligible == null` considers all.
+fn scoreBackends(
+    allocator: std.mem.Allocator,
+    rows: []const RunRow,
+    scale: []const u8,
+    query_mix: []const queries.QueryWeight,
+    eligible: ?[]const []const u8,
+) ![]BackendScore {
+    if (query_mix.len == 0) return &[_]BackendScore{};
+
     var backend_names: std.ArrayList([]const u8) = .empty;
     defer backend_names.deinit(allocator);
     for (rows) |r| {
         if (!std.mem.eql(u8, r.scale, scale)) continue;
+        if (!backendEligible(eligible, r.backend)) continue;
         var seen = false;
         for (backend_names.items) |b| {
             if (std.mem.eql(u8, b, r.backend)) {
@@ -112,6 +172,7 @@ pub fn recommendBackend(
             for (rows) |r| {
                 if (!std.mem.eql(u8, r.scale, scale)) continue;
                 if (!std.mem.eql(u8, r.query, qname)) continue;
+                if (!backendEligible(eligible, r.backend)) continue;
                 if (winner_median == null or r.stats.median_ns < winner_median.?) {
                     winner_median = r.stats.median_ns;
                 }
@@ -151,10 +212,49 @@ pub fn recommendBackend(
             return a.score < b.score;
         }
     }.lt);
+    return owned;
+}
+
+/// Split `query_mix` by query family and rank each track independently (see
+/// `CompoundRecommendation`): the `real_time` family across all backends,
+/// everything else across only `full_retention_backends`. `full_retention_
+/// backends` is the set of backend names eligible for the historical track
+/// (i.e. every deployment backend except the count-capped real-time cache);
+/// pass it straight from `runner.supported_backends`' names. Caller frees
+/// both returned `.scores` slices.
+pub fn recommendCompound(
+    allocator: std.mem.Allocator,
+    rows: []const RunRow,
+    scale: []const u8,
+    query_mix: []const queries.QueryWeight,
+    full_retention_backends: []const []const u8,
+) !CompoundRecommendation {
+    var realtime_mix: std.ArrayList(queries.QueryWeight) = .empty;
+    defer realtime_mix.deinit(allocator);
+    var historical_mix: std.ArrayList(queries.QueryWeight) = .empty;
+    defer historical_mix.deinit(allocator);
+
+    for (query_mix) |qw| {
+        if (queries.familyOf(qw.query) == .real_time) {
+            try realtime_mix.append(allocator, qw);
+        } else {
+            try historical_mix.append(allocator, qw);
+        }
+    }
+
+    const rt_scores = try scoreBackends(allocator, rows, scale, realtime_mix.items, null);
+    errdefer allocator.free(rt_scores);
+    const hist_scores = try scoreBackends(allocator, rows, scale, historical_mix.items, full_retention_backends);
 
     return .{
-        .scores = owned,
-        .winner = if (owned.len > 0) owned[0].backend else "none",
+        .realtime = .{
+            .scores = rt_scores,
+            .winner = if (rt_scores.len > 0) rt_scores[0].backend else "none",
+        },
+        .historical = .{
+            .scores = hist_scores,
+            .winner = if (hist_scores.len > 0) hist_scores[0].backend else "none",
+        },
     };
 }
 
@@ -764,4 +864,53 @@ test "recommendBackend: a real per-type query mix resolves against real query_sp
     try testing.expectEqualStrings("TimeSeries", rec.winner);
     try testing.expectEqual(@as(usize, 2), rec.scores.len);
     try testing.expectApproxEqAbs(@as(f64, 1.0), rec.scores[0].coverage, 1e-9);
+}
+
+test "recommendCompound: RingBuffer wins real-time track, excluded from historical track" {
+    // Simulates the compound split: RingBuffer is fastest on latest_*
+    // (real-time family) but is excluded from the historical track where
+    // only full-retention backends compete.
+    const mix = [_]queries.QueryWeight{
+        .{ .query = .latest_single, .weight = 3.0, .hot = true },
+        .{ .query = .latest_zone, .weight = 2.0, .hot = true },
+        .{ .query = .daily_zone_rollup, .weight = 5.0, .hot = false },
+        .{ .query = .avg_zone_type, .weight = 3.0, .hot = false },
+        .{ .query = .anomalies, .weight = 4.0, .hot = true },
+    };
+
+    var rows: std.ArrayList(RunRow) = .empty;
+    defer rows.deinit(testing.allocator);
+    for (mix) |qw| {
+        const qn = queryNameStr(qw.query);
+        // RingBuffer: fastest on real-time, but also present for historical
+        // queries (the point is that the compound split excludes it from
+        // the historical track regardless of its row presence).
+        try rows.append(testing.allocator, testRow("Small", qn, "RingBuffer", 5));
+        try rows.append(testing.allocator, testRow("Small", qn, "TimeSeries", 50));
+        try rows.append(testing.allocator, testRow("Small", qn, "Columnar", 80));
+    }
+
+    const full_retention = [_][]const u8{ "TimeSeries", "Columnar" };
+
+    const compound = try recommendCompound(
+        testing.allocator,
+        rows.items,
+        "Small",
+        &mix,
+        &full_retention,
+    );
+    defer testing.allocator.free(compound.realtime.scores);
+    defer testing.allocator.free(compound.historical.scores);
+
+    // Real-time track: all three backends compete; RingBuffer is fastest.
+    try testing.expectEqualStrings("RingBuffer", compound.realtime.winner);
+    try testing.expectEqual(@as(usize, 3), compound.realtime.scores.len);
+
+    // Historical track: RingBuffer excluded; only TimeSeries and Columnar.
+    try testing.expectEqual(@as(usize, 2), compound.historical.scores.len);
+    for (compound.historical.scores) |s| {
+        try testing.expect(!std.mem.eql(u8, s.backend, "RingBuffer"));
+    }
+    // TimeSeries (50) beats Columnar (80) on every historical query.
+    try testing.expectEqualStrings("TimeSeries", compound.historical.winner);
 }

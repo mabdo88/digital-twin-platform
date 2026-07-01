@@ -308,14 +308,15 @@ by a "live" call doesn't manufacture a fake transition at the seam), and
 `null`, each sensor's window becomes `[now - retention_days(that
 sensor's type), now]` — real per-type depth, sourced from `profileFor`.
 
-**Update 2026-07-01 (second session, continued from this handoff):**
-items 1, 2, 3, and the scoring half of 4 below are now DONE, tested
-(`zig build test` green: 174/188/162/109/98/5/177 across the test
-binaries), and smoke-tested end-to-end against
-`assets/IFC/Building-Architecture.ifc` (16 sensors → 1,015,925 readings =
-1,015,847 history + 78 live, full run 20.5s, reports written). Details
-per item below. The ONE genuinely-open piece is eviction sizing — see the
-"OPEN DECISION" note after the list; it was deliberately NOT invented.
+**Update 2026-07-01 (third session, compound recommendations):**
+items 1–6 below are now fully DONE, including the previously-open RingBuffer
+eviction sizing decision (resolved: flat 10 readings/sensor for all types).
+`zig build test` green (98 tests pass), smoke-tested end-to-end against
+`assets/IFC/Building-Architecture.ifc` (16 sensors → 1,015,925 readings,
+full run ~19s). The compound recommendation correctly splits into a
+real-time track (all backends compete) and a historical track (RingBuffer
+excluded); per-type tracks gracefully skip empty families. Details per
+item below.
 
 1. ~~main.zig doesn't use any of this yet.~~ **DONE.** `main.zig` now makes
    two `generate()` calls: a retention-driven history call (`duration_ms =
@@ -337,18 +338,25 @@ per item below. The ONE genuinely-open piece is eviction sizing — see the
    sensor per distinct placed type), and `runOne` (one timed call via
    `metrics.timeQuery(..., iterations=1, ...)` — still the only sanctioned
    timing path). CLAUDE.md §3.4 updated to match (item 5).
-4. **`recommendBackend()` coverage-gap scoring — DONE. Eviction wiring —
-   STILL OPEN (see OPEN DECISION).** The scoring half is fixed: a backend
-   is now charged `UNCOVERED_QUERY_PENALTY` (=4.0, disclosed policy
-   constant) per unit of uncovered query weight, denominator is the full
-   mix, zero-coverage stays +inf; new regression test added. BUT this only
-   penalizes *entirely-missing query patterns*. It does NOT catch the
-   deeper problem the smoke test just exposed: RingBuffer's default
-   `capacity_per_sensor = 1000` silently evicts ~99% of the 1M-reading
-   dataset, so its covered queries scan almost nothing and look fastest
-   (it "won" the smoke run at 83% coverage). Making that fair requires
-   main.zig to call `setRetentionHint` before ingest so RingBuffer holds
-   full retention — which needs the sizing decision below.
+4. **`recommendBackend()` coverage-gap scoring + compound recommendations —
+   DONE.** The scoring half is fixed: a backend is now charged
+   `UNCOVERED_QUERY_PENALTY` (=4.0, disclosed policy constant) per unit of
+   uncovered query weight, denominator is the full mix, zero-coverage stays
+   +inf; regression test added. RingBuffer is capped at 10 readings/sensor
+   via `setRetentionHint(sensor_type, RINGBUFFER_CAP=10)` for every placed
+   type before ingest — a flat cap, no per-type formula, making it a
+   deliberately tiny real-time-only cache. Recommendations are now
+   **compound** (`report.recommendCompound`): the query mix is split by
+   `queries.familyOf` into a real-time track (`latest_*` — all backends
+   compete, RingBuffer legitimately wins) and a historical track
+   (aggregation/historical/spatial/anomaly — only full-retention backends
+   compete; RingBuffer excluded). The final recommendation per
+   building/type is a deployment combo: "<real-time winner> for live
+   queries + <historical winner> for everything else." `main.zig` consumes
+   this for both building-level and per-type reports; console output and
+   `recommendation.md` show both tracks. Regression test added
+   (`recommendCompound: RingBuffer wins real-time, excluded from
+   historical`).
 5. ~~CLAUDE.md §3.4 still says "minimum 25 iterations."~~ **DONE.** §3.4 now
    documents the two-path reality: real per-building path measures each
    query once against full real data; the internal `runner.zig`
@@ -356,17 +364,17 @@ per item below. The ONE genuinely-open piece is eviction sizing — see the
 6. **Retire the AoS/SoA-only equivalence tests' assumption of small
    uniform data** — still not done, still low priority.
 
-**OPEN DECISION (do not invent — this is why eviction wiring is unfinished):**
-`setRetentionHint(sensor_type, max_readings)` sizes RingBuffer's per-sensor
-buffer. For continuous types `max_readings ≈ retention_days × freq × 86400`
-is well-defined. For the EVENT types it is not: occupancy (`binary_event`)
-and vibration (`bursty_impulsive`) store only transitions/anomalies, a small
-and *probabilistic* fraction of the tick count. Sizing their buffers by tick
-count would over-allocate absurdly (e.g. occupancy 1yr@1min ≈ 525k slots per
-sensor to hold a few hundred real events). Needs a decision: size event
-buffers by (a) an estimated stored-event count, (b) a measured post-generation
-count, or (c) leave RingBuffer ineligible for event types. Flagged, not
-guessed, per the standing "don't edit undecided design" instruction.
+**RESOLVED — RingBuffer eviction sizing:** flat capacity of 10 readings per
+sensor for ALL types (no per-type formula, no retention/frequency math).
+`main.zig` calls `setRetentionHint(sensor_type, 10)` (`RINGBUFFER_CAP`) for
+every placed type before ingest. RingBuffer is a deliberately tiny real-time-
+only cache; its existing eviction (11th write evicts oldest) handles it. This
+makes RingBuffer ineligible for historical/aggregate/anomaly queries (which
+need far more than 10 readings), which is why the compound recommendation
+splits it into the real-time track only. The event-type sizing question
+(occupancy/vibration storing only transitions, not every tick) is moot: 10
+readings is small enough for any type's real-time cache, and the compound
+split ensures RingBuffer never competes where it lacks data.
 
 **Two design decisions already made, don't re-litigate them:**
 - The live simulator is NOT new machinery — see #2 above. Do not build a

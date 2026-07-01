@@ -22,6 +22,22 @@ pub const QueryFamily = enum {
     anomaly,
 };
 
+/// Family of a query, at the enum level. Single source of truth — must stay
+/// consistent with `QUERY_PATTERNS` below (which carries the same mapping
+/// keyed by display name for the reports). `real_time` is the only family
+/// whose data need fits within a tiny live cache (the latest reading[s]);
+/// every other family needs more history than a real-time buffer holds,
+/// which is what the compound recommendation (report.zig) splits on.
+pub fn familyOf(q: QueryName) QueryFamily {
+    return switch (q) {
+        .latest_single, .latest_zone, .latest_by_type => .real_time,
+        .avg_window, .avg_zone_type, .floor_stats => .aggregation,
+        .hourly_rollup, .daily_zone_rollup => .historical,
+        .spatial_radius, .zone_hierarchy => .spatial,
+        .anomalies, .threshold_breach => .anomaly,
+    };
+}
+
 /// One value per query pattern this file implements — was previously
 /// mirrored in bim/profiles.zig (kept separate "so profiles.zig has no
 /// dependency on the benchmark layer"), back when query relevance was a

@@ -214,13 +214,12 @@ The same folder also holds **status docs** (read as current state, not as proced
   against actual repo state each time it's updated. Treat this as more current than
   `AGENT.md`'s phase checklists, which have drifted from what was actually built
   (e.g. `AGENT.md`'s Phase 3 query list no longer matches `queries.zig`).
-- **`storage-redesign-plan.md`** — agreed 2026-06-30, **not yet implemented**: real
+- **`storage-redesign-plan.md`** — agreed 2026-06-30, **implemented**: real
   retention-bound per-sensor datasets (no toy 1h dataset, no sampling/replication
-  across sibling sensors), real eviction across every backend (not just
-  RingBuffer), a live tick-based simulator, and no backend-eligibility assumptions
-  (every backend races every query, empirical winner reported). This plan
-  explicitly supersedes §3.4's "minimum 25 iterations" rule below once
-  implemented — read it before touching `synthetic/generator.zig`,
+  across sibling sensors), a live tail (second `generate()` call, no tick-loop),
+  RingBuffer capped at 10 readings/sensor (flat, all types) via
+  `setRetentionHint`, and compound recommendations splitting real-time vs
+  historical tracks. Read it before touching `synthetic/generator.zig`,
   `ecs/storage/*`, `benchmark/queries.zig`, or `main.zig`'s orchestration.
 
 ---
@@ -237,9 +236,18 @@ The same folder also holds **status docs** (read as current state, not as proced
 - **Report format:** emit JSON, a human-readable Markdown report, **and** an
   interactive HTML dashboard — all three written by `engine/benchmark/report.zig`
   (`latency.json`, `latency.md`, `benchmark.html`).
-- **Tiered strategies:** the platform *recommends* mixed strategies but only
-  *benchmarks* single backends; recommendations come from per-query winners + cost.
-  Not yet built (Phase 7).
+- **Tiered strategies — resolved:** the platform now emits **compound recommendations**
+  via `report.recommendCompound`: a real-time track (all backends compete, RingBuffer
+  wins on `latest_*` queries) and a historical track (full-retention backends only;
+  RingBuffer excluded). The final recommendation per building/type is a deployment
+  combo: "<real-time winner> for live queries + <historical winner> for everything
+  else." `main.zig` consumes this for both building-level and per-type reports.
+- **RingBuffer eviction sizing — resolved:** flat capacity of 10 readings per
+  sensor for ALL types (no per-type formula). `main.zig` calls
+  `setRetentionHint(sensor_type, 10)` for every placed type before ingest.
+  RingBuffer is a deliberately tiny real-time-only cache; its existing eviction
+  (11th write evicts oldest) handles it. See `storage-redesign-plan.md` for the
+  full reasoning.
 - **Calibration:** DuckDB is the primary calibration; vendor benchmarks are optional
   metadata. Not yet built (Phase 8).
 
