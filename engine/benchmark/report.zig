@@ -57,6 +57,16 @@ pub const Recommendation = struct {
     winner: []const u8,
 };
 
+/// How much each unit of *uncovered* query weight counts against a backend
+/// in `recommendBackend`'s score (1.0 = as good as tying the per-query
+/// winner; higher is worse). Set above the this/winner ratios functioning
+/// backends realistically reach (~1-3x) so a coverage gap reliably outweighs
+/// mere slowness: a backend that can't answer a weighted query at all (it
+/// evicted that type's data, or doesn't support that rollup) should rank
+/// below one that answers it slowly. Not researched — a deliberate,
+/// disclosed policy choice (CLAUDE.md §6 honesty).
+const UNCOVERED_QUERY_PENALTY: f64 = 4.0;
+
 /// Weight every query in `query_mix` by its declared importance and
 /// rank every backend present in `rows` at `scale` by how close it comes to
 /// the per-query winner across that weighted mix. `query_mix` is whatever
@@ -119,7 +129,18 @@ pub fn recommendBackend(
         }
 
         const coverage: f64 = if (total_weight > 0) covered_weight / total_weight else 0;
-        const score: f64 = if (covered_weight > 0) weighted_sum / covered_weight else std.math.inf(f64);
+        // Penalize coverage gaps instead of silently scoring a backend only
+        // over the queries it happens to cover. The denominator is the FULL
+        // weighted mix, and each uncovered unit of weight is charged
+        // UNCOVERED_QUERY_PENALTY rather than dropped from the average — so a
+        // backend missing data for a weighted query can't win by omission. A
+        // backend with zero coverage stays +inf (worst possible), so it never
+        // edges out one that actually returns data.
+        const uncovered_weight = total_weight - covered_weight;
+        const score: f64 = if (covered_weight <= 0)
+            std.math.inf(f64)
+        else
+            (weighted_sum + UNCOVERED_QUERY_PENALTY * uncovered_weight) / total_weight;
 
         try scores.append(allocator, .{ .backend = backend, .score = score, .coverage = coverage });
     }
@@ -423,7 +444,7 @@ fn writeHtmlReport(
                 try html.print(allocator, "            {d:.2} µs\n", .{result.median_us});
                 try html.print(allocator, "          </div>\n", .{});
                 try html.print(allocator, "        </div>\n", .{});
-                try html.print(allocator, "        <div style=\"color:var(--text-dim);font-family:monospace;font-size:11px;text-align:right\">{s}</div>\n", .{ if (is_winner) "★ winner" else "" });
+                try html.print(allocator, "        <div style=\"color:var(--text-dim);font-family:monospace;font-size:11px;text-align:right\">{s}</div>\n", .{if (is_winner) "★ winner" else ""});
                 try html.print(allocator, "      </div>\n", .{});
             }
 
@@ -664,6 +685,38 @@ test "recommendBackend: a backend missing data for a weighted query gets partial
             try testing.expectApproxEqAbs(@as(f64, 1.0), s.coverage, 1e-9);
         } else if (std.mem.eql(u8, s.backend, "B")) {
             try testing.expectApproxEqAbs(@as(f64, 0.5), s.coverage, 1e-9);
+        }
+    }
+}
+
+test "recommendBackend: coverage gaps are penalized, not silently averaged away" {
+    // A and B tie on the one query B can serve; A additionally serves a
+    // second, equally-weighted query B has no data for. The old scoring
+    // averaged B only over its covered query (score 1.0, tying A); the
+    // coverage penalty must now rank the fully-covered A strictly ahead.
+    const rows = [_]RunRow{
+        testRow("Small", "query_threshold_breach", "A", 10),
+        testRow("Small", "query_threshold_breach", "B", 10),
+        testRow("Small", "query_daily_zone_rollup", "A", 10),
+        // B: no query_daily_zone_rollup row.
+    };
+    const mix = [_]queries.QueryWeight{
+        .{ .query = .threshold_breach, .weight = 1.0, .hot = true },
+        .{ .query = .daily_zone_rollup, .weight = 1.0, .hot = false },
+    };
+
+    const rec = try recommendBackend(testing.allocator, &rows, "Small", &mix);
+    defer testing.allocator.free(rec.scores);
+
+    try testing.expectEqualStrings("A", rec.winner);
+    for (rec.scores) |s| {
+        if (std.mem.eql(u8, s.backend, "A")) {
+            // Full coverage, wins both queries: (1*1.0 + 1*1.0) / 2 = 1.0.
+            try testing.expectApproxEqAbs(@as(f64, 1.0), s.score, 1e-9);
+        } else {
+            // Covers 1 of 2 weighted queries at ratio 1.0, penalized on the
+            // other: (1*1.0 + UNCOVERED_QUERY_PENALTY*1) / 2 = 2.5.
+            try testing.expectApproxEqAbs(@as(f64, 2.5), s.score, 1e-9);
         }
     }
 }

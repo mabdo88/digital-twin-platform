@@ -308,42 +308,65 @@ by a "live" call doesn't manufacture a fake transition at the seam), and
 `null`, each sensor's window becomes `[now - retention_days(that
 sensor's type), now]` — real per-type depth, sourced from `profileFor`.
 
-**What's NOT done — this is the actual remaining work:**
+**Update 2026-07-01 (second session, continued from this handoff):**
+items 1, 2, 3, and the scoring half of 4 below are now DONE, tested
+(`zig build test` green: 174/188/162/109/98/5/177 across the test
+binaries), and smoke-tested end-to-end against
+`assets/IFC/Building-Architecture.ifc` (16 sensors → 1,015,925 readings =
+1,015,847 history + 78 live, full run 20.5s, reports written). Details
+per item below. The ONE genuinely-open piece is eviction sizing — see the
+"OPEN DECISION" note after the list; it was deliberately NOT invented.
 
-1. **main.zig doesn't use any of this yet.** It still calls
-   `synthetic.generate(allocator, placement.sensors, .{}, null)` — the
-   old 1-hour-for-everyone call. The real production call needs
-   `duration_ms = null` and a real `now` value, generating full retention
-   depth for every placed sensor (not a sampled subset — every sensor
-   gets its own independently-generated dataset, per explicit user
-   instruction earlier in the redesign: "no generate for every sensor...
-   for all the 3200 temperature sensors placed all must have dataset").
-2. **The "live tail" isn't wired in.** The plan (confirmed correct by the
-   user) is NOT a new tick-loop subsystem — it's just a second
-   `generate()` call with a short window starting where history's window
-   ends, using the state-continuity mechanism just added. Nobody calls
-   it yet.
-3. **The 25-iteration/sample-cycling methodology is still live in
-   main.zig** (`pickOverallSamples`, `pickSamplesByType`,
-   `runOneAcrossSamples`, the `Sampler` struct, `TYPE_SAMPLE_CAP`). Per
-   explicit user decision this session, this is retired: once every
-   sensor has real, non-shared data, each query should run ONCE against
-   the real ingested world using real sensor_id/zone_id/floor_id
-   arguments — no repeated-cycling wrapper. This code needs deleting, not
-   patching.
-4. **`recommendBackend()`'s scoring still ignores coverage gaps.** Flagged
-   as an open finding on 2026-06-30, never fixed: a backend with 60%
-   coverage (because it evicted 40% of a type's data) scores only over
-   the 60% it has, instead of being penalized for the 40% it's missing.
-   Once real eviction is actually wired up (main.zig calling
-   `pruneOlderThan`/`setRetentionHint`, which it currently does NOT), this
-   stops being a hypothetical and starts actively producing misleading
-   recommendations — worth fixing before or immediately after the
-   main.zig rewire.
-5. **CLAUDE.md §3.4 still says "minimum 25 iterations."** Update it once
-   #3 above actually lands, not before (don't edit speculatively).
+1. ~~main.zig doesn't use any of this yet.~~ **DONE.** `main.zig` now makes
+   two `generate()` calls: a retention-driven history call (`duration_ms =
+   null`, `now = SIMULATED_NOW_MS`, a fixed constant so runs stay
+   deterministic) that produces full per-type retention depth for EVERY
+   placed sensor (no sampling, no sharing), and captures each occupancy
+   sensor's final state via `out_final_binary_state`.
+2. ~~The "live tail" isn't wired in.~~ **DONE.** Exactly as the plan said —
+   a second `generate()` over `[SIMULATED_NOW_MS, +LIVE_TAIL_MS]` with
+   `initial_binary_state` = the history call's captured final state, so no
+   spurious transition at the seam. No tick-loop machinery. History + live
+   are ingested as a two-element `[]const []const SensorReading`
+   (`read_parts`) rather than concatenated, so peak memory stays at one
+   backend's world plus the two source slices.
+3. ~~The 25-iteration/sample-cycling methodology is still live.~~ **DONE.**
+   `pickOverallSamples`/`pickSamplesByType`/`runOneAcrossSamples`/`Sampler`/
+   `TYPE_SAMPLE_CAP`/`ITERATIONS` are deleted. Replaced by
+   `pickOverallSample` (one real sensor), `pickTypeSamples` (one real
+   sensor per distinct placed type), and `runOne` (one timed call via
+   `metrics.timeQuery(..., iterations=1, ...)` — still the only sanctioned
+   timing path). CLAUDE.md §3.4 updated to match (item 5).
+4. **`recommendBackend()` coverage-gap scoring — DONE. Eviction wiring —
+   STILL OPEN (see OPEN DECISION).** The scoring half is fixed: a backend
+   is now charged `UNCOVERED_QUERY_PENALTY` (=4.0, disclosed policy
+   constant) per unit of uncovered query weight, denominator is the full
+   mix, zero-coverage stays +inf; new regression test added. BUT this only
+   penalizes *entirely-missing query patterns*. It does NOT catch the
+   deeper problem the smoke test just exposed: RingBuffer's default
+   `capacity_per_sensor = 1000` silently evicts ~99% of the 1M-reading
+   dataset, so its covered queries scan almost nothing and look fastest
+   (it "won" the smoke run at 83% coverage). Making that fair requires
+   main.zig to call `setRetentionHint` before ingest so RingBuffer holds
+   full retention — which needs the sizing decision below.
+5. ~~CLAUDE.md §3.4 still says "minimum 25 iterations."~~ **DONE.** §3.4 now
+   documents the two-path reality: real per-building path measures each
+   query once against full real data; the internal `runner.zig`
+   multi-scale suite keeps fixed iterations as a CI-style regression check.
 6. **Retire the AoS/SoA-only equivalence tests' assumption of small
-   uniform data** — not urgent, lower priority than 1-4.
+   uniform data** — still not done, still low priority.
+
+**OPEN DECISION (do not invent — this is why eviction wiring is unfinished):**
+`setRetentionHint(sensor_type, max_readings)` sizes RingBuffer's per-sensor
+buffer. For continuous types `max_readings ≈ retention_days × freq × 86400`
+is well-defined. For the EVENT types it is not: occupancy (`binary_event`)
+and vibration (`bursty_impulsive`) store only transitions/anomalies, a small
+and *probabilistic* fraction of the tick count. Sizing their buffers by tick
+count would over-allocate absurdly (e.g. occupancy 1yr@1min ≈ 525k slots per
+sensor to hold a few hundred real events). Needs a decision: size event
+buffers by (a) an estimated stored-event count, (b) a measured post-generation
+count, or (c) leave RingBuffer ineligible for event types. Flagged, not
+guessed, per the standing "don't edit undecided design" instruction.
 
 **Two design decisions already made, don't re-litigate them:**
 - The live simulator is NOT new machinery — see #2 above. Do not build a

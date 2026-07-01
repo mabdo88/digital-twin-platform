@@ -68,8 +68,19 @@ rather than assumes.
 
 ### 3.4 Benchmark rules
 - **All benchmarks are deterministic.** RNG is seeded; same input → same output, always.
-- Metrics are recorded by **`metrics_system.zig` only**. No ad-hoc timing elsewhere.
-- Each query runs a **minimum of 25 iterations** per backend. Report median, p95, p99.
+- Metrics are recorded by **`metrics_system.zig` only** (`timeQuery`). No ad-hoc timing elsewhere.
+- **Iteration count is workload-dependent, by deliberate design decision (see
+  `.cascade/digital-twin/storage-redesign-plan.md`):**
+  - The **real per-building path** (`main.zig`) generates each sensor's own full,
+    retention-depth dataset (no sampling, no sharing across siblings), then measures
+    each query **once** against that real ingested data (`timeQuery` with
+    `iterations = 1`). The old "minimum 25 iterations" rule existed only to fake
+    statistical spread over a 1-hour toy dataset via resampling; with real per-sensor
+    volume there is nothing to resample, so single-shot is the honest measurement.
+  - The **internal multi-scale regression suite** (`runner.zig`, against
+    `dataset.zig`'s shared synthetic fixture) still runs a fixed per-tier iteration
+    count for stable relative rankings on that small fixture — it is a CI-style
+    regression check, not the project-specific recommendation.
 - Memory is measured **after ingest, before queries, and after queries**.
 
 ### 3.5 General rules
