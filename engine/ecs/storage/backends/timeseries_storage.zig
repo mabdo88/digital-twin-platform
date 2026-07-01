@@ -168,6 +168,10 @@ pub fn floorOfZone(self: *const Self, zone_id: u32) ?u32 {
 /// order `log` was already in — a stable filter never reorders survivors,
 /// so `sorted` doesn't need to change. See storage_backend.zig's
 /// pruneOlderThan contract.
+/// TimeSeries has no fixed-capacity concept — see aos_storage.zig's
+/// setRetentionHint for why this is a no-op.
+pub fn setRetentionHint(_: *Self, _: SensorType, _: usize) !void {}
+
 pub fn pruneOlderThan(self: *Self, sensor_type: SensorType, cutoff_timestamp: i64) !void {
     var write: usize = 0;
     for (self.log.items) |r| {

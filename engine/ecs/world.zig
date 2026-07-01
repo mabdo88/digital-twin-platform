@@ -342,6 +342,13 @@ pub fn World(comptime Backend: type) type {
             return self.backend.pruneOlderThan(sensor_type, cutoff_timestamp);
         }
 
+        /// Passthrough — see storage_backend.zig's setRetentionHint
+        /// contract. Doesn't touch any existing data, so no World-level
+        /// cache needs invalidating (unlike insert/pruneOlderThan).
+        pub fn setRetentionHint(self: *Self, sensor_type: sb.SensorType, max_readings: usize) !void {
+            return self.backend.setRetentionHint(sensor_type, max_readings);
+        }
+
         pub fn registerZone(self: *Self, sensor_id: u32, zone_id: u32) !void {
             return self.backend.registerZone(sensor_id, zone_id);
         }
@@ -375,6 +382,7 @@ const timeseries = @import("storage/backends/timeseries_storage.zig");
 const columnar = @import("storage/backends/columnar_storage.zig");
 const hierarchical = @import("storage/backends/hierarchical_storage.zig");
 const ringbuffer = @import("storage/backends/ringbuffer_storage.zig");
+const lake = @import("storage/backends/lake_storage.zig");
 const query_system = @import("systems/query_system.zig");
 
 fn insertTestData(world: anytype) !void {
@@ -591,8 +599,8 @@ test "World(T).statsForType invalidates its cache on the next insert" {
     try std.testing.expectApproxEqAbs(@as(f64, 25.0), after.mean, 1e-9); // (10+30+20+40)/4
 }
 
-test "World(T) memoryUsed strictly grows after insert, for all six backends" {
-    const all_backends = .{ aos, soa, timeseries, columnar, hierarchical, ringbuffer };
+test "World(T) memoryUsed strictly grows after insert, for all seven backends" {
+    const all_backends = .{ aos, soa, timeseries, columnar, hierarchical, ringbuffer, lake };
     inline for (all_backends) |Backend| {
         var world = try World(Backend).init(std.testing.allocator);
         defer world.deinit();

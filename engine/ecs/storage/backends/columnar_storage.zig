@@ -222,6 +222,10 @@ pub fn rangeByTime(self: *const Self, allocator: std.mem.Allocator, q: RangeQuer
 /// to rebuild it from the (correct) raw `timestamps` column on next use,
 /// same as a fresh insert already does. See storage_backend.zig's
 /// pruneOlderThan contract.
+/// Columnar has no fixed-capacity concept — see aos_storage.zig's
+/// setRetentionHint for why this is a no-op.
+pub fn setRetentionHint(_: *Self, _: SensorType, _: usize) !void {}
+
 pub fn pruneOlderThan(self: *Self, sensor_type: SensorType, cutoff_timestamp: i64) !void {
     var write: usize = 0;
     for (self.sensor_ids.items, 0..) |sid, i| {

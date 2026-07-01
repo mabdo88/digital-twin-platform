@@ -1,6 +1,6 @@
 // Zig 0.16.0 (tested against 0.17.0-dev)
 //
-// Benchmark runner — wires all six storage backends into a comptime list,
+// Benchmark runner — wires every storage backend into a comptime list,
 // runs the full equivalence suite, and produces a combined per-query
 // latency table.
 //
@@ -20,6 +20,7 @@ const timeseries = @import("../ecs/storage/backends/timeseries_storage.zig");
 const columnar = @import("../ecs/storage/backends/columnar_storage.zig");
 const hierarchical = @import("../ecs/storage/backends/hierarchical_storage.zig");
 const ringbuffer = @import("../ecs/storage/backends/ringbuffer_storage.zig");
+const lake = @import("../ecs/storage/backends/lake_storage.zig");
 const World = @import("../ecs/world.zig").World;
 const queries = @import("queries.zig");
 const metrics = @import("../ecs/systems/metrics_system.zig");
@@ -40,15 +41,21 @@ pub const backends = [_]BackendEntry{
     .{ .name = "Columnar", .T = columnar },
     .{ .name = "Hierarchical", .T = hierarchical },
     .{ .name = "RingBuffer", .T = ringbuffer },
+    .{ .name = "Lake", .T = lake },
 };
 
 /// Subset of deployment backends that support historical rollup queries
-/// (Q7/Q8). RingBuffer is excluded: it evicts old data so historical
-/// rollups would return incomplete results.
+/// (Q7/Q8). RingBuffer is excluded: it evicts old data (count-based cap)
+/// so historical rollups would return incomplete results. Lake is
+/// included: unlike RingBuffer it retains full history (bounded only by
+/// pruneOlderThan, same as TimeSeries/Columnar/Hierarchical) — it's the
+/// cheap cold tier for exactly this kind of long-retention query, not a
+/// live/hot-only cache.
 pub const supported_backends = [_]BackendEntry{
     .{ .name = "TimeSeries", .T = timeseries },
     .{ .name = "Columnar", .T = columnar },
     .{ .name = "Hierarchical", .T = hierarchical },
+    .{ .name = "Lake", .T = lake },
 };
 
 // ---------------------------------------------------------------------------
@@ -146,7 +153,7 @@ pub fn q12_wrapper(world: anytype, sensor_id: u32, threshold: f32, min_duration_
 // the raw World interface methods (getLatestBySensor, rangeByTime), which
 // queries.zig's query-level tests never exercise directly.
 
-test "equivalence: getLatestBySensor across all six backends" {
+test "equivalence: getLatestBySensor across all backends" {
     const dataset = try generateDataset(std.testing.allocator);
     defer std.testing.allocator.free(dataset);
 
@@ -176,7 +183,7 @@ test "equivalence: getLatestBySensor across all six backends" {
     }
 }
 
-test "equivalence: getLatestBySensor agrees on null across all six backends (nonexistent sensor, and empty world)" {
+test "equivalence: getLatestBySensor agrees on null across all backends (nonexistent sensor, and empty world)" {
     const dataset = try generateDataset(std.testing.allocator);
     defer std.testing.allocator.free(dataset);
 
@@ -192,7 +199,7 @@ test "equivalence: getLatestBySensor agrees on null across all six backends (non
     }
 }
 
-test "equivalence: rangeByTime across all six backends" {
+test "equivalence: rangeByTime across all backends" {
     const dataset = try generateDataset(std.testing.allocator);
     defer std.testing.allocator.free(dataset);
 

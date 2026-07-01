@@ -40,7 +40,16 @@ const SensorBuffer = struct {
 
 allocator: std.mem.Allocator,
 sensors: std.AutoHashMap(u32, SensorBuffer),
-capacity_per_sensor: usize,
+/// Fallback capacity for any sensor_type that never got a setRetentionHint
+/// call. A sensor's OWN buffer size, once allocated, lives on
+/// SensorBuffer.buffer.len (see capacityForType/setRetentionHint's doc
+/// comments for why this field is not used for existing sensors' wraparound
+/// math anymore).
+default_capacity_per_sensor: usize,
+/// sensor_type -> capacity hint set via setRetentionHint, consulted only
+/// when allocating a NEW sensor's buffer (first insert for that
+/// sensor_id). See setRetentionHint's doc comment.
+capacity_per_type: std.AutoHashMap(SensorType, usize),
 total_count: usize,
 zone_index: ZoneIndex,
 
@@ -48,7 +57,8 @@ pub fn init(allocator: std.mem.Allocator) !Self {
     return .{
         .allocator = allocator,
         .sensors = std.AutoHashMap(u32, SensorBuffer).init(allocator),
-        .capacity_per_sensor = DEFAULT_CAPACITY_PER_SENSOR,
+        .default_capacity_per_sensor = DEFAULT_CAPACITY_PER_SENSOR,
+        .capacity_per_type = std.AutoHashMap(SensorType, usize).init(allocator),
         .total_count = 0,
         .zone_index = ZoneIndex.init(allocator),
     };
@@ -60,15 +70,33 @@ pub fn deinit(self: *Self) void {
         self.allocator.free(entry.value_ptr.buffer);
     }
     self.sensors.deinit();
+    self.capacity_per_type.deinit();
     self.zone_index.deinit();
     self.* = undefined;
 }
 
+fn capacityForType(self: *const Self, sensor_type: SensorType) usize {
+    return self.capacity_per_type.get(sensor_type) orelse self.default_capacity_per_sensor;
+}
+
+/// See storage_backend.zig's setRetentionHint contract: only affects
+/// sensors of `sensor_type` not yet inserted (their buffer is allocated at
+/// this size on first insert); already-allocated sensors keep their
+/// original buffer size.
+pub fn setRetentionHint(self: *Self, sensor_type: SensorType, max_readings: usize) !void {
+    try self.capacity_per_type.put(sensor_type, max_readings);
+}
+
 pub fn insert(self: *Self, reading: SensorReading) !void {
     if (self.sensors.getPtr(reading.sensor_id)) |sb_ptr| {
+        // Wraparound math must use THIS sensor's own buffer length, not a
+        // backend-wide constant — different sensor types can have
+        // different capacities (see setRetentionHint), so two sensors in
+        // the same backend instance may have differently-sized buffers.
+        const capacity = sb_ptr.buffer.len;
         sb_ptr.buffer[sb_ptr.head] = reading;
-        sb_ptr.head = (sb_ptr.head + 1) % self.capacity_per_sensor;
-        if (sb_ptr.len < self.capacity_per_sensor) {
+        sb_ptr.head = (sb_ptr.head + 1) % capacity;
+        if (sb_ptr.len < capacity) {
             sb_ptr.len += 1;
             self.total_count += 1;
         }
@@ -78,7 +106,7 @@ pub fn insert(self: *Self, reading: SensorReading) !void {
         return;
     }
 
-    const buf = try self.allocator.alloc(SensorReading, self.capacity_per_sensor);
+    const buf = try self.allocator.alloc(SensorReading, self.capacityForType(reading.sensor_type));
     errdefer self.allocator.free(buf);
     buf[0] = reading;
     try self.sensors.put(reading.sensor_id, .{
@@ -97,9 +125,12 @@ pub fn count(self: *const Self) usize {
 pub fn memoryUsed(self: *const Self) usize {
     var total: usize = self.sensors.capacity() * (@sizeOf(u32) + @sizeOf(SensorBuffer));
     var it = self.sensors.iterator();
-    while (it.next()) |_| {
-        total += self.capacity_per_sensor * @sizeOf(SensorReading);
+    while (it.next()) |entry| {
+        // Each sensor's own buffer length, not a single backend-wide
+        // constant — capacities can differ per sensor_type (setRetentionHint).
+        total += entry.value_ptr.buffer.len * @sizeOf(SensorReading);
     }
+    total += self.capacity_per_type.capacity() * (@sizeOf(SensorType) + @sizeOf(usize));
     return total + self.zone_index.memoryUsed();
 }
 
@@ -210,9 +241,12 @@ pub fn pruneOlderThan(self: *Self, sensor_type: SensorType, cutoff_timestamp: i6
         var scratch = try std.ArrayList(SensorReading).initCapacity(self.allocator, sensor_buf.len);
         defer scratch.deinit(self.allocator);
 
-        const start = (sensor_buf.head + self.capacity_per_sensor - sensor_buf.len) % self.capacity_per_sensor;
+        // This sensor's OWN buffer length, not a backend-wide constant —
+        // capacities can differ per sensor_type (setRetentionHint).
+        const capacity = sensor_buf.buffer.len;
+        const start = (sensor_buf.head + capacity - sensor_buf.len) % capacity;
         for (0..sensor_buf.len) |i| {
-            const r = sensor_buf.buffer[(start + i) % self.capacity_per_sensor];
+            const r = sensor_buf.buffer[(start + i) % capacity];
             if (r.sensor_type == sensor_type and r.timestamp < cutoff_timestamp) continue;
             scratch.appendAssumeCapacity(r);
         }
@@ -222,7 +256,7 @@ pub fn pruneOlderThan(self: *Self, sensor_type: SensorType, cutoff_timestamp: i6
 
         for (scratch.items, 0..) |r, i| sensor_buf.buffer[i] = r;
         sensor_buf.len = scratch.items.len;
-        sensor_buf.head = scratch.items.len % self.capacity_per_sensor;
+        sensor_buf.head = scratch.items.len % capacity;
         self.total_count -= removed;
 
         if (sensor_buf.latest) |latest| {
@@ -533,7 +567,7 @@ test "RingBuffer: pruneOlderThan handles a wrapped buffer (physical order != log
     var backend = try Self.init(std.testing.allocator);
     defer backend.deinit();
     // Force wraparound with only 4 inserts instead of 1000+.
-    backend.capacity_per_sensor = 3;
+    backend.default_capacity_per_sensor = 3;
 
     // Sensor 1's ring (capacity 3) after these 4 inserts has wrapped:
     // physically buf[0]=t40(temp, overwrote t10), buf[1]=t20(humidity),
@@ -570,4 +604,65 @@ test "RingBuffer: pruneOlderThan handles a wrapped buffer (physical order != log
     // latest survives unchanged (40 wasn't pruned).
     const latest = backend.getLatestBySensor(1).?;
     try std.testing.expectEqual(@as(i64, 40), latest.timestamp);
+}
+
+test "RingBuffer: setRetentionHint sizes a new sensor's buffer per its sensor_type, independent of other types in the same backend" {
+    var backend = try Self.init(std.testing.allocator);
+    defer backend.deinit();
+
+    try backend.setRetentionHint(.temperature, 2);
+    try backend.setRetentionHint(.structural, 5);
+
+    // Sensor 1: temperature, capacity 2 -- the 3rd insert should evict the
+    // 1st (count-based eviction, same mechanism as before, just sized
+    // per-type now instead of one global constant).
+    try backend.insert(.{ .sensor_id = 1, .timestamp = 10, .value = 1.0, .sensor_type = .temperature });
+    try backend.insert(.{ .sensor_id = 1, .timestamp = 20, .value = 2.0, .sensor_type = .temperature });
+    try backend.insert(.{ .sensor_id = 1, .timestamp = 30, .value = 3.0, .sensor_type = .temperature });
+
+    // Sensor 2: structural, capacity 5 -- all 4 inserts fit, nothing evicted.
+    try backend.insert(.{ .sensor_id = 2, .timestamp = 10, .value = 10.0, .sensor_type = .structural });
+    try backend.insert(.{ .sensor_id = 2, .timestamp = 20, .value = 20.0, .sensor_type = .structural });
+    try backend.insert(.{ .sensor_id = 2, .timestamp = 30, .value = 30.0, .sensor_type = .structural });
+    try backend.insert(.{ .sensor_id = 2, .timestamp = 40, .value = 40.0, .sensor_type = .structural });
+
+    const all = try backend.iterateAll(std.testing.allocator);
+    defer std.testing.allocator.free(all);
+
+    var temp_count: usize = 0;
+    var structural_count: usize = 0;
+    var found_temp_10 = false;
+    for (all) |r| {
+        if (r.sensor_type == .temperature) {
+            temp_count += 1;
+            if (r.timestamp == 10) found_temp_10 = true;
+        }
+        if (r.sensor_type == .structural) structural_count += 1;
+    }
+
+    // Sensor 1's oldest (t=10) was evicted at capacity 2; sensor 2 kept all 4.
+    try std.testing.expectEqual(@as(usize, 2), temp_count);
+    try std.testing.expect(!found_temp_10);
+    try std.testing.expectEqual(@as(usize, 4), structural_count);
+}
+
+test "RingBuffer: setRetentionHint set after a sensor already exists doesn't resize it" {
+    var backend = try Self.init(std.testing.allocator);
+    defer backend.deinit();
+
+    // No hint yet -- sensor 1 allocates at the default capacity.
+    backend.default_capacity_per_sensor = 2;
+    try backend.insert(.{ .sensor_id = 1, .timestamp = 10, .value = 1.0, .sensor_type = .temperature });
+    try backend.insert(.{ .sensor_id = 1, .timestamp = 20, .value = 2.0, .sensor_type = .temperature });
+
+    // Hint arrives late -- per the documented contract, this must NOT
+    // resize sensor 1's already-allocated buffer.
+    try backend.setRetentionHint(.temperature, 10);
+    try backend.insert(.{ .sensor_id = 1, .timestamp = 30, .value = 3.0, .sensor_type = .temperature });
+
+    // Still capacity 2: t=10 was evicted, only t=20 and t=30 remain.
+    try std.testing.expectEqual(@as(usize, 2), backend.count());
+    const all = try backend.iterateAll(std.testing.allocator);
+    defer std.testing.allocator.free(all);
+    try std.testing.expectEqual(@as(usize, 2), all.len);
 }

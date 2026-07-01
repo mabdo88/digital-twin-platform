@@ -160,6 +160,10 @@ pub fn floorOfZone(self: *const Self, zone_id: u32) ?u32 {
 /// an in-place stable compaction across all four parallel arrays (readings
 /// of other types, and this backend's zone/floor topology, are untouched).
 /// See storage_backend.zig's pruneOlderThan contract.
+/// SoA has no fixed-capacity concept — see aos_storage.zig's
+/// setRetentionHint for why this is a no-op.
+pub fn setRetentionHint(_: *Self, _: SensorType, _: usize) !void {}
+
 pub fn pruneOlderThan(self: *Self, sensor_type: SensorType, cutoff_timestamp: i64) !void {
     var write: usize = 0;
     for (self.sensor_ids.items, 0..) |sid, i| {

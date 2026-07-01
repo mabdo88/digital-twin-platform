@@ -1,6 +1,6 @@
 # Storage/Benchmark Redesign Plan (agreed 2026-06-30)
 
-> **Status: IN PROGRESS as of 2026-07-01.** Two of eleven implementation steps are
+> **Status: IN PROGRESS as of 2026-07-01.** Four of eleven implementation steps are
 > done and verified (see "Implementation progress" below); the rest of this
 > document is still the target, not yet built. Check `git log` and the current
 > source before assuming any specific piece is done. Treat this as a status doc
@@ -48,9 +48,33 @@
    prune exactly like it does on insert. 8 new regression tests (one or two
    per backend), including a RingBuffer wraparound case that specifically
    forces physical/logical order to diverge — all passing, full suite green.
+3. **RingBuffer's per-type-configurable capacity** — added
+   `setRetentionHint(sensor_type, max_readings) !void` to the `StorageBackend`
+   interface. Non-RingBuffer backends implement it as a no-op (they have no
+   fixed-capacity concept). RingBuffer stores per-type capacity hints in a
+   hashmap, consulted only when allocating a NEW sensor's buffer (first
+   insert for that sensor_id) — a hint set after some sensors of a type
+   already exist doesn't resize them, by design (the caller sets every hint
+   before ingestion begins). Also fixed a real correctness bug found while
+   implementing this: `capacity_per_sensor` was a single backend-wide field
+   used for wraparound math even on an *existing* sensor's buffer — once
+   different types can have different capacities, that math must use each
+   sensor's own `buffer.len`, not a shared constant. Fixed in `insert`,
+   `memoryUsed`, and `pruneOlderThan`. 2 new regression tests.
+4. **Lake backend** — the cheapest possible cold tier: a flat, unindexed,
+   uncompressed array (`ecs/storage/backends/lake_storage.zig`), structurally
+   similar to AoS/SoA but framed and registered as a real deployment
+   candidate (unlike AoS/SoA, which stay reference-only baselines). Full
+   `StorageBackend` interface, own unit tests, a golden-equivalence test
+   against TimeSeries, and wired into `runner.zig`'s `backends` /
+   `supported_backends` registries — the single registration point every
+   test/table already reads from, so Lake was automatically picked up by the
+   dynamic cross-backend equivalence tests in `runner.zig` with no further
+   duplication needed. End-to-end smoke-tested: `dt.exe` against a real IFC
+   file runs Lake alongside the other 4 deployment backends and reports it
+   in the winner comparison.
 
-**Not yet started:** RingBuffer's per-type-configurable capacity, the Lake
-backend, the generator.zig continuous/event-storage split, the researched
+**Not yet started:** the generator.zig continuous/event-storage split, the researched
 retention values, per-sensor unique full-volume generation, the live tick
 simulator, retiring the 25-iteration methodology, and the main.zig rewire.
 See "Explicitly NOT yet done" at the bottom — unchanged except items 1-2
@@ -184,11 +208,14 @@ Columnar/TimeSeries's indexing overhead isn't worth paying for.
 
 ## Explicitly NOT yet done
 
-1. ~~Full recheck of the remaining 7 query patterns~~ — **done 2026-07-01**,
-   see "Implementation progress" above.
-2. ~~The prune/evict interface method~~ — **done 2026-07-01**, see
+1. ~~Full recheck of the remaining 7 query patterns~~ — **done 2026-07-01**.
+2. ~~The prune/evict interface method~~ — **done 2026-07-01**.
+3. ~~RingBuffer's per-type-configurable capacity~~ — **done 2026-07-01**.
+4. ~~The Lake backend~~ — **done 2026-07-01**. All four items above are in
    "Implementation progress" above. Still not implemented: the two-tier
-   generation split, the live simulator, RingBuffer's per-type capacity, or
-   the Lake backend.
-3. Time-compression factor for the live simulator.
-4. The CLAUDE.md §3.4 edit reflecting the retired 25-iteration rule.
+   generation split (continuous vs. event-storage sensor types), the
+   researched retention values, per-sensor unique full-volume generation,
+   the live tick simulator, retiring the 25-iteration methodology, and the
+   main.zig rewire.
+5. Time-compression factor for the live simulator.
+6. The CLAUDE.md §3.4 edit reflecting the retired 25-iteration rule.

@@ -1,12 +1,26 @@
 // Zig 0.16.0 (tested against 0.17.0-dev)
 //
-// Array-of-Structs backend — the intuitive baseline.
+// Lake backend — the cheapest possible cold tier.
 //
-// All readings are stored in a single contiguous ArrayList(SensorReading).
-// Iteration order: insertion order (NOT sorted).
-// This layout is cache-unfriendly for bulk field queries (e.g. "average
-// value across all sensors") because each SensorReading fetches an entire
-// 20-byte struct even when only one field is needed.
+// Models an object-store/cold-archive layout (e.g. S3 + Parquet): a flat,
+// unindexed, uncompressed append-only log. No sorting, no compression, no
+// secondary indices beyond the shared zone/floor bookkeeping every backend
+// carries. Reads are always a full linear scan — this is deliberate, not an
+// oversight: real cold storage trades query speed for near-zero storage
+// cost, and this backend is meant to be evaluated on exactly that tradeoff
+// (see storage-redesign-plan.md's hot/warm/cold tiering discussion,
+// research-grounded: real digital twin deployments put long-retention,
+// infrequently-queried data in an S3-class cold tier rather than a
+// general-purpose database).
+//
+// Unlike AoS/SoA (worst-case reference baselines, explicitly not
+// deployment candidates — see backend-audit.md and runner.zig's
+// `backends` list), Lake IS a real deployment candidate: it is expected to
+// win precisely when a query is infrequent/cold enough that paying for
+// Columnar/TimeSeries's indexing overhead isn't worthwhile for that
+// sensor type's retention window.
+//
+// Iteration order: insertion order (NOT sorted) — same as AoS/SoA.
 
 const std = @import("std");
 const sb = @import("../storage_backend.zig");
@@ -82,8 +96,7 @@ pub fn rangeByTime(self: *const Self, allocator: std.mem.Allocator, q: RangeQuer
         }
     }.lt);
 
-    const owned = try result.toOwnedSlice(allocator);
-    return owned;
+    return try result.toOwnedSlice(allocator);
 }
 
 /// Zone/floor topology bookkeeping delegates to the shared ZoneIndex — see
@@ -113,11 +126,6 @@ pub fn floorOfZone(self: *const Self, zone_id: u32) ?u32 {
 /// an in-place stable compaction (readings of other types, and this
 /// backend's zone/floor topology, are untouched). See storage_backend.zig's
 /// pruneOlderThan contract.
-/// AoS has no fixed-capacity concept — it holds everything inserted,
-/// bounded only by pruneOlderThan. No-op, per storage_backend.zig's
-/// setRetentionHint contract.
-pub fn setRetentionHint(_: *Self, _: SensorType, _: usize) !void {}
-
 pub fn pruneOlderThan(self: *Self, sensor_type: SensorType, cutoff_timestamp: i64) !void {
     var write: usize = 0;
     for (self.readings.items) |r| {
@@ -128,15 +136,20 @@ pub fn pruneOlderThan(self: *Self, sensor_type: SensorType, cutoff_timestamp: i6
     self.readings.shrinkRetainingCapacity(write);
 }
 
+/// Lake has no fixed-capacity concept — it holds everything inserted,
+/// bounded only by pruneOlderThan, same as the other full-retention
+/// backends. No-op, per storage_backend.zig's setRetentionHint contract.
+pub fn setRetentionHint(_: *Self, _: SensorType, _: usize) !void {}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
-test "AoS: assertImplements" {
+test "Lake: assertImplements" {
     sb.assertImplements(Self);
 }
 
-test "AoS: insert N readings and read them back" {
+test "Lake: insert N readings and read them back" {
     const N: usize = 100;
     var backend = try Self.init(std.testing.allocator);
     defer backend.deinit();
@@ -164,7 +177,7 @@ test "AoS: insert N readings and read them back" {
     }
 }
 
-test "AoS: getLatestBySensor" {
+test "Lake: getLatestBySensor" {
     var backend = try Self.init(std.testing.allocator);
     defer backend.deinit();
 
@@ -180,7 +193,7 @@ test "AoS: getLatestBySensor" {
     try std.testing.expect(backend.getLatestBySensor(999) == null);
 }
 
-test "AoS: rangeByTime filters and sorts" {
+test "Lake: rangeByTime filters and sorts" {
     var backend = try Self.init(std.testing.allocator);
     defer backend.deinit();
 
@@ -194,7 +207,6 @@ test "AoS: rangeByTime filters and sorts" {
     defer std.testing.allocator.free(result);
 
     try std.testing.expectEqual(@as(usize, 4), result.len);
-    // Sorted by timestamp asc, then sensor_id asc
     try std.testing.expectEqual(@as(u32, 1), result[0].sensor_id);
     try std.testing.expectEqual(@as(i64, 10), result[0].timestamp);
     try std.testing.expectEqual(@as(u32, 1), result[1].sensor_id);
@@ -205,7 +217,7 @@ test "AoS: rangeByTime filters and sorts" {
     try std.testing.expectEqual(@as(i64, 50), result[3].timestamp);
 }
 
-test "AoS: rangeByTime with sensor filter" {
+test "Lake: rangeByTime with sensor filter" {
     var backend = try Self.init(std.testing.allocator);
     defer backend.deinit();
 
@@ -225,12 +237,10 @@ test "AoS: rangeByTime with sensor filter" {
     try std.testing.expectEqual(@as(u32, 1), result[1].sensor_id);
 }
 
-test "AoS: sensorIdsByZone/sensorIdsByFloor reflect real (non-arithmetic) registration" {
+test "Lake: sensorIdsByZone/sensorIdsByFloor reflect real (non-arithmetic) registration" {
     var backend = try Self.init(std.testing.allocator);
     defer backend.deinit();
 
-    // Arbitrary, non-sequential ids — like a real building's IFC entity
-    // ids, not a fixed-width sensor_id/N convention.
     try backend.insert(.{ .sensor_id = 7, .timestamp = 0, .value = 1.0, .sensor_type = .temperature });
     try backend.insert(.{ .sensor_id = 2, .timestamp = 0, .value = 1.0, .sensor_type = .temperature });
     try backend.registerZone(7, 4291);
@@ -247,21 +257,15 @@ test "AoS: sensorIdsByZone/sensorIdsByFloor reflect real (non-arithmetic) regist
 
     try std.testing.expectEqual(@as(?u32, 3), backend.floorOfZone(4291));
 
-    // An unregistered zone/floor is empty, not an error.
     const empty = try backend.sensorIdsByZone(std.testing.allocator, 99);
     defer std.testing.allocator.free(empty);
     try std.testing.expectEqual(@as(usize, 0), empty.len);
 }
 
-test "AoS: getLatestBySensor is deterministic across repeated calls when timestamps tie" {
+test "Lake: getLatestBySensor is deterministic across repeated calls when timestamps tie" {
     var backend = try Self.init(std.testing.allocator);
     defer backend.deinit();
 
-    // Two readings for the same sensor, same timestamp. The interface
-    // contract (storage_backend.zig) explicitly allows any one of them to
-    // win the tie — it does NOT require agreement with other backends —
-    // but a single backend must keep answering the same way call after
-    // call, not flip-flop.
     try backend.insert(.{ .sensor_id = 1, .timestamp = 100, .value = 10.0, .sensor_type = .temperature });
     try backend.insert(.{ .sensor_id = 1, .timestamp = 100, .value = 20.0, .sensor_type = .temperature });
 
@@ -271,7 +275,7 @@ test "AoS: getLatestBySensor is deterministic across repeated calls when timesta
     try std.testing.expectEqual(first.value, second.value);
 }
 
-test "AoS: empty backend" {
+test "Lake: empty backend" {
     var backend = try Self.init(std.testing.allocator);
     defer backend.deinit();
 
@@ -287,14 +291,12 @@ test "AoS: empty backend" {
     try std.testing.expectEqual(@as(usize, 0), rng.len);
 }
 
-test "AoS: pruneOlderThan removes only the matching type older than cutoff" {
+test "Lake: pruneOlderThan removes only the matching type older than cutoff" {
     var backend = try Self.init(std.testing.allocator);
     defer backend.deinit();
 
     try backend.insert(.{ .sensor_id = 1, .timestamp = 50, .value = 1.0, .sensor_type = .temperature });
     try backend.insert(.{ .sensor_id = 1, .timestamp = 150, .value = 2.0, .sensor_type = .temperature });
-    // Same age as the pruned temperature reading, but a different type —
-    // must survive.
     try backend.insert(.{ .sensor_id = 2, .timestamp = 50, .value = 3.0, .sensor_type = .humidity });
 
     try backend.pruneOlderThan(.temperature, 100);
@@ -314,4 +316,43 @@ test "AoS: pruneOlderThan removes only the matching type older than cutoff" {
     try std.testing.expect(!found_old_temp);
     try std.testing.expect(found_new_temp);
     try std.testing.expect(found_humidity);
+}
+
+test "Lake and TimeSeries produce identical results" {
+    var lake = try Self.init(std.testing.allocator);
+    defer lake.deinit();
+    var ts = try @import("timeseries_storage.zig").init(std.testing.allocator);
+    defer ts.deinit();
+
+    const readings = [_]SensorReading{
+        .{ .sensor_id = 5, .timestamp = 100, .value = 1.5, .sensor_type = .temperature },
+        .{ .sensor_id = 2, .timestamp = 300, .value = 2.5, .sensor_type = .humidity },
+        .{ .sensor_id = 5, .timestamp = 200, .value = 3.5, .sensor_type = .co2 },
+        .{ .sensor_id = 1, .timestamp = 200, .value = 4.5, .sensor_type = .occupancy },
+    };
+
+    for (readings) |r| {
+        try lake.insert(r);
+        try ts.insert(r);
+    }
+
+    try std.testing.expectEqual(lake.count(), ts.count());
+
+    const lake_all = try lake.iterateAll(std.testing.allocator);
+    defer std.testing.allocator.free(lake_all);
+    const ts_all = try ts.iterateAll(std.testing.allocator);
+    defer std.testing.allocator.free(ts_all);
+
+    try std.testing.expectEqual(lake_all.len, ts_all.len);
+
+    const lake_rng = try lake.rangeByTime(std.testing.allocator, .{ .start_time = 150, .end_time = 250 });
+    defer std.testing.allocator.free(lake_rng);
+    const ts_rng = try ts.rangeByTime(std.testing.allocator, .{ .start_time = 150, .end_time = 250 });
+    defer std.testing.allocator.free(ts_rng);
+
+    try std.testing.expectEqual(lake_rng.len, ts_rng.len);
+    for (0..lake_rng.len) |i| {
+        try std.testing.expectEqual(lake_rng[i].sensor_id, ts_rng[i].sensor_id);
+        try std.testing.expectEqual(lake_rng[i].timestamp, ts_rng[i].timestamp);
+    }
 }

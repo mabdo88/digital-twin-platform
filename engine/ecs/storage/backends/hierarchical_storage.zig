@@ -309,6 +309,10 @@ pub fn floorOfZone(self: *const Self, zone_id: u32) ?u32 {
 /// `sensor_to_node`/`zone_to_node`/`floor_to_node` are untouched — pruning
 /// only ever removes readings, never a sensor's place in the tree. See
 /// storage_backend.zig's pruneOlderThan contract.
+/// Hierarchical has no fixed-capacity concept — see aos_storage.zig's
+/// setRetentionHint for why this is a no-op.
+pub fn setRetentionHint(_: *Self, _: SensorType, _: usize) !void {}
+
 pub fn pruneOlderThan(self: *Self, sensor_type: SensorType, cutoff_timestamp: i64) !void {
     for (self.nodes.items) |*node| {
         if (node.readings == null) continue;

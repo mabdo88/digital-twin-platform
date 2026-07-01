@@ -87,6 +87,7 @@ pub fn assertImplements(comptime T: type) void {
     if (!@hasDecl(T, "sensorIdsByFloor")) @compileError("StorageBackend: " ++ @typeName(T) ++ " missing pub fn sensorIdsByFloor");
     if (!@hasDecl(T, "floorOfZone")) @compileError("StorageBackend: " ++ @typeName(T) ++ " missing pub fn floorOfZone");
     if (!@hasDecl(T, "pruneOlderThan")) @compileError("StorageBackend: " ++ @typeName(T) ++ " missing pub fn pruneOlderThan");
+    if (!@hasDecl(T, "setRetentionHint")) @compileError("StorageBackend: " ++ @typeName(T) ++ " missing pub fn setRetentionHint");
 }
 
 // ---------------------------------------------------------------------------
@@ -226,6 +227,29 @@ pub fn assertImplements(comptime T: type) void {
 //      read. Safe to call when no reading of that type is old enough to
 //      remove (a no-op). Does not affect readings of other sensor types
 //      or a sensor's zone/floor registration.
+//
+//  pub fn setRetentionHint(self: *T, sensor_type: SensorType, max_readings: usize) !void
+//
+//      A HINT, not a command: tells the backend that `sensor_type` is
+//      expected to need at most `max_readings` retained (computed by the
+//      caller from that type's retention_days x reading rate — see
+//      synthetic/generator.zig's canonical per-type table, the single
+//      source of truth for those numbers; this interface only receives
+//      the already-computed count, keeping the storage layer unaware of
+//      *why* a number was chosen). Most backends have no fixed-capacity
+//      concept — they hold everything inserted, bounded only by
+//      pruneOlderThan — and implement this as a no-op, same as
+//      Hierarchical's tree structurally exploiting registerZone/Floor
+//      while flat backends only bookkeep it. RingBuffer is the one
+//      backend that structurally needs this: its per-sensor circular
+//      buffer size is fixed at allocation time (first insert for that
+//      sensor_id), so a hint set before a sensor type's first reading
+//      sizes that type's buffers correctly; a hint set after some
+//      sensors of that type already exist only affects sensors not yet
+//      seen (already-allocated buffers keep their original size — the
+//      caller is expected to set every hint before ingestion begins).
+//      Falls back to a backend-chosen default when no hint was set for
+//      a given type. No effect on already-stored readings.
 
 // ---------------------------------------------------------------------------
 // Tests — verify the interface types and assertImplements compile.
@@ -289,6 +313,7 @@ const StubBackend = struct {
         return null;
     }
     pub fn pruneOlderThan(_: *StubBackend, _: SensorType, _: i64) !void {}
+    pub fn setRetentionHint(_: *StubBackend, _: SensorType, _: usize) !void {}
 };
 
 test "assertImplements accepts a valid backend" {
@@ -336,6 +361,7 @@ const ExtendedBackend = struct {
         return null;
     }
     pub fn pruneOlderThan(_: *ExtendedBackend, _: SensorType, _: i64) !void {}
+    pub fn setRetentionHint(_: *ExtendedBackend, _: SensorType, _: usize) !void {}
     // Not part of the StorageBackend interface — should not affect the check.
     pub fn debugDump(_: *const ExtendedBackend) void {}
 };

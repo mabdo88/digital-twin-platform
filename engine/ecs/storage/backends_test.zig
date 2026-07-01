@@ -8,6 +8,7 @@ const ts = @import("backends/timeseries_storage.zig");
 const col = @import("backends/columnar_storage.zig");
 const hier = @import("backends/hierarchical_storage.zig");
 const rb = @import("backends/ringbuffer_storage.zig");
+const lake = @import("backends/lake_storage.zig");
 
 // Re-export so all tests in those files are discovered.
 comptime {
@@ -17,4 +18,5 @@ comptime {
     _ = col;
     _ = hier;
     _ = rb;
+    _ = lake;
 }
