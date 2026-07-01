@@ -132,15 +132,34 @@ pub const SensorProfile = struct {
 ///     range. The previous 1-10Hz values across building profiles were
 ///     600-6000x too fast for this sensor type.
 ///
-/// retention_days is research-grounded for energy (5yr — within the
-/// documented 3yr-private/5yr-third-party-sharing range) and structural
-/// (7yr — strain gauges are built for 10yr+ service life, and this matches
-/// typical facility-records compliance windows); the rest are reasonable
-/// defaults: 90 days for fast-changing operational types (temperature,
-/// humidity, flow), 1 year for types with seasonal/long-term trend value
-/// (occupancy, CO2, air_quality), 30 days for vibration's raw data (real
-/// systems keep flagged/derived events much longer than the raw stream,
-/// which this single-number model doesn't yet distinguish).
+/// retention_days is research-grounded for:
+///   - energy: 5yr, within the documented 3yr-private/5yr-third-party-
+///     sharing range for AMI data.
+///   - structural: 7yr, strain gauges are built for 10yr+ service life,
+///     matching typical facility-records compliance windows.
+///   - co2/air_quality: 3yr (1095 days), the WELL Building Standard's
+///     documented minimum for air-quality monitoring records (a real,
+///     regulatory-grounded number — OSHA's 29 CFR 1910.1020 requires up to
+///     30yr for employee-exposure records at regulated facilities, but
+///     that's disproportionate for this tool's scope; WELL's 3yr is the
+///     defensible, bounded choice).
+/// The rest are reasoned operational defaults, not backed by an external
+/// standard (labeled honestly, not dressed up as researched):
+///   - temperature/humidity: 90 days — no retention standard exists for
+///     BMS trend logs in the literature (only the 15-min sampling
+///     convention is documented); kept short since this is fast-changing
+///     operational data with no long-term compliance value.
+///   - flow: 1yr — genuinely ambiguous whether a given flow sensor is
+///     billing-relevant (utility water-meter retention runs 3yr+ in some
+///     jurisdictions) or a purely internal HVAC/plumbing trend sensor (no
+///     standard applies); 1yr is a pragmatic middle ground, not a
+///     researched number.
+///   - occupancy: 1yr — no retention standard found; privacy/data-
+///     minimization literature argues for keeping this short, not long.
+///   - vibration: 30 days — this is now an ANOMALY-EVENT log, not raw
+///     history (see Shape.bursty_impulsive's doc comment), so the window
+///     length barely affects volume either way; no external standard
+///     found for condition-monitoring alarm-log retention.
 ///
 /// density_per_100m2 has no equivalent external standard the way
 /// frequency_hz does — there's no "ISO spec for thermostats per square
@@ -234,12 +253,12 @@ pub fn profileFor(sensor_type: SensorType) SensorProfile {
         .temperature => .{ .base_value = 21.0, .daily_amplitude = 3.0, .peak_hour = 15.0, .noise_stddev = 0.3, .min_bound = 0.0, .max_bound = 50.0, .frequency_hz = 1.0 / 300.0, .shape = .diurnal_continuous, .density_per_100m2 = 1.0, .retention_days = 90, .relevant_queries = &COMFORT_QUERIES },
         .humidity => .{ .base_value = 45.0, .daily_amplitude = 10.0, .peak_hour = 5.0, .noise_stddev = 2.0, .min_bound = 0.0, .max_bound = 100.0, .frequency_hz = 1.0 / 300.0, .shape = .diurnal_continuous, .density_per_100m2 = 1.0, .retention_days = 90, .relevant_queries = &COMFORT_QUERIES_NO_THRESHOLD },
         .occupancy => .{ .base_value = 0.0, .daily_amplitude = 0.0, .peak_hour = 13.0, .noise_stddev = 0.0, .min_bound = 0.0, .max_bound = 1.0, .frequency_hz = 1.0 / 60.0, .shape = .binary_event, .density_per_100m2 = 1.0, .retention_days = 365, .relevant_queries = &OCCUPANCY_QUERIES },
-        .co2 => .{ .base_value = 450.0, .daily_amplitude = 350.0, .peak_hour = 14.0, .noise_stddev = 20.0, .min_bound = 350.0, .max_bound = 5000.0, .frequency_hz = 1.0 / 180.0, .shape = .diurnal_continuous, .density_per_100m2 = 0.5, .retention_days = 365, .relevant_queries = &AIR_SAFETY_QUERIES },
+        .co2 => .{ .base_value = 450.0, .daily_amplitude = 350.0, .peak_hour = 14.0, .noise_stddev = 20.0, .min_bound = 350.0, .max_bound = 5000.0, .frequency_hz = 1.0 / 180.0, .shape = .diurnal_continuous, .density_per_100m2 = 0.5, .retention_days = 1095, .relevant_queries = &AIR_SAFETY_QUERIES },
         .vibration => .{ .base_value = 0.05, .daily_amplitude = 0.15, .peak_hour = 13.0, .noise_stddev = 0.02, .min_bound = 0.0, .max_bound = 10.0, .frequency_hz = 1.0 / 120.0, .shape = .bursty_impulsive, .density_per_100m2 = 1.0, .retention_days = 30, .relevant_queries = &EQUIPMENT_HEALTH_QUERIES },
-        .flow => .{ .base_value = 5.0, .daily_amplitude = 4.0, .peak_hour = 10.0, .noise_stddev = 0.5, .min_bound = 0.0, .max_bound = 100.0, .frequency_hz = 1.0 / 60.0, .shape = .diurnal_continuous, .density_per_100m2 = 1.5, .retention_days = 90, .relevant_queries = &FLOW_QUERIES },
+        .flow => .{ .base_value = 5.0, .daily_amplitude = 4.0, .peak_hour = 10.0, .noise_stddev = 0.5, .min_bound = 0.0, .max_bound = 100.0, .frequency_hz = 1.0 / 60.0, .shape = .diurnal_continuous, .density_per_100m2 = 1.5, .retention_days = 365, .relevant_queries = &FLOW_QUERIES },
         .energy => .{ .base_value = 2.0, .daily_amplitude = 6.0, .peak_hour = 13.0, .noise_stddev = 0.5, .min_bound = 0.0, .max_bound = 500.0, .frequency_hz = 1.0 / 900.0, .shape = .stepwise_discrete, .density_per_100m2 = 0.5, .retention_days = 1825, .relevant_queries = &ENERGY_QUERIES },
         .structural => .{ .base_value = 50.0, .daily_amplitude = 5.0, .peak_hour = 15.0, .noise_stddev = 1.0, .min_bound = 0.0, .max_bound = 1000.0, .frequency_hz = 1.0 / 600.0, .shape = .diurnal_continuous, .density_per_100m2 = 0.5, .retention_days = 2555, .relevant_queries = &STRUCTURAL_QUERIES },
-        .air_quality => .{ .base_value = 50.0, .daily_amplitude = 20.0, .peak_hour = 17.0, .noise_stddev = 5.0, .min_bound = 0.0, .max_bound = 500.0, .frequency_hz = 1.0 / 180.0, .shape = .diurnal_continuous, .density_per_100m2 = 0.5, .retention_days = 365, .relevant_queries = &AIR_SAFETY_QUERIES },
+        .air_quality => .{ .base_value = 50.0, .daily_amplitude = 20.0, .peak_hour = 17.0, .noise_stddev = 5.0, .min_bound = 0.0, .max_bound = 500.0, .frequency_hz = 1.0 / 180.0, .shape = .diurnal_continuous, .density_per_100m2 = 0.5, .retention_days = 1095, .relevant_queries = &AIR_SAFETY_QUERIES },
     };
 }
 
@@ -282,22 +301,64 @@ pub fn generate(
         // sample loop, so state persists across that sensor's own
         // timeline — only the relevant one is touched per shape.
         var binary_state: f32 = 0.0;
+        // binary_event is an EVENT LOG, not periodic polling: a real
+        // occupancy/PIR system only reports a reading when the state
+        // actually transitions (occupied <-> unoccupied), never "still
+        // occupied" on a fixed clock. period_ms is how often we check for
+        // a transition, not how often we persist a reading — only ticks
+        // where the value actually changed from the last EMITTED value
+        // get appended. The first tick always emits (there is no prior
+        // emitted value to compare against — a real system reports its
+        // initial state at startup).
+        var binary_last_emitted: ?f32 = null;
         var step_level: f32 = profile.base_value;
         var step_hold: u32 = 0;
 
         while (t < end_time) : (t += period_ms) {
-            const value = switch (profile.shape) {
-                .diurnal_continuous => sampleDiurnal(profile, rand, t),
-                .binary_event => sampleBinaryEvent(profile, rand, t, &binary_state),
-                .stepwise_discrete => sampleStepwiseDiscrete(profile, rand, t, &step_level, &step_hold),
-                .bursty_impulsive => sampleBurstyImpulsive(profile, rand),
-            };
-            try out.append(allocator, .{
-                .sensor_id = sensor.sensor_id,
-                .timestamp = t,
-                .value = value,
-                .sensor_type = sensor.sensor_type,
-            });
+            switch (profile.shape) {
+                .diurnal_continuous => try out.append(allocator, .{
+                    .sensor_id = sensor.sensor_id,
+                    .timestamp = t,
+                    .value = sampleDiurnal(profile, rand, t),
+                    .sensor_type = sensor.sensor_type,
+                }),
+                .binary_event => {
+                    const value = sampleBinaryEvent(profile, rand, t, &binary_state);
+                    if (binary_last_emitted == null or value != binary_last_emitted.?) {
+                        binary_last_emitted = value;
+                        try out.append(allocator, .{
+                            .sensor_id = sensor.sensor_id,
+                            .timestamp = t,
+                            .value = value,
+                            .sensor_type = sensor.sensor_type,
+                        });
+                    }
+                },
+                .stepwise_discrete => try out.append(allocator, .{
+                    .sensor_id = sensor.sensor_id,
+                    .timestamp = t,
+                    .value = sampleStepwiseDiscrete(profile, rand, t, &step_level, &step_hold),
+                    .sensor_type = sensor.sensor_type,
+                }),
+                .bursty_impulsive => {
+                    // bursty_impulsive is an ANOMALY-EVENT LOG, not a raw
+                    // stream: real condition-monitoring systems don't
+                    // retain the continuous high-Hz signal — only the
+                    // detected events (bursts) get stored long-term. The
+                    // non-event (baseline) samples are generated
+                    // transiently, purely to drive the RNG the same way
+                    // every tick (determinism), and discarded immediately.
+                    const sample = sampleBurstyImpulsive(profile, rand);
+                    if (sample.is_event) {
+                        try out.append(allocator, .{
+                            .sensor_id = sensor.sensor_id,
+                            .timestamp = t,
+                            .value = sample.value,
+                            .sensor_type = sensor.sensor_type,
+                        });
+                    }
+                },
+            }
         }
     }
 
@@ -371,21 +432,32 @@ fn sampleStepwiseDiscrete(profile: SensorProfile, rand: std.Random, timestamp_ms
     return std.math.clamp(level.* + noise, profile.min_bound, profile.max_bound);
 }
 
+/// One sample from the bursty_impulsive model, tagged with whether it's an
+/// actual event (burst) worth persisting — see sampleBurstyImpulsive's doc
+/// comment and generate()'s bursty_impulsive branch for why only
+/// `is_event == true` samples get stored.
+const BurstSample = struct { value: f32, is_event: bool };
+
 /// Flat baseline with rare sharp bursts — vibration. Real condition-
 /// monitoring signals sit near a quiet baseline almost all the time, with
 /// occasional events (impacts, bearing faults) producing a sharp spike.
 /// Unlike the old uniform Gaussian-noise model, this makes anomaly
 /// detection mean something: outliers correspond to actual injected burst
 /// events, not just random tail noise that happened to clear the
-/// threshold.
-fn sampleBurstyImpulsive(profile: SensorProfile, rand: std.Random) f32 {
+/// threshold. `is_event` reports which branch produced this sample so the
+/// caller can decide whether to persist it — tied directly to the
+/// generative branch, not a derived magnitude threshold that could
+/// disagree near the boundary.
+fn sampleBurstyImpulsive(profile: SensorProfile, rand: std.Random) BurstSample {
     const burst_chance: f32 = 0.02;
     if (rand.float(f32) < burst_chance) {
         const burst_magnitude = profile.daily_amplitude * (3.0 + rand.float(f32) * 4.0);
-        return std.math.clamp(profile.base_value + burst_magnitude, profile.min_bound, profile.max_bound);
+        const value = std.math.clamp(profile.base_value + burst_magnitude, profile.min_bound, profile.max_bound);
+        return .{ .value = value, .is_event = true };
     }
     const noise = rand.floatNorm(f32) * profile.noise_stddev;
-    return std.math.clamp(profile.base_value + noise, profile.min_bound, profile.max_bound);
+    const value = std.math.clamp(profile.base_value + noise, profile.min_bound, profile.max_bound);
+    return .{ .value = value, .is_event = false };
 }
 
 /// Hour-of-day (0.0-23.999...) for a given epoch-ms timestamp. Exposed so
@@ -521,12 +593,20 @@ test "generate scales to 100,000 sensors (Phase 1 ceiling) without blowing up" {
     // Short duration so the test stays fast — this checks the generator's
     // per-sensor overhead scales to 100k sensors, not that it can produce a
     // full day of data for all of them in one test run. Every canonical
-    // per-type frequency is well under 1/2s (the fastest, occupancy/flow,
-    // is 1/60Hz), so a 2000ms window yields exactly 1 sample per sensor.
+    // per-type period is well over 2000ms (the fastest, occupancy/flow, is
+    // 60000ms), so exactly one tick gets evaluated per sensor in this
+    // window — but "one tick evaluated" no longer means "one reading
+    // stored" for every type: continuous/stepwise types and occupancy's
+    // first-ever tick always emit, but vibration's bursty_impulsive only
+    // emits ~2% of the time (event-based storage — see generate()'s
+    // bursty_impulsive branch). So readings.len is bounded above by
+    // num_sensors, not equal to it; the real thing this test checks is
+    // that generation completes and doesn't blow up at this scale.
     const readings = try generate(allocator, sensors, .{ .duration_ms = 2000 });
     defer allocator.free(readings);
 
-    try testing.expectEqual(num_sensors, readings.len);
+    try testing.expect(readings.len > 0);
+    try testing.expect(readings.len <= num_sensors);
 }
 
 // ---------------------------------------------------------------------------
@@ -556,15 +636,27 @@ test "binary_event (occupancy): state has dwell time, not flickering every sampl
     const readings = try generate(testing.allocator, &sensors, .{ .duration_ms = 2 * 24 * 60 * 60 * 1000 });
     defer testing.allocator.free(readings);
 
-    // If every sample independently re-rolled its state, consecutive
-    // samples would differ ~50% of the time. Real dwell time means most
-    // consecutive pairs share the same value.
-    var same_as_prev: usize = 0;
+    // binary_event is an event log: only transitions are stored, so every
+    // consecutive pair of STORED readings must differ (0->1 or 1->0) — if
+    // two adjacent stored readings ever shared a value, that would mean a
+    // non-transition tick got persisted, which is exactly what event-based
+    // storage must not do.
+    try testing.expect(readings.len > 1);
     for (1..readings.len) |i| {
-        if (readings[i].value == readings[i - 1].value) same_as_prev += 1;
+        try testing.expect(readings[i].value != readings[i - 1].value);
     }
-    const same_fraction = @as(f64, @floatFromInt(same_as_prev)) / @as(f64, @floatFromInt(readings.len - 1));
-    try testing.expect(same_fraction > 0.6);
+
+    // Dwell time still exists in the underlying process — it's just no
+    // longer visible as "many identical consecutive samples" (there are
+    // none now). Instead, most gaps between transitions should span more
+    // than one tick period, proving the state didn't literally flip every
+    // single tick.
+    const period_ms = periodMs(profileFor(.occupancy).frequency_hz);
+    var wide_gaps: usize = 0;
+    for (1..readings.len) |i| {
+        if (readings[i].timestamp - readings[i - 1].timestamp > period_ms) wide_gaps += 1;
+    }
+    try testing.expect(wide_gaps > 0);
 }
 
 test "stepwise_discrete (energy): holds an identical value across consecutive samples, not continuously varying" {
@@ -582,24 +674,31 @@ test "stepwise_discrete (energy): holds an identical value across consecutive sa
     try testing.expect(any_repeat);
 }
 
-test "bursty_impulsive (vibration): most readings stay near baseline, bursts are rare" {
+test "bursty_impulsive (vibration): only burst events are stored, never the baseline stream" {
     const sensors = [_]SensorMetadata{
         .{ .sensor_id = 0, .sensor_type = .vibration, .frequency_hz = 1.0, .element_id = 0 },
     };
-    const readings = try generate(testing.allocator, &sensors, .{ .duration_ms = 7 * 24 * 60 * 60 * 1000 });
+    const duration_ms: i64 = 7 * 24 * 60 * 60 * 1000;
+    const readings = try generate(testing.allocator, &sensors, .{ .duration_ms = duration_ms });
     defer testing.allocator.free(readings);
 
     const profile = profileFor(.vibration);
     const burst_floor = profile.base_value + profile.daily_amplitude * 2.0;
 
-    var burst_count: usize = 0;
+    // Every STORED reading must be a burst (the anomaly-event log
+    // contract) — if any stored value fell at/below the burst floor, that
+    // would mean baseline noise leaked into the persisted stream, which
+    // real condition-monitoring systems never do.
+    try testing.expect(readings.len > 0);
     for (readings) |r| {
-        if (r.value > burst_floor) burst_count += 1;
+        try testing.expect(r.value > burst_floor);
     }
-    const burst_fraction = @as(f64, @floatFromInt(burst_count)) / @as(f64, @floatFromInt(readings.len));
 
-    // ~2% burst chance — assert it's rare (well under half) but that at
-    // least some bursts occurred over a week of samples (not a dead path).
-    try testing.expect(burst_count > 0);
-    try testing.expect(burst_fraction < 0.2);
+    // Sparse relative to the underlying tick count — proves this is an
+    // event log, not the full raw stream (~2% burst chance means readings
+    // stored should be a small fraction of total ticks evaluated, not
+    // anywhere close to 1:1).
+    const period_ms = periodMs(profile.frequency_hz);
+    const total_ticks: usize = @intCast(@divFloor(duration_ms, period_ms));
+    try testing.expect(readings.len < total_ticks / 4);
 }

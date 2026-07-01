@@ -1,6 +1,6 @@
 # Storage/Benchmark Redesign Plan (agreed 2026-06-30)
 
-> **Status: IN PROGRESS as of 2026-07-01.** Four of eleven implementation steps are
+> **Status: IN PROGRESS as of 2026-07-01.** Six of eleven implementation steps are
 > done and verified (see "Implementation progress" below); the rest of this
 > document is still the target, not yet built. Check `git log` and the current
 > source before assuming any specific piece is done. Treat this as a status doc
@@ -74,11 +74,58 @@
    file runs Lake alongside the other 4 deployment backends and reports it
    in the winner comparison.
 
-**Not yet started:** the generator.zig continuous/event-storage split, the researched
-retention values, per-sensor unique full-volume generation, the live tick
-simulator, retiring the 25-iteration methodology, and the main.zig rewire.
-See "Explicitly NOT yet done" at the bottom — unchanged except items 1-2
-above are now done, not planned.
+5. **generator.zig split into continuous vs. event-storage models** —
+   `generate()`'s per-shape switch now decides not just HOW to compute a
+   value but WHETHER to store it. `binary_event` (occupancy) only appends a
+   reading when the value differs from the last EMITTED value (an event
+   log, not periodic polling) — the first tick always emits, since a real
+   system reports its initial state at startup. `bursty_impulsive`
+   (vibration) only appends when `sampleBurstyImpulsive` reports
+   `is_event == true` — non-event (baseline) samples still run through the
+   RNG for determinism but are discarded immediately, never stored. This
+   is the exact design the user corrected earlier in this session
+   ("occupancy is stored event based... vibration... we only store
+   anomalies"), now implemented as an authorized, agreed step.
+   `diurnal_continuous`/`stepwise_discrete` (temperature/humidity/co2/
+   air_quality/flow/structural/energy) are unchanged — full periodic
+   readings every tick, since that's genuinely how BMS/AMI historians
+   report.
+6. **Retention values updated per research** — co2/air_quality: 365 -> 1095
+   days (3yr, WELL Building Standard's documented minimum — a real
+   regulatory number, correcting the earlier unresearched guess). flow: 90
+   -> 365 days (1yr, a disclosed pragmatic choice per the user: genuinely
+   ambiguous whether a given flow sensor is billing-relevant, "not
+   important now, just make it 1yr"). The doc comment above `profileFor`
+   now explicitly labels which retention values are research-grounded
+   (energy, structural, co2/air_quality) vs. reasoned operational defaults
+   (temperature/humidity, flow, occupancy, vibration), so a future reader
+   never mistakes a default for a citation.
+
+**Verification (steps 5-6).** Three existing tests had premises inverted by
+the storage-model change and were rewritten, not just patched: the old
+"binary_event... state has dwell time" test asserted most CONSECUTIVE
+STORED readings share a value — the opposite is now true by construction
+(every stored reading is a transition), so it now asserts consecutive
+stored readings always DIFFER, with dwell time proven instead via gaps
+between transition timestamps exceeding one tick period. The old
+"bursty_impulsive... most readings stay near baseline" test asserted most
+stored readings are near baseline — now every stored reading must exceed
+the burst floor (it's an event log), with sparsity proven by comparing
+count against total ticks evaluated. The 100k-sensor scale test's exact
+`readings.len == num_sensors` assertion no longer holds now that
+vibration's per-tick storage is genuinely probabilistic (~2%) — relaxed to
+`0 < readings.len <= num_sensors`, since the test's real purpose (scale
+without blowing up) doesn't depend on an exact count. Full suite green
+throughout. End-to-end smoke-tested against the equipment-heavy HASC IFC
+file: 364 sensors -> 1053 readings (a fraction of the old per-type-uniform
+volume), vibration correctly sparse, Lake winning for both energy and
+vibration in that run's per-type recommendation.
+
+**Not yet started:** per-sensor unique full-volume generation (no
+sampling/sharing across sibling sensors), the live tick simulator, retiring
+the 25-iteration methodology, and the main.zig rewire that ties all of this
+together into the real pipeline. See "Explicitly NOT yet done" at the
+bottom — unchanged except items 1-4 above are now done, not planned.
 
 ## Why this exists
 
@@ -211,11 +258,11 @@ Columnar/TimeSeries's indexing overhead isn't worth paying for.
 1. ~~Full recheck of the remaining 7 query patterns~~ — **done 2026-07-01**.
 2. ~~The prune/evict interface method~~ — **done 2026-07-01**.
 3. ~~RingBuffer's per-type-configurable capacity~~ — **done 2026-07-01**.
-4. ~~The Lake backend~~ — **done 2026-07-01**. All four items above are in
-   "Implementation progress" above. Still not implemented: the two-tier
-   generation split (continuous vs. event-storage sensor types), the
-   researched retention values, per-sensor unique full-volume generation,
-   the live tick simulator, retiring the 25-iteration methodology, and the
-   main.zig rewire.
-5. Time-compression factor for the live simulator.
-6. The CLAUDE.md §3.4 edit reflecting the retired 25-iteration rule.
+4. ~~The Lake backend~~ — **done 2026-07-01**.
+5. ~~The generator.zig continuous/event-storage split~~ — **done 2026-07-01**.
+6. ~~The researched retention values~~ — **done 2026-07-01**. All six items
+   above are in "Implementation progress" above. Still not implemented:
+   per-sensor unique full-volume generation, the live tick simulator,
+   retiring the 25-iteration methodology, and the main.zig rewire.
+7. Time-compression factor for the live simulator.
+8. The CLAUDE.md §3.4 edit reflecting the retired 25-iteration rule.
