@@ -1,0 +1,1143 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Digital Twin Storage & Query Patterns</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; overflow: hidden; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0b1220; color: #e8eef7; }
+  .deck { width: 100vw; height: 100vh; position: relative; }
+  .slide { position: absolute; inset: 0; padding: 60px 80px; display: none; flex-direction: column; opacity: 0; transition: opacity 0.3s ease; }
+  .slide.active { display: flex; opacity: 1; }
+  .slide-num { position: absolute; top: 24px; right: 32px; font-size: 13px; color: #6b7c95; letter-spacing: 2px; }
+  .slide-title { font-size: 44px; font-weight: 700; color: #ffffff; margin-bottom: 8px; letter-spacing: -0.5px; }
+  .slide-subtitle { font-size: 18px; color: #8aa0bf; margin-bottom: 36px; font-weight: 400; }
+  h2 { font-size: 28px; color: #ffffff; margin-bottom: 20px; font-weight: 600; }
+  h3 { font-size: 18px; color: #4dabf7; margin-bottom: 12px; margin-top: 8px; font-weight: 600; text-transform: uppercase; letter-spacing: 1px; }
+  p { font-size: 16px; line-height: 1.6; color: #c5d2e3; margin-bottom: 12px; }
+  .nav { position: fixed; bottom: 24px; left: 0; right: 0; display: flex; justify-content: center; gap: 16px; z-index: 100; align-items: center; }
+  .nav button { background: #1a2540; border: 1px solid #2d3b5e; color: #e8eef7; padding: 10px 20px; border-radius: 8px; cursor: pointer; font-size: 14px; transition: all 0.2s; }
+  .nav button:hover { background: #243358; border-color: #4dabf7; }
+  .nav button:disabled { opacity: 0.3; cursor: not-allowed; }
+  .counter { font-size: 13px; color: #6b7c95; min-width: 60px; text-align: center; }
+  .progress { position: fixed; top: 0; left: 0; height: 3px; background: linear-gradient(90deg, #4dabf7, #22d3ee); z-index: 100; transition: width 0.3s; }
+  .grid { display: grid; gap: 20px; }
+  .grid-2 { grid-template-columns: 1fr 1fr; }
+  .grid-3 { grid-template-columns: 1fr 1fr 1fr; }
+  .grid-4 { grid-template-columns: repeat(4, 1fr); }
+  .card { background: #131c30; border: 1px solid #243358; border-radius: 12px; padding: 20px; transition: transform 0.2s, border-color 0.2s; }
+  .card:hover { transform: translateY(-2px); border-color: #4dabf7; }
+  .card-icon { font-size: 32px; margin-bottom: 10px; }
+  .card-title { font-size: 17px; font-weight: 600; color: #ffffff; margin-bottom: 6px; }
+  .card-sub { font-size: 12px; color: #6b7c95; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 10px; }
+  .card-body { font-size: 13.5px; line-height: 1.55; color: #b8c6db; }
+  .badge { display: inline-block; padding: 3px 10px; border-radius: 4px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; margin-right: 6px; margin-bottom: 6px; }
+  .badge-green { background: rgba(34, 197, 94, 0.15); color: #4ade80; border: 1px solid rgba(34, 197, 94, 0.3); }
+  .badge-red { background: rgba(239, 68, 68, 0.15); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.3); }
+  .badge-yellow { background: rgba(234, 179, 8, 0.15); color: #facc15; border: 1px solid rgba(234, 179, 8, 0.3); }
+  .badge-blue { background: rgba(77, 171, 247, 0.15); color: #4dabf7; border: 1px solid rgba(77, 171, 247, 0.3); }
+  .badge-purple { background: rgba(168, 85, 247, 0.15); color: #c084fc; border: 1px solid rgba(168, 85, 247, 0.3); }
+  .badge-orange { background: rgba(249, 115, 22, 0.15); color: #fb923c; border: 1px solid rgba(249, 115, 22, 0.3); }
+  .badge-gray { background: rgba(148, 163, 184, 0.15); color: #cbd5e1; border: 1px solid rgba(148, 163, 184, 0.3); }
+  .diagram { background: #0a1224; border: 1px solid #243358; border-radius: 12px; padding: 28px; margin: 16px 0; flex: 1; display: flex; flex-direction: column; justify-content: center; }
+  .flow-row { display: flex; align-items: center; justify-content: center; gap: 12px; flex-wrap: wrap; }
+  .flow-box { background: #1a2540; border: 2px solid #4dabf7; border-radius: 10px; padding: 14px 18px; text-align: center; min-width: 120px; }
+  .flow-box.source { border-color: #22d3ee; background: rgba(34, 211, 238, 0.08); }
+  .flow-box.hot { border-color: #f87171; background: rgba(239, 68, 68, 0.08); }
+  .flow-box.warm { border-color: #fb923c; background: rgba(249, 115, 22, 0.08); }
+  .flow-box.cold { border-color: #4dabf7; background: rgba(77, 171, 247, 0.08); }
+  .flow-box.analyze { border-color: #c084fc; background: rgba(168, 85, 247, 0.08); }
+  .flow-box small { display: block; font-size: 10px; color: #6b7c95; text-transform: uppercase; letter-spacing: 1px; margin-top: 4px; }
+  .arrow { color: #4dabf7; font-size: 24px; font-weight: 700; }
+  .arrow-down { color: #4dabf7; font-size: 20px; }
+  .legend { display: flex; gap: 18px; justify-content: center; margin-top: 20px; font-size: 12px; color: #8aa0bf; }
+  .legend-item { display: flex; align-items: center; gap: 6px; }
+  .legend-dot { width: 12px; height: 12px; border-radius: 3px; }
+  .viz-row { display: flex; gap: 4px; align-items: flex-end; height: 100px; margin: 12px 0; }
+  .viz-bar { flex: 1; background: linear-gradient(180deg, #4dabf7, #2563eb); border-radius: 2px 2px 0 0; min-height: 4px; transition: all 0.3s; }
+  .viz-bar.hot { background: linear-gradient(180deg, #f87171, #dc2626); }
+  .viz-bar.warm { background: linear-gradient(180deg, #fb923c, #ea580c); }
+  .viz-bar.cold { background: linear-gradient(180deg, #60a5fa, #2563eb); }
+  .viz-label { font-size: 10px; color: #6b7c95; text-align: center; margin-top: 4px; }
+  .table-wrap { overflow: auto; flex: 1; }
+  table.matrix { width: 100%; border-collapse: collapse; font-size: 13px; }
+  table.matrix th { background: #1a2540; color: #4dabf7; padding: 10px 8px; text-align: center; font-weight: 600; border: 1px solid #243358; }
+  table.matrix th.row-label { text-align: left; color: #ffffff; background: #131c30; }
+  table.matrix td { padding: 10px 8px; text-align: center; border: 1px solid #243358; color: #b8c6db; }
+  table.matrix td.label { text-align: left; font-weight: 500; color: #ffffff; background: #131c30; }
+  .heat-best { background: rgba(34, 197, 94, 0.25); color: #4ade80; font-weight: 700; }
+  .heat-good { background: rgba(34, 197, 94, 0.10); color: #86efac; }
+  .heat-ok { background: rgba(234, 179, 8, 0.10); color: #facc15; }
+  .heat-poor { background: rgba(239, 68, 68, 0.20); color: #fca5a5; }
+  .heat-bad { background: rgba(239, 68, 68, 0.35); color: #fecaca; font-weight: 700; }
+  .stat-row { display: flex; gap: 24px; margin: 16px 0; }
+  .stat { flex: 1; background: #131c30; border: 1px solid #243358; border-radius: 10px; padding: 18px; }
+  .stat-num { font-size: 32px; font-weight: 700; color: #4dabf7; margin-bottom: 4px; }
+  .stat-label { font-size: 12px; color: #6b7c95; text-transform: uppercase; letter-spacing: 1px; }
+  .callout { background: linear-gradient(135deg, rgba(77, 171, 247, 0.1), rgba(34, 211, 238, 0.05)); border-left: 4px solid #4dabf7; padding: 16px 20px; border-radius: 8px; margin: 12px 0; }
+  .callout-warn { background: linear-gradient(135deg, rgba(239, 68, 68, 0.1), rgba(249, 115, 22, 0.05)); border-left: 4px solid #f87171; }
+  .callout-success { background: linear-gradient(135deg, rgba(34, 197, 94, 0.1), rgba(74, 222, 128, 0.05)); border-left: 4px solid #4ade80; }
+  .callout-title { font-size: 14px; font-weight: 700; color: #ffffff; margin-bottom: 6px; text-transform: uppercase; letter-spacing: 1px; }
+  .callout-body { font-size: 14px; color: #c5d2e3; line-height: 1.55; }
+  .sensor-pill { display: inline-block; padding: 8px 16px; border-radius: 20px; font-size: 13px; margin: 4px; font-weight: 500; }
+  .timeline { position: relative; padding: 20px 0; }
+  .timeline-track { position: absolute; top: 50%; left: 0; right: 0; height: 4px; background: #243358; }
+  .timeline-events { display: flex; justify-content: space-between; position: relative; }
+  .timeline-event { flex: 1; text-align: center; position: relative; }
+  .timeline-dot { width: 16px; height: 16px; background: #4dabf7; border-radius: 50%; margin: 0 auto 12px; border: 3px solid #0b1220; box-shadow: 0 0 0 2px #4dabf7; }
+  .timeline-label { font-size: 12px; color: #8aa0bf; font-weight: 600; }
+  .timeline-time { font-size: 11px; color: #6b7c95; margin-top: 2px; }
+  .scenario { background: #131c30; border: 1px solid #243358; border-radius: 12px; padding: 24px; margin-bottom: 14px; }
+  .scenario-head { display: flex; align-items: center; gap: 14px; margin-bottom: 14px; }
+  .scenario-num { background: #4dabf7; color: #0b1220; width: 36px; height: 36px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 16px; flex-shrink: 0; }
+  .scenario-title { font-size: 18px; font-weight: 600; color: #ffffff; }
+  .scenario-body { font-size: 14px; color: #b8c6db; line-height: 1.6; margin-bottom: 10px; }
+  .scenario-stack { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+  .use-case-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px; margin-top: 12px; }
+  .use-case { background: rgba(77, 171, 247, 0.06); border: 1px solid #243358; border-radius: 8px; padding: 14px; }
+  .use-case-title { font-size: 14px; font-weight: 600; color: #4dabf7; margin-bottom: 6px; }
+  .use-case-body { font-size: 13px; color: #b8c6db; line-height: 1.5; }
+  .row-spread { display: flex; justify-content: space-between; align-items: center; }
+  ul.compact { list-style: none; padding-left: 0; }
+  ul.compact li { padding-left: 20px; position: relative; margin-bottom: 8px; font-size: 14px; color: #b8c6db; line-height: 1.5; }
+  ul.compact li::before { content: "▸"; position: absolute; left: 0; color: #4dabf7; font-weight: 700; }
+  .keyword { color: #4dabf7; font-weight: 600; }
+  .code-inline { background: #1a2540; padding: 2px 8px; border-radius: 4px; font-family: 'SF Mono', Monaco, monospace; font-size: 12.5px; color: #22d3ee; }
+  .cover { background: radial-gradient(ellipse at top, #1a2540 0%, #0b1220 70%); align-items: center; justify-content: center; text-align: center; }
+  .cover-title { font-size: 64px; font-weight: 700; color: #ffffff; letter-spacing: -1.5px; margin-bottom: 16px; }
+  .cover-sub { font-size: 22px; color: #8aa0bf; margin-bottom: 36px; }
+  .cover-tag { display: inline-block; padding: 8px 18px; background: rgba(77, 171, 247, 0.12); border: 1px solid #4dabf7; border-radius: 24px; color: #4dabf7; font-size: 14px; font-weight: 500; letter-spacing: 1px; }
+  .end-cover { background: radial-gradient(ellipse at center, #1a2540 0%, #0b1220 70%); align-items: center; justify-content: center; text-align: center; }
+  .end-cover h1 { font-size: 48px; color: #ffffff; margin-bottom: 16px; }
+  .end-cover p { font-size: 18px; color: #8aa0bf; max-width: 700px; }
+  .scrollable { overflow-y: auto; flex: 1; padding-right: 8px; }
+  .scrollable::-webkit-scrollbar { width: 6px; }
+  .scrollable::-webkit-scrollbar-thumb { background: #243358; border-radius: 3px; }
+  .flex-grow { flex: 1; }
+</style>
+</head>
+<body>
+
+<div class="progress" id="progress"></div>
+
+<div class="deck" id="deck">
+
+  <!-- SLIDE 1: COVER -->
+  <div class="slide cover active" data-slide="1">
+    <div class="cover-tag">DIGITAL TWIN INFRASTRUCTURE</div>
+    <h1 class="cover-title">Storage & Query Patterns</h1>
+    <p class="cover-sub">How sensor data flows through a digital twin — and what each piece actually does</p>
+    <div style="margin-top: 48px;">
+      <span class="badge badge-blue">Time-Series</span>
+      <span class="badge badge-purple">Columnar</span>
+      <span class="badge badge-orange">Hierarchical</span>
+      <span class="badge badge-green">In-Memory</span>
+      <span class="badge badge-red">Lake</span>
+    </div>
+  </div>
+
+  <!-- SLIDE 2: WHY THIS MATTERS -->
+  <div class="slide" data-slide="2">
+    <div class="slide-num">02 / 16</div>
+    <h1 class="slide-title">Why Digital Twins Live or Die on Data Plumbing</h1>
+    <p class="slide-subtitle">The model is 20% of the work. The data infrastructure is the other 80%.</p>
+    <div class="stat-row">
+      <div class="stat"><div class="stat-num">70%</div><div class="stat-label">of cost is data, not compute</div></div>
+      <div class="stat"><div class="stat-num">5+</div><div class="stat-label">storage types often needed</div></div>
+      <div class="stat"><div class="stat-num">3-10x</div><div class="stat-label">cost of naive vs tiered design</div></div>
+    </div>
+    <div class="callout">
+      <div class="callout-title">The Real Failure Mode</div>
+      <div class="callout-body">Digital twin projects don't fail because the 3D model is wrong. They fail because queries get slow, storage bills balloon, and schema changes break ingest. The architecture decisions made in week one determine what hurts in year one.</div>
+    </div>
+    <div class="scrollable" style="margin-top: 8px;">
+      <ul class="compact">
+        <li>Sensors fire millions of readings per day — high ingest pressure from day one</li>
+        <li>Different sensor types want different storage behavior — temperature ≠ vibration ≠ occupancy</li>
+        <li>Query patterns are mixed: real-time dashboards, hourly aggregations, year-long historical scans</li>
+        <li>Buildings change: new sensors get added, schemas drift, hardware gets replaced</li>
+        <li>One storage backend rarely wins all workloads — hybrid is the norm</li>
+      </ul>
+    </div>
+  </div>
+
+  <!-- SLIDE 3: SENSOR TYPES -->
+  <div class="slide" data-slide="3">
+    <div class="slide-num">03 / 16</div>
+    <h1 class="slide-title">The Five Sensor Personalities</h1>
+    <p class="slide-subtitle">Each sensor type wants different storage behavior. Treating them all the same is the first expensive mistake.</p>
+    <div class="grid grid-2">
+      <div class="card">
+        <div class="card-icon">🌡️</div>
+        <div class="card-title">Temperature / Humidity</div>
+        <div class="card-sub">Slow, smooth, autocorrelated</div>
+        <div class="card-body">Steady baseline + small noise + occasional HVAC events. Compresses beautifully. Best stored with time-series engine, aggressively downsampled.</div>
+        <div style="margin-top: 10px;">
+          <span class="badge badge-green">Compresses 4-8x</span>
+          <span class="badge badge-blue">Time-series</span>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-icon">📳</div>
+        <div class="card-title">Vibration / Acceleration</div>
+        <div class="card-sub">Bursty, high-frequency, spectral</div>
+        <div class="card-body">100+ Hz sampling, mostly quiet, sudden bursts with rich frequency content. Needs short raw retention (days) plus feature extraction (RMS, FFT peaks).</div>
+        <div style="margin-top: 10px;">
+          <span class="badge badge-red">Storage hungry</span>
+          <span class="badge badge-orange">Edge preprocessing</span>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-icon">👥</div>
+        <div class="card-title">Occupancy / People Counters</div>
+        <div class="card-sub">Event-driven, state machines</div>
+        <div class="card-body">Binary or count-valued, slow transitions (no flicker), diurnal and weekly patterns. Best stored as events with state-change detection, not raw streams.</div>
+        <div style="margin-top: 10px;">
+          <span class="badge badge-yellow">Event-sourced</span>
+          <span class="badge badge-purple">Low volume</span>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-icon">🏗️</div>
+        <div class="card-title">Structural (Strain / Displacement)</div>
+        <div class="card-sub">Sparse, long-lived, coupled</div>
+        <div class="card-body">Low sample rate but data must be kept for years. Couples with temperature (thermal expansion). Rare high-amplitude load events. Compliance-driven retention.</div>
+        <div style="margin-top: 10px;">
+          <span class="badge badge-red">Years retention</span>
+          <span class="badge badge-blue">Compliance</span>
+        </div>
+      </div>
+    </div>
+    <div class="card" style="margin-top: 14px;">
+      <div class="card-icon">⚡</div>
+      <div class="card-title">Energy / Flow Meters</div>
+      <div class="card-sub">Stepwise constant, scheduled loads</div>
+      <div class="card-body">Piecewise-constant values, low sample rate (15-min typical), step events on equipment activation. Highly compressible but query patterns are very aggregation-heavy (daily/weekly/monthly totals).</div>
+      <div style="margin-top: 10px;">
+        <span class="badge badge-green">Compresses well</span>
+        <span class="badge badge-purple">Aggregation queries</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- SLIDE 4: SENSOR CHARACTERISTICS TABLE -->
+  <div class="slide" data-slide="4">
+    <div class="slide-num">04 / 16</div>
+    <h1 class="slide-title">Sensor Characteristics at a Glance</h1>
+    <p class="slide-subtitle">The storage strategy follows from these numbers.</p>
+    <div class="table-wrap">
+      <table class="matrix">
+        <thead>
+          <tr>
+            <th class="row-label">Sensor Type</th>
+            <th>Sample Rate</th>
+            <th>Data Pattern</th>
+            <th>Retention Need</th>
+            <th>Compression</th>
+            <th>Best Storage</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="label">🌡️ Temperature</td>
+            <td>1 / minute</td>
+            <td>Smooth, diurnal</td>
+            <td>90 days</td>
+            <td class="heat-best">4-8x</td>
+            <td><span class="badge badge-blue">Time-Series</span></td>
+          </tr>
+          <tr>
+            <td class="label">📳 Vibration</td>
+            <td>100+ Hz</td>
+            <td>Bursty, spectral</td>
+            <td>7-30 days raw</td>
+            <td class="heat-poor">1.5-2x</td>
+            <td><span class="badge badge-green">Ring + Lake</span></td>
+          </tr>
+          <tr>
+            <td class="label">👥 Occupancy</td>
+            <td>Event-driven</td>
+            <td>State machine</td>
+            <td>1 year</td>
+            <td class="heat-best">10x</td>
+            <td><span class="badge badge-purple">Events / KV</span></td>
+          </tr>
+          <tr>
+            <td class="label">🏗️ Structural</td>
+            <td>1 / 10 min</td>
+            <td>Sparse, coupled</td>
+            <td>5-10 years</td>
+            <td class="heat-good">3-5x</td>
+            <td><span class="badge badge-orange">Time-Series + Archive</span></td>
+          </tr>
+          <tr>
+            <td class="label">⚡ Energy Meter</td>
+            <td>15 min</td>
+            <td>Stepwise constant</td>
+            <td>3-5 years</td>
+            <td class="heat-best">8-12x</td>
+            <td><span class="badge badge-purple">Columnar</span></td>
+          </tr>
+          <tr>
+            <td class="label">💨 Air Quality (CO2)</td>
+            <td>1 / min</td>
+            <td>Periodic + events</td>
+            <td>1 year</td>
+            <td class="heat-good">3-4x</td>
+            <td><span class="badge badge-blue">Time-Series</span></td>
+          </tr>
+          <tr>
+            <td class="label">🌊 HVAC Flow</td>
+            <td>1 Hz</td>
+            <td>Periodic, controlled</td>
+            <td>90 days</td>
+            <td class="heat-good">3-4x</td>
+            <td><span class="badge badge-blue">Time-Series</span></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="callout" style="margin-top: 16px;">
+      <div class="callout-title">The Takeaway</div>
+      <div class="callout-body">Notice vibration: worst compression, shortest retention, highest ingest rate. That single combination breaks most "one database for everything" architectures. Storage strategy must be per-sensor-type, not universal.</div>
+    </div>
+  </div>
+
+  <!-- SLIDE 5: STORAGE TYPE 1 - TIME SERIES -->
+  <div class="slide" data-slide="5">
+    <div class="slide-num">05 / 16</div>
+    <h1 class="slide-title">Storage Type #1: Time-Series Store</h1>
+    <p class="slide-subtitle">The workhorse for high-ingest sensor telemetry. <span class="keyword">InfluxDB · TimescaleDB · InfluxDB Cloud · AWS Timestream · Bigtable</span></p>
+    <div class="grid grid-2">
+      <div>
+        <h3>How It's Built</h3>
+        <p>Append-only log sorted by timestamp, grouped into time blocks. Each block compressed with delta-of-delta + XOR encoding (Gorilla-style) or similar. Indexes sit alongside: time index, series/tag index, optionally bloom filters.</p>
+        <h3 style="margin-top: 20px;">Strengths</h3>
+        <ul class="compact">
+          <li>Excellent <span class="keyword">write throughput</span> (millions of points/sec on cluster)</li>
+          <li>Time-window reads scan contiguous blocks — very fast</li>
+          <li>Built-in downsampling, retention policies, continuous queries</li>
+          <li>Compression ratios of 4-8x for smooth sensor data</li>
+        </ul>
+      </div>
+      <div>
+        <h3>Weaknesses</h3>
+        <ul class="compact">
+          <li>Cross-series aggregation gets expensive at scale</li>
+          <li>Schema changes (new tag dimensions) require index rebuilds</li>
+          <li>Limited support for <span class="keyword">joins</span> with reference data (BIM metadata)</li>
+          <li>High cardinality (millions of unique sensor IDs) can break the series index</li>
+        </ul>
+        <h3 style="margin-top: 20px;">Best Use Cases</h3>
+        <div class="use-case-grid">
+          <div class="use-case">
+            <div class="use-case-title">Real-time monitoring</div>
+            <div class="use-case-body">Live sensor dashboards, last-value displays, threshold alerts</div>
+          </div>
+          <div class="use-case">
+            <div class="use-case-title">Time-window ops</div>
+            <div class="use-case-body">"Avg temperature in zone X for last 24h"</div>
+          </div>
+          <div class="use-case">
+            <div class="use-case-title">Append-only retention</div>
+            <div class="use-case-body">Raw telemetry with automatic TTL-based eviction</div>
+          </div>
+          <div class="use-case">
+            <div class="use-case-title">Anomaly detection</div>
+            <div class="use-case-body">Stream-aligned computations, recent-baseline comparisons</div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="diagram" style="margin-top: 18px;">
+      <div style="font-size: 13px; color: #8aa0bf; margin-bottom: 16px; text-align: center;">INTERNAL LAYOUT — TSM (Time-Structured Merge Tree)</div>
+      <div class="flow-row">
+        <div class="flow-box source"><strong>Write</strong><small>new reading</small></div>
+        <div class="arrow">→</div>
+        <div class="flow-box warm"><strong>WAL</strong><small>durability</small></div>
+        <div class="arrow">→</div>
+        <div class="flow-box hot"><strong>Cache</strong><small>in-memory blocks</small></div>
+        <div class="arrow">→</div>
+        <div class="flow-box cold"><strong>TSM Files</strong><small>compressed blocks</small></div>
+      </div>
+      <div class="legend">
+        <div class="legend-item"><div class="legend-dot" style="background: #f87171;"></div>Hot (recent)</div>
+        <div class="legend-item"><div class="legend-dot" style="background: #fb923c;"></div>Warm (cache)</div>
+        <div class="legend-item"><div class="legend-dot" style="background: #4dabf7;"></div>Cold (disk)</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- SLIDE 6: STORAGE TYPE 2 - COLUMNAR -->
+  <div class="slide" data-slide="6">
+    <div class="slide-num">06 / 16</div>
+    <h1 class="slide-title">Storage Type #2: Columnar / Analytical Store</h1>
+    <p class="slide-subtitle">The aggregation champion. <span class="keyword">ClickHouse · Apache Druid · BigQuery · Snowflake · DuckDB · Redshift</span></p>
+    <div class="grid grid-2">
+      <div>
+        <h3>How It's Built</h3>
+        <p>Data stored column-by-column within each sort-key partition. All timestamps in one vector, all values in another, all sensor IDs in another. Columns compressed independently (LZ4, ZSTD, delta, dictionary). Sparse primary index on the sort key enables block-skipping.</p>
+        <h3 style="margin-top: 20px;">Strengths</h3>
+        <ul class="compact">
+          <li><span class="keyword">Aggregation queries</span> (AVG, MIN, MAX, GROUP BY) are 10-100x faster than row stores</li>
+          <li>Excellent compression on sorted, repetitive data (energy meters love this)</li>
+          <li>Scales to petabytes</li>
+          <li>Vectorized query execution — one CPU instruction processes thousands of values</li>
+        </ul>
+      </div>
+      <div>
+        <h3>Weaknesses</h3>
+        <ul class="compact">
+          <li>Single-row reads are slow (must reconstruct from columns)</li>
+          <li>Writes are expensive — often batched or merged in background</li>
+          <li>Updates/deletes are awkward (append + merge instead of in-place)</li>
+          <li>Real-time freshness lags the write path by minutes</li>
+        </ul>
+        <h3 style="margin-top: 20px;">Best Use Cases</h3>
+        <div class="use-case-grid">
+          <div class="use-case">
+            <div class="use-case-title">Historical analysis</div>
+            <div class="use-case-body">Monthly/yearly rollups across the whole building</div>
+          </div>
+          <div class="use-case">
+            <div class="use-case-title">Energy reporting</div>
+            <div class="use-case-body">Multi-year consumption breakdowns by zone</div>
+          </div>
+          <div class="use-case">
+            <div class="use-case-title">ML feature pipelines</div>
+            <div class="use-case-body">Bulk extracts for model training</div>
+          </div>
+          <div class="use-case">
+            <div class="use-case-title">Cross-building compare</div>
+            <div class="use-case-body">Portfolio analytics across many sites</div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="diagram" style="margin-top: 18px;">
+      <div style="font-size: 13px; color: #8aa0bf; margin-bottom: 16px; text-align: center;">INTERNAL LAYOUT — MergeTree (columnar with sort key)</div>
+      <div style="display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px;">
+        <div style="text-align: center;">
+          <div style="font-size: 11px; color: #8aa0bf; margin-bottom: 6px;">PARTITION: 2026-06</div>
+          <div style="background: #1a2540; border: 1px solid #4dabf7; padding: 8px; border-radius: 4px; font-size: 11px;">ts: 8B × N</div>
+          <div style="background: #1a2540; border: 1px solid #4dabf7; padding: 8px; border-radius: 4px; margin-top: 4px; font-size: 11px;">sensor_id: 4B × N</div>
+          <div style="background: #1a2540; border: 1px solid #4dabf7; padding: 8px; border-radius: 4px; margin-top: 4px; font-size: 11px;">value: 4B × N</div>
+          <div style="background: #1a2540; border: 1px solid #4dabf7; padding: 8px; border-radius: 4px; margin-top: 4px; font-size: 11px;">zone: dict</div>
+        </div>
+        <div style="text-align: center;">
+          <div style="font-size: 11px; color: #8aa0bf; margin-bottom: 6px;">BLOCK 1 (sorted)</div>
+          <div style="background: rgba(77, 171, 247, 0.1); padding: 14px; border-radius: 4px; font-family: monospace; font-size: 11px;">ts₁ ts₂ ts₃<br>1.1 1.2 1.3</div>
+        </div>
+        <div style="text-align: center;">
+          <div style="font-size: 11px; color: #8aa0bf; margin-bottom: 6px;">BLOCK 2 (sorted)</div>
+          <div style="background: rgba(77, 171, 247, 0.1); padding: 14px; border-radius: 4px; font-family: monospace; font-size: 11px;">ts₄ ts₅ ts₆<br>1.4 1.5 1.6</div>
+        </div>
+        <div style="text-align: center;">
+          <div style="font-size: 11px; color: #8aa0bf; margin-bottom: 6px;">BLOCK 3 (sorted)</div>
+          <div style="background: rgba(77, 171, 247, 0.1); padding: 14px; border-radius: 4px; font-family: monospace; font-size: 11px;">ts₇ ts₈ ts₉<br>1.7 1.8 1.9</div>
+        </div>
+        <div style="text-align: center;">
+          <div style="font-size: 11px; color: #8aa0bf; margin-bottom: 6px;">→</div>
+          <div style="background: rgba(168, 85, 247, 0.1); border: 1px solid #c084fc; padding: 14px; border-radius: 4px; font-size: 11px;">Index skip:<br>ts₅ &lt; ts_query<br>skip block 3</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- SLIDE 7: STORAGE TYPE 3 - HIERARCHICAL / GRAPH -->
+  <div class="slide" data-slide="7">
+    <div class="slide-num">07 / 16</div>
+    <h1 class="slide-title">Storage Type #3: Hierarchical / Graph Store</h1>
+    <p class="slide-subtitle">The spatial index — building → floor → room → sensor. <span class="keyword">Neo4j · Memgraph · Amazon Neptune · PostgreSQL with ltree</span></p>
+    <div class="grid grid-2">
+      <div>
+        <h3>How It's Built</h3>
+        <p>Nodes represent physical entities (Building, Floor, Room, Equipment, Sensor). Edges represent containment relationships (room contains sensors, floor contains rooms). Property graph model. Indexes on labels and key properties.</p>
+        <h3 style="margin-top: 20px;">Strengths</h3>
+        <ul class="compact">
+          <li>Traverse zone hierarchies in <span class="keyword">milliseconds</span>, regardless of size</li>
+          <li>Natural fit for BIM/IFC models (already a tree)</li>
+          <li>"All sensors on floor 3 with high CO2" is one query, not a join nightmare</li>
+          <li>Recursive queries (descendants, ancestors) are first-class</li>
+        </ul>
+      </div>
+      <div>
+        <h3>Weaknesses</h3>
+        <ul class="compact">
+          <li>Poor for time-series data — no native time window support</li>
+          <li>High write overhead for ingest-heavy workloads</li>
+          <li>Query language (Cypher) is a separate skill from SQL</li>
+          <li>Operational tooling less mature than RDBMS</li>
+        </ul>
+        <h3 style="margin-top: 20px;">Best Use Cases</h3>
+        <div class="use-case-grid">
+          <div class="use-case">
+            <div class="use-case-title">Spatial queries</div>
+            <div class="use-case-body">"Sensors within 10m of this point"</div>
+          </div>
+          <div class="use-case">
+            <div class="use-case-title">Zone hierarchy</div>
+            <div class="use-case-body">"All sensors in zone and sub-zones"</div>
+          </div>
+          <div class="use-case">
+            <div class="use-case-title">Impact analysis</div>
+            <div class="use-case-body">"If this equipment fails, which zones are affected?"</div>
+          </div>
+          <div class="use-case">
+            <div class="use-case-title">Twin graph traversal</div>
+            <div class="use-case-body">Following relationships between BIM elements</div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="diagram" style="margin-top: 18px;">
+      <div style="font-size: 13px; color: #8aa0bf; margin-bottom: 16px; text-align: center;">SAMPLE HIERARCHY (one building)</div>
+      <div style="display: flex; flex-direction: column; align-items: center; gap: 8px;">
+        <div class="flow-box" style="background: rgba(168, 85, 247, 0.15); border-color: #c084fc; min-width: 200px;"><strong>Building: Office Tower</strong><small>1 entity</small></div>
+        <div class="arrow-down">↙ &nbsp; ↘</div>
+        <div style="display: flex; gap: 40px;">
+          <div class="flow-box" style="border-color: #4dabf7;"><strong>Floor 1</strong><small>14 rooms</small></div>
+          <div class="flow-box" style="border-color: #4dabf7;"><strong>Floor 2</strong><small>14 rooms</small></div>
+        </div>
+        <div class="arrow-down">↙ &nbsp; ↘ &nbsp; ↙ &nbsp; ↘</div>
+        <div style="display: flex; gap: 12px; flex-wrap: wrap; justify-content: center;">
+          <div class="flow-box" style="border-color: #22d3ee; min-width: 100px; padding: 8px 12px;"><strong>Room 101</strong><small>5 sensors</small></div>
+          <div class="flow-box" style="border-color: #22d3ee; min-width: 100px; padding: 8px 12px;"><strong>Room 102</strong><small>5 sensors</small></div>
+          <div class="flow-box" style="border-color: #22d3ee; min-width: 100px; padding: 8px 12px;"><strong>Room 201</strong><small>5 sensors</small></div>
+          <div class="flow-box" style="border-color: #22d3ee; min-width: 100px; padding: 8px 12px;"><strong>Room 202</strong><small>5 sensors</small></div>
+        </div>
+        <div style="font-size: 11px; color: #6b7c95; margin-top: 8px;">Each room → 5 sensor entities with readings attached</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- SLIDE 8: STORAGE TYPE 4 - IN-MEMORY / RING -->
+  <div class="slide" data-slide="8">
+    <div class="slide-num">08 / 16</div>
+    <h1 class="slide-title">Storage Type #4: In-Memory Ring Buffer</h1>
+    <p class="slide-subtitle">The speed layer. Latest N readings, per sensor, in RAM. <span class="keyword">Redis · Memcached · Apache Ignite · Hazelcast · custom ring buffer</span></p>
+    <div class="grid grid-2">
+      <div>
+        <h3>How It's Built</h3>
+        <p>Fixed-size circular buffer per sensor. Writes overwrite oldest entry when full. Latest read is O(1). Windowed scan is O(N) but with predictable, sub-millisecond latency because everything is in RAM.</p>
+        <h3 style="margin-top: 20px;">Strengths</h3>
+        <ul class="compact">
+          <li><span class="keyword">Sub-millisecond</span> latency for real-time queries</li>
+          <li>Perfect for "what is this sensor reading right now?"</li>
+          <li>Zero disk I/O on the hot path</li>
+          <li>Predictable, bounded memory footprint</li>
+        </ul>
+      </div>
+      <div>
+        <h3>Weaknesses</h3>
+        <ul class="compact">
+          <li>Limited by RAM — can't keep years of data here</li>
+          <li>Volatile — needs persistence layer for restart</li>
+          <li>No aggregation across sensors without scanning each ring</li>
+          <li>Cost per GB is 10-100x higher than disk-based storage</li>
+        </ul>
+        <h3 style="margin-top: 20px;">Best Use Cases</h3>
+        <div class="use-case-grid">
+          <div class="use-case">
+            <div class="use-case-title">Live dashboards</div>
+            <div class="use-case-body">"Current temperature in 1,800 rooms"</div>
+          </div>
+          <div class="use-case">
+            <div class="use-case-title">Real-time alerts</div>
+            <div class="use-case-body">Threshold breaches checked against last value</div>
+          </div>
+          <div class="use-case">
+            <div class="use-case-title">Streaming windows</div>
+            <div class="use-case-body">Last 5 minutes of vibration for FFT analysis</div>
+          </div>
+          <div class="use-case">
+            <div class="use-case-title">Edge buffer</div>
+            <div class="use-case-body">Hold readings during network outage</div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="diagram" style="margin-top: 18px;">
+      <div style="font-size: 13px; color: #8aa0bf; margin-bottom: 16px; text-align: center;">RING BUFFER PER SENSOR (size = 240 readings = 4 hours at 1/min)</div>
+      <div style="display: flex; flex-direction: column; gap: 6px; align-items: center;">
+        <div style="display: flex; gap: 4px; flex-wrap: wrap; justify-content: center; max-width: 700px;">
+          <div class="viz-bar hot" style="width: 18px; height: 60px;"></div>
+          <div class="viz-bar hot" style="width: 18px; height: 65px;"></div>
+          <div class="viz-bar hot" style="width: 18px; height: 58px;"></div>
+          <div class="viz-bar hot" style="width: 18px; height: 62px;"></div>
+          <div class="viz-bar hot" style="width: 18px; height: 68px;"></div>
+          <div class="viz-bar" style="width: 18px; height: 70px;"></div>
+          <div class="viz-bar" style="width: 18px; height: 72px;"></div>
+          <div class="viz-bar" style="width: 18px; height: 75px;"></div>
+          <div class="viz-bar" style="width: 18px; height: 78px;"></div>
+          <div class="viz-bar" style="width: 18px; height: 80px;"></div>
+          <div class="viz-bar" style="width: 18px; height: 82px;"></div>
+          <div class="viz-bar" style="width: 18px; height: 85px;"></div>
+          <div class="viz-bar" style="width: 18px; height: 88px;"></div>
+          <div class="viz-bar" style="width: 18px; height: 90px;"></div>
+          <div class="viz-bar" style="width: 18px; height: 85px;"></div>
+          <div class="viz-bar" style="width: 18px; height: 82px;"></div>
+          <div class="viz-bar" style="width: 18px; height: 80px;"></div>
+          <div class="viz-bar" style="width: 18px; height: 78px;"></div>
+          <div class="viz-bar" style="width: 18px; height: 75px;"></div>
+          <div class="viz-bar" style="width: 18px; height: 72px;"></div>
+          <div class="viz-bar" style="width: 18px; height: 70px;"></div>
+          <div class="viz-bar" style="width: 18px; height: 68px;"></div>
+        </div>
+        <div style="display: flex; gap: 30px; font-size: 11px; color: #8aa0bf; margin-top: 12px;">
+          <span>← oldest (about to be overwritten)</span>
+          <span style="color: #f87171; font-weight: 700;">head →</span>
+          <span>latest reading</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- SLIDE 9: STORAGE TYPE 5 - DATA LAKE -->
+  <div class="slide" data-slide="9">
+    <div class="slide-num">09 / 16</div>
+    <h1 class="slide-title">Storage Type #5: Data Lake / Object Store</h1>
+    <p class="slide-subtitle">The cold archive. Everything that's too old, too big, or too rare to keep hot. <span class="keyword">S3 + Parquet · GCS · Azure Data Lake · Apache Iceberg · Delta Lake</span></p>
+    <div class="grid grid-2">
+      <div>
+        <h3>How It's Built</h3>
+        <p>Sensor readings batched into Parquet (or ORC) files, partitioned by date and sensor type. Files live in cheap object storage ($0.004-$0.02/GB-month). Query engines (Athena, BigQuery, DuckDB, Spark) read them on demand.</p>
+        <h3 style="margin-top: 20px;">Strengths</h3>
+        <ul class="compact">
+          <li><span class="keyword">Cheapest storage</span> available — pennies per GB-month</li>
+          <li>Infinite retention — pay only for what you store</li>
+          <li>Schema-on-read — handle drift gracefully</li>
+          <li>Native format for ML pipelines and notebooks</li>
+        </ul>
+      </div>
+      <div>
+        <h3>Weaknesses</h3>
+        <ul class="compact">
+          <li>Query latency is seconds-to-minutes, not milliseconds</li>
+          <li>No real-time — by definition batch-oriented</li>
+          <li>Small files are an anti-pattern (creates metadata chaos)</li>
+          <li>Schema governance requires extra tooling (Iceberg, Delta)</li>
+        </ul>
+        <h3 style="margin-top: 20px;">Best Use Cases</h3>
+        <div class="use-case-grid">
+          <div class="use-case">
+            <div class="use-case-title">Long-term archive</div>
+            <div class="use-case-body">Multi-year compliance retention</div>
+          </div>
+          <div class="use-case">
+            <div class="use-case-title">ML training data</div>
+            <div class="use-case-body">Bulk feature engineering, model training</div>
+          </div>
+          <div class="use-case">
+            <div class="use-case-title">Cold forensic queries</div>
+            <div class="use-case-body">"Show me everything from Q3 2024"</div>
+          </div>
+          <div class="use-case">
+            <div class="use-case-title">Cross-portfolio analytics</div>
+            <div class="use-case-body">Querying many buildings at once</div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="diagram" style="margin-top: 18px;">
+      <div style="font-size: 13px; color: #8aa0bf; margin-bottom: 16px; text-align: center;">PARTITIONED PARQUET LAYOUT (hive-style partitioning)</div>
+      <div style="font-family: 'SF Mono', Monaco, monospace; font-size: 13px; background: #0a1224; padding: 20px; border-radius: 8px; color: #b8c6db;">
+        <div style="color: #6b7c95;">s3://twin-lake/</div>
+        <div>&nbsp;&nbsp;sensor_type=<span style="color: #22d3ee;">temperature</span>/</div>
+        <div>&nbsp;&nbsp;&nbsp;&nbsp;year=<span style="color: #4ade80;">2026</span>/month=<span style="color: #4ade80;">06</span>/day=<span style="color: #4ade80;">27</span>/</div>
+        <div>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;data-<span style="color: #facc15;">0</span>.parquet &nbsp;&nbsp;<span style="color: #6b7c95;">128 MB, snappy</span></div>
+        <div>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;data-<span style="color: #facc15;">1</span>.parquet &nbsp;&nbsp;<span style="color: #6b7c95;">128 MB, snappy</span></div>
+        <div>&nbsp;&nbsp;sensor_type=<span style="color: #22d3ee;">vibration</span>/</div>
+        <div>&nbsp;&nbsp;&nbsp;&nbsp;year=<span style="color: #4ade80;">2026</span>/month=<span style="color: #4ade80;">06</span>/day=<span style="color: #4ade80;">27</span>/</div>
+        <div>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;data-<span style="color: #facc15;">0</span>.parquet &nbsp;&nbsp;<span style="color: #6b7c95;">2.1 GB, zstd</span></div>
+      </div>
+      <div style="font-size: 12px; color: #8aa0bf; margin-top: 12px; text-align: center;">Query: <span class="code-inline">SELECT avg(value) FROM twin WHERE sensor_type='temperature' AND date='2026-06-27'</span><br>Engine reads only relevant partitions — column-pruning + partition-pruning combine for massive speedups</div>
+    </div>
+  </div>
+
+  <!-- SLIDE 10: QUERY PATTERNS OVERVIEW -->
+  <div class="slide" data-slide="10">
+    <div class="slide-num">10 / 16</div>
+    <h1 class="slide-title">Query Patterns: The 5 Families</h1>
+    <p class="slide-subtitle">Every digital twin dashboard runs these. Each favors different storage.</p>
+    <div class="grid grid-3">
+      <div class="card">
+        <div class="card-icon">⚡</div>
+        <div class="card-title">Real-Time</div>
+        <div class="card-sub">"What's happening now?"</div>
+        <div class="card-body">Latest value for one sensor. Latest values for a zone. Sub-millisecond latency required. Favors ring buffers and time-series caches.</div>
+        <div style="margin-top: 8px;">
+          <span class="badge badge-green">Ring Buffer</span>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-icon">⏱️</div>
+        <div class="card-title">Time-Window Aggregation</div>
+        <div class="card-sub">"What happened recently?"</div>
+        <div class="card-body">AVG/MIN/MAX over last hour/day. Per-zone, per-type. The bread-and-butter dashboard query. Favors time-series with rollups.</div>
+        <div style="margin-top: 8px;">
+          <span class="badge badge-blue">Time-Series</span>
+          <span class="badge badge-purple">Columnar</span>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-icon">📅</div>
+        <div class="card-title">Historical / Long-Lookback</div>
+        <div class="card-sub">"What happened over months?"</div>
+        <div class="card-body">Hourly rollups over 30 days. Daily averages over a year. Multi-year compliance queries. Favors columnar or lake.</div>
+        <div style="margin-top: 8px;">
+          <span class="badge badge-purple">Columnar</span>
+          <span class="badge badge-red">Lake</span>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-icon">📍</div>
+        <div class="card-title">Spatial</div>
+        <div class="card-sub">"What's nearby / in this area?"</div>
+        <div class="card-body">Sensors within a radius. All sensors in a zone hierarchy. Spatial joins with BIM geometry. Favors graph/hierarchical stores.</div>
+        <div style="margin-top: 8px;">
+          <span class="badge badge-orange">Hierarchical</span>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-icon">🔍</div>
+        <div class="card-title">Anomaly Detection</div>
+        <div class="card-sub">"What's wrong?"</div>
+        <div class="card-body">Standard deviation from baseline. Sustained threshold breaches. Pattern matching. Mix of stream + scan + comparison.</div>
+        <div style="margin-top: 8px;">
+          <span class="badge badge-green">Ring</span>
+          <span class="badge badge-blue">TS</span>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-icon">🔗</div>
+        <div class="card-title">Cross-Domain Joins</div>
+        <div class="card-sub">"Combine sensor + metadata"</div>
+        <div class="card-body">Sensor readings joined with BIM metadata, asset hierarchies, work orders. The hardest query class. Needs serving layer + OLTP.</div>
+        <div style="margin-top: 8px;">
+          <span class="badge badge-yellow">OLTP + Serving</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- SLIDE 11: THE BIG MATRIX -->
+  <div class="slide" data-slide="11">
+    <div class="slide-num">11 / 16</div>
+    <h1 class="slide-title">The Storage × Query Matrix</h1>
+    <p class="slide-subtitle">Green = winner. Red = bad fit. This is the table your architecture decision comes from.</p>
+    <div class="table-wrap">
+      <table class="matrix">
+        <thead>
+          <tr>
+            <th class="row-label">Query Pattern ↓ &nbsp; / &nbsp; Storage →</th>
+            <th>Time-Series</th>
+            <th>Columnar</th>
+            <th>Hierarchical</th>
+            <th>Ring Buffer</th>
+            <th>Lake (Parquet)</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="label">Latest single value</td>
+            <td class="heat-good">Good</td>
+            <td class="heat-poor">Poor</td>
+            <td class="heat-ok">OK</td>
+            <td class="heat-best">Best</td>
+            <td class="heat-bad">Bad</td>
+          </tr>
+          <tr>
+            <td class="label">Latest by zone</td>
+            <td class="heat-good">Good</td>
+            <td class="heat-poor">Poor</td>
+            <td class="heat-best">Best</td>
+            <td class="heat-good">Good</td>
+            <td class="heat-bad">Bad</td>
+          </tr>
+          <tr>
+            <td class="label">Avg / Min / Max, last 24h</td>
+            <td class="heat-best">Best</td>
+            <td class="heat-best">Best</td>
+            <td class="heat-poor">Poor</td>
+            <td class="heat-good">Good</td>
+            <td class="heat-ok">OK</td>
+          </tr>
+          <tr>
+            <td class="label">Floor stats, 24h</td>
+            <td class="heat-good">Good</td>
+            <td class="heat-best">Best</td>
+            <td class="heat-ok">OK</td>
+            <td class="heat-ok">OK</td>
+            <td class="heat-poor">Poor</td>
+          </tr>
+          <tr>
+            <td class="label">Hourly rollup, 30 days</td>
+            <td class="heat-good">Good</td>
+            <td class="heat-best">Best</td>
+            <td class="heat-poor">Poor</td>
+            <td class="heat-bad">Bad</td>
+            <td class="heat-good">Good</td>
+          </tr>
+          <tr>
+            <td class="label">Daily avg, 1 year</td>
+            <td class="heat-ok">OK</td>
+            <td class="heat-best">Best</td>
+            <td class="heat-poor">Poor</td>
+            <td class="heat-bad">Bad</td>
+            <td class="heat-best">Best</td>
+          </tr>
+          <tr>
+            <td class="label">Spatial radius search</td>
+            <td class="heat-bad">Bad</td>
+            <td class="heat-poor">Poor</td>
+            <td class="heat-best">Best</td>
+            <td class="heat-bad">Bad</td>
+            <td class="heat-poor">Poor</td>
+          </tr>
+          <tr>
+            <td class="label">Zone hierarchy traversal</td>
+            <td class="heat-poor">Poor</td>
+            <td class="heat-poor">Poor</td>
+            <td class="heat-best">Best</td>
+            <td class="heat-bad">Bad</td>
+            <td class="heat-poor">Poor</td>
+          </tr>
+          <tr>
+            <td class="label">Anomaly detection</td>
+            <td class="heat-best">Best</td>
+            <td class="heat-good">Good</td>
+            <td class="heat-poor">Poor</td>
+            <td class="heat-best">Best</td>
+            <td class="heat-bad">Bad</td>
+          </tr>
+          <tr>
+            <td class="label">Sustained threshold breach</td>
+            <td class="heat-good">Good</td>
+            <td class="heat-ok">OK</td>
+            <td class="heat-poor">Poor</td>
+            <td class="heat-best">Best</td>
+            <td class="heat-bad">Bad</td>
+          </tr>
+          <tr>
+            <td class="label">Join with BIM metadata</td>
+            <td class="heat-poor">Poor</td>
+            <td class="heat-ok">OK</td>
+            <td class="heat-good">Good</td>
+            <td class="heat-bad">Bad</td>
+            <td class="heat-good">Good</td>
+          </tr>
+          <tr>
+            <td class="label">Year-long compliance scan</td>
+            <td class="heat-ok">OK</td>
+            <td class="heat-best">Best</td>
+            <td class="heat-poor">Poor</td>
+            <td class="heat-bad">Bad</td>
+            <td class="heat-best">Best</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="callout" style="margin-top: 14px;">
+      <div class="callout-title">No Single Winner</div>
+      <div class="callout-body">Look at any row — at most two backends are "Best." This is the architectural argument for hybrid storage. The question is not "which database" but "which tier handles which query."</div>
+    </div>
+  </div>
+
+  <!-- SLIDE 12: THE TIERED ARCHITECTURE -->
+  <div class="slide" data-slide="12">
+    <div class="slide-num">12 / 16</div>
+    <h1 class="slide-title">The Tiered Architecture (How It's Actually Built)</h1>
+    <p class="slide-subtitle">Hot → Warm → Cold. Three tiers, five storage types, one unified query interface.</p>
+    <div class="diagram" style="background: linear-gradient(180deg, #131c30 0%, #0a1224 100%);">
+      <div style="display: flex; flex-direction: column; gap: 14px;">
+        <div class="flow-row">
+          <div class="flow-box source"><strong>🏭 Sensors / PLCs</strong><small>MQTT, OPC-UA, Modbus</small></div>
+          <div class="arrow">→</div>
+          <div class="flow-box source"><strong>📥 Ingest Layer</strong><small>Kafka / Pub/Sub / Kinesis</small></div>
+          <div class="arrow">→</div>
+          <div class="flow-box hot"><strong>🔥 HOT TIER</strong><small>Ring Buffer · Time-Series (recent)</small></div>
+        </div>
+        <div style="text-align: center; font-size: 12px; color: #6b7c95;">↓ &nbsp; continuous rollup jobs (every 5-15 min) &nbsp; ↓</div>
+        <div class="flow-row">
+          <div class="flow-box warm"><strong>🌡️ WARM TIER</strong><small>Time-Series · Columnar (days-weeks)</small></div>
+          <div class="arrow">→</div>
+          <div class="flow-box analyze"><strong>📊 Serving Layer</strong><small>Materialized views, rollups, OLTP</small></div>
+          <div class="arrow">→</div>
+          <div class="flow-box warm"><strong>🌳 Hierarchy</strong><small>Neo4j / graph store (zone tree)</small></div>
+        </div>
+        <div style="text-align: center; font-size: 12px; color: #6b7c95;">↓ &nbsp; compaction / tiering (hourly-daily) &nbsp; ↓</div>
+        <div class="flow-row">
+          <div class="flow-box cold"><strong>❄️ COLD TIER</strong><small>Parquet lake · Object storage</small></div>
+          <div class="arrow">→</div>
+          <div class="flow-box analyze"><strong>🤖 ML Pipelines</strong><small>Training data, batch inference</small></div>
+          <div class="arrow">→</div>
+          <div class="flow-box analyze"><strong>🖥️ Dashboards</strong><small>Real-time, historical, alerts</small></div>
+        </div>
+      </div>
+    </div>
+    <div class="grid grid-3" style="margin-top: 16px;">
+      <div class="callout">
+        <div class="callout-title">🔥 Hot Tier</div>
+        <div class="callout-body">Last 1-24 hours. Sub-100ms queries. Lives in RAM + fast NVMe. Cost per GB-month: high ($0.10-$1.00).</div>
+      </div>
+      <div class="callout callout-warn">
+        <div class="callout-title">🌡️ Warm Tier</div>
+        <div class="callout-body">Last 7-90 days. 100ms-2s queries. Columnar or compressed time-series. Cost per GB-month: medium ($0.02-$0.10).</div>
+      </div>
+      <div class="callout callout-success">
+        <div class="callout-title">❄️ Cold Tier</div>
+        <div class="callout-body">Months to years. Seconds-to-minutes query latency. Parquet on object storage. Cost per GB-month: low ($0.004-$0.02).</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- SLIDE 13: HOT ZONES -->
+  <div class="slide" data-slide="13">
+    <div class="slide-num">13 / 16</div>
+    <h1 class="slide-title">Hot Zones vs Cold Zones</h1>
+    <p class="slide-subtitle">Not all sensors are queried equally. The 80/20 rule applies hard here.</p>
+    <div class="grid grid-2">
+      <div>
+        <h3>What Is a Hot Zone?</h3>
+        <p>A subset of sensors, time windows, or zones that receive a disproportionate share of query traffic. Examples:</p>
+        <ul class="compact" style="margin-top: 8px;">
+          <li>Sensors on the equipment currently being maintained</li>
+          <li>Recent data (last 1 hour) — almost always queried</li>
+          <li>Executive floor / high-profile zones — viewed constantly</li>
+          <li>Alert-triggered sensors — under sustained query load until resolved</li>
+          <li>Sensors associated with active simulations</li>
+        </ul>
+      </div>
+      <div>
+        <h3>The Typical Distribution</h3>
+        <div class="viz-row">
+          <div class="viz-bar hot" style="height: 100%;"></div>
+          <div class="viz-bar hot" style="height: 95%;"></div>
+          <div class="viz-bar hot" style="height: 88%;"></div>
+          <div class="viz-bar hot" style="height: 75%;"></div>
+          <div class="viz-bar warm" style="height: 60%;"></div>
+          <div class="viz-bar warm" style="height: 45%;"></div>
+          <div class="viz-bar warm" style="height: 35%;"></div>
+          <div class="viz-bar warm" style="height: 28%;"></div>
+          <div class="viz-bar warm" style="height: 22%;"></div>
+          <div class="viz-bar warm" style="height: 18%;"></div>
+          <div class="viz-bar cold" style="height: 14%;"></div>
+          <div class="viz-bar cold" style="height: 12%;"></div>
+          <div class="viz-bar cold" style="height: 10%;"></div>
+          <div class="viz-bar cold" style="height: 8%;"></div>
+          <div class="viz-bar cold" style="height: 6%;"></div>
+          <div class="viz-bar cold" style="height: 5%;"></div>
+          <div class="viz-bar cold" style="height: 4%;"></div>
+          <div class="viz-bar cold" style="height: 3%;"></div>
+          <div class="viz-bar cold" style="height: 3%;"></div>
+          <div class="viz-bar cold" style="height: 2%;"></div>
+        </div>
+        <p style="text-align: center; font-size: 11px; color: #8aa0bf;">Per-sensor query volume, log scale. Top 5% get 80% of queries.</p>
+        <div class="callout" style="margin-top: 14px;">
+          <div class="callout-title">How to Handle It</div>
+          <div class="callout-body">Pin hot sensors to RAM-backed ring buffers or pre-warmed time-series shards. Move cold sensors to cheaper tier. Auto-detect via query log analysis; demote sensors that haven't been queried in 7 days.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- SLIDE 14: SCHEMA EVOLUTION -->
+  <div class="slide" data-slide="14">
+    <div class="slide-num">14 / 16</div>
+    <h1 class="slide-title">Schema Evolution: The Operational Headache</h1>
+    <p class="slide-subtitle">Buildings change. New sensors get added. Hardware gets replaced. Your schema has to absorb it.</p>
+    <div class="grid grid-2">
+      <div>
+        <h3>Common Schema Changes</h3>
+        <ul class="compact">
+          <li><span class="keyword">New sensor type</span> — air quality sensor installed mid-project</li>
+          <li><span class="keyword">New metadata field</span> — calibration date added to all sensors</li>
+          <li><span class="keyword">Unit change</span> — sensor recalibrated from degC to a different scale</li>
+          <li><span class="keyword">Sensor moved</span> — physically relocated, zone_id changes</li>
+          <li><span class="keyword">Sensor retired</span> — readings stop but history must remain queryable</li>
+          <li><span class="keyword">Vendor upgrade</span> — firmware ships new payload format</li>
+        </ul>
+      </div>
+      <div>
+        <h3>How Teams Handle It</h3>
+        <div class="scenario">
+          <div class="scenario-head">
+            <div class="scenario-num">1</div>
+            <div class="scenario-title">Wide-Table / Sparse Columns</div>
+          </div>
+          <div class="scenario-body">One column per possible sensor attribute. Most rows have null in most columns. Simple, but wasteful and index-bloated at scale.</div>
+        </div>
+        <div class="scenario">
+          <div class="scenario-head">
+            <div class="scenario-num">2</div>
+            <div class="scenario-title">JSON / Document Payloads</div>
+          </div>
+          <div class="scenario-body">Free-form metadata blob. Schema-on-read. Works well in Postgres (JSONB), MongoDB, or Parquet variant columns.</div>
+        </div>
+        <div class="scenario">
+          <div class="scenario-head">
+            <div class="scenario-num">3</div>
+            <div class="scenario-title">Schema Versioning + Registry</div>
+          </div>
+          <div class="scenario-body">Each reading tagged with schema version. Reader picks parser based on version. Used by Kafka + Avro/Protobuf setups.</div>
+        </div>
+        <div class="scenario">
+          <div class="scenario-head">
+            <div class="scenario-num">4</div>
+            <div class="scenario-title">Time-Indexed Schema History</div>
+          </div>
+          <div class="scenario-body">Store schema snapshots as time-series themselves. Old readings still resolvable against their original schema. Most rigorous approach.</div>
+        </div>
+      </div>
+    </div>
+    <div class="callout callout-warn" style="margin-top: 16px;">
+      <div class="callout-title">The Failure Mode</div>
+      <div class="callout-body">Tight schemas with ALTER TABLE on every change = outages. Wide tables with hundreds of null columns = query planner gives up. Document blobs with no version tracking = "what did this field mean six months ago?" Schema evolution is an architectural choice, not a database feature.</div>
+    </div>
+  </div>
+
+  <!-- SLIDE 15: REAL SCENARIOS -->
+  <div class="slide" data-slide="15">
+    <div class="slide-num">15 / 16</div>
+    <h1 class="slide-title">Putting It Together: 3 Real Scenarios</h1>
+    <p class="slide-subtitle">Same sensor types, different buildings, different architecture.</p>
+    <div class="scrollable">
+      <div class="scenario">
+        <div class="scenario-head">
+          <div class="scenario-num">A</div>
+          <div class="scenario-title">Office Tower — 24 floors, 1,847 sensors</div>
+        </div>
+        <div class="scenario-body">Mostly temperature, occupancy, CO2, lighting energy. Hourly/daily patterns dominate. Low-frequency queries, dashboards refreshed every 30 seconds.</div>
+        <div class="scenario-stack">
+          <span class="sensor-pill" style="background: rgba(77, 171, 247, 0.15); color: #4dabf7;">Time-Series (primary)</span>
+          <span class="sensor-pill" style="background: rgba(168, 85, 247, 0.15); color: #c084fc;">Columnar (monthly reports)</span>
+          <span class="sensor-pill" style="background: rgba(168, 85, 247, 0.15); color: #c084fc;">Hierarchical (zone nav)</span>
+          <span class="sensor-pill" style="background: rgba(239, 68, 68, 0.15); color: #f87171;">Lake (yearly archive)</span>
+        </div>
+        <p style="margin-top: 12px;"><span class="keyword">Cost:</span> $1,100/mo optimized vs $4,800/mo naive → <span class="keyword">$44k/year saved</span></p>
+      </div>
+
+      <div class="scenario">
+        <div class="scenario-head">
+          <div class="scenario-num">B</div>
+          <div class="scenario-title">Hospital — critical infrastructure, 12k sensors</div>
+        </div>
+        <div class="scenario-body">Mixed criticality: HVAC + medical refrigeration + occupancy + air quality. Real-time alerting is life-safety. Anomaly detection on temperature excursions (medication spoilage).</div>
+        <div class="scenario-stack">
+          <span class="sensor-pill" style="background: rgba(34, 197, 94, 0.15); color: #4ade80;">Ring Buffer (alerts)</span>
+          <span class="sensor-pill" style="background: rgba(77, 171, 247, 0.15); color: #4dabf7;">Time-Series (operational)</span>
+          <span class="sensor-pill" style="background: rgba(168, 85, 247, 0.15); color: #c084fc;">Columnar (compliance reports)</span>
+          <span class="sensor-pill" style="background: rgba(239, 68, 68, 0.15); color: #f87171;">Lake (7-year retention)</span>
+        </div>
+        <p style="margin-top: 12px;"><span class="keyword">Critical pattern:</span> Dual-write to ring + time-series for every reading. Ring serves sub-10ms alerts; time-series serves 30-day forensics.</p>
+      </div>
+
+      <div class="scenario">
+        <div class="scenario-head">
+          <div class="scenario-num">C</div>
+          <div class="scenario-title">Factory — 120 vibration sensors at 100 Hz</div>
+        </div>
+        <div class="scenario-body">Predictive maintenance. Vibration is everything — but storing 100 Hz raw indefinitely is prohibitively expensive. Need edge feature extraction + tiered retention.</div>
+        <div class="scenario-stack">
+          <span class="sensor-pill" style="background: rgba(34, 197, 94, 0.15); color: #4ade80;">Ring Buffer (raw, 24h)</span>
+          <span class="sensor-pill" style="background: rgba(77, 171, 247, 0.15); color: #4dabf7;">Time-Series (features, 30d)</span>
+          <span class="sensor-pill" style="background: rgba(168, 85, 247, 0.15); color: #c084fc;">Columnar (trends, 1yr)</span>
+          <span class="sensor-pill" style="background: rgba(249, 115, 22, 0.15); color: #fb923c;">Edge preprocessing</span>
+          <span class="sensor-pill" style="background: rgba(239, 68, 68, 0.15); color: #f87171;">Lake (rare events, forever)</span>
+        </div>
+        <p style="margin-top: 12px;"><span class="keyword">Key insight:</span> 100 Hz × 120 sensors = 12,000 readings/sec. Storing all raw = 4 TB/month. Edge-extracted features (RMS, peak freq, kurtosis) = 4 GB/month. 1000x reduction.</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- SLIDE 16: DECISION RULES / SUMMARY -->
+  <div class="slide" data-slide="16">
+    <div class="slide-num">16 / 16</div>
+    <h1 class="slide-title">Decision Rules for the Architect</h1>
+    <p class="slide-subtitle">If you remember nothing else, remember these.</p>
+    <div class="grid grid-2">
+      <div class="callout">
+        <div class="callout-title">Rule 1: Match Storage to Query</div>
+        <div class="callout-body">Don't pick storage first. Enumerate every dashboard query pattern. Map each to a backend. The matrix tells you the answer.</div>
+      </div>
+      <div class="callout">
+        <div class="callout-title">Rule 2: Per-Sensor-Type Tiering</div>
+        <div class="callout-body">Vibration wants different storage than temperature. Build per-sensor-type data flows. One universal policy wastes money.</div>
+      </div>
+      <div class="callout">
+        <div class="callout-title">Rule 3: Hot / Cold Separation</div>
+        <div class="callout-body">Last 24h on fast storage. Days-weeks on columnar. Months-years on lake. Continuous tiering jobs move data automatically.</div>
+      </div>
+      <div class="callout">
+        <div class="callout-title">Rule 4: Pre-Aggregate Aggressively</div>
+        <div class="callout-body">Hourly rollups, daily rollups, per-zone. Dashboards query rollups, not raw. Raw only for forensic dives.</div>
+      </div>
+      <div class="callout">
+        <div class="callout-title">Rule 5: Schema-on-Read for Metadata</div>
+        <div class="callout-body">Critical dimensions are typed. Everything else is JSON/Parquet variant. Versioning the schema is non-optional.</div>
+      </div>
+      <div class="callout">
+        <div class="callout-title">Rule 6: Measure, Don't Guess</div>
+        <div class="callout-body">The storage decision is project-specific. Run real benchmarks on synthetic data shaped like your sensors. The cost difference between naive and optimized is often 3-10x.</div>
+      </div>
+    </div>
+    <div style="margin-top: 24px; text-align: center;">
+      <p style="font-size: 15px; color: #8aa0bf;">The platform built on this spec exists to replace these heuristics with measured numbers.</p>
+    </div>
+  </div>
+
+  <!-- SLIDE 17: END -->
+  <div class="slide end-cover" data-slide="17">
+    <div style="font-size: 14px; color: #4dabf7; letter-spacing: 3px; margin-bottom: 24px;">END OF DECK</div>
+    <h1>Storage shapes the twin.</h1>
+    <p>The model is what you see. The storage is what makes it work — or breaks it at 2am when the cloud bill arrives.</p>
+    <div style="margin-top: 40px;">
+      <span class="badge badge-blue">Time-Series</span>
+      <span class="badge badge-purple">Columnar</span>
+      <span class="badge badge-orange">Hierarchical</span>
+      <span class="badge badge-green">In-Memory</span>
+      <span class="badge badge-red">Lake</span>
+    </div>
+    <p style="margin-top: 40px; font-size: 13px; color: #6b7c95;">Use ← → keys or buttons to navigate</p>
+  </div>
+
+</div>
+
+<div class="nav">
+  <button id="prevBtn" onclick="prevSlide()">← Previous</button>
+  <div class="counter" id="counter">1 / 17</div>
+  <button id="nextBtn" onclick="nextSlide()">Next →</button>
+</div>
+
+<script>
+  let current = 1;
+  const total = 17;
+
+  function show(n) {
+    if (n < 1 || n > total) return;
+    document.querySelectorAll('.slide').forEach(s => s.classList.remove('active'));
+    document.querySelector(`[data-slide="${n}"]`).classList.add('active');
+    current = n;
+    document.getElementById('counter').textContent = `${n} / ${total}`;
+    document.getElementById('progress').style.width = `${(n / total) * 100}%`;
+    document.getElementById('prevBtn').disabled = n === 1;
+    document.getElementById('nextBtn').disabled = n === total;
+  }
+
+  function nextSlide() { show(current + 1); }
+  function prevSlide() { show(current - 1); }
+
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'ArrowRight' || e.key === ' ' || e.key === 'PageDown') { e.preventDefault(); nextSlide(); }
+    if (e.key === 'ArrowLeft' || e.key === 'PageUp') { e.preventDefault(); prevSlide(); }
+    if (e.key === 'Home') { e.preventDefault(); show(1); }
+    if (e.key === 'End') { e.preventDefault(); show(total); }
+  });
+
+  show(1);
+</script>
+
+</body>
+</html>

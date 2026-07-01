@@ -22,6 +22,39 @@ pub const QueryFamily = enum {
     anomaly,
 };
 
+/// One value per query pattern this file implements — was previously
+/// mirrored in bim/profiles.zig (kept separate "so profiles.zig has no
+/// dependency on the benchmark layer"), back when query relevance was a
+/// building-profile concern. Now that relevance is a per-sensor-type fact
+/// (synthetic/generator.zig's SensorProfile.relevant_queries) rather than a
+/// building-type guess, there's no more reason for two copies of this
+/// enum to exist — this is the one.
+pub const QueryName = enum {
+    avg_window,
+    avg_zone_type,
+    floor_stats,
+    hourly_rollup,
+    daily_zone_rollup,
+    spatial_radius,
+    zone_hierarchy,
+    anomalies,
+    threshold_breach,
+    latest_single,
+    latest_zone,
+    latest_by_type,
+};
+
+/// How much a given query matters for whatever it's attached to (a sensor
+/// type's profile, or main.zig's derived building-level mix — see
+/// synthetic/generator.zig's SensorProfile.relevant_queries doc comment).
+/// `weight` is relative call frequency, not normalized to 1.0. `hot` marks
+/// queries that hit live/recent data vs. `cold` (historical/reporting).
+pub const QueryWeight = struct {
+    query: QueryName,
+    weight: f32,
+    hot: bool,
+};
+
 pub const QueryPattern = struct {
     name: []const u8,
     family: QueryFamily,
@@ -128,27 +161,46 @@ pub fn query_avg_window(world: anytype, sensor_id: u32, hours: u32) !f32 {
 
 // ---------------------------------------------------------------------------
 // Aggregation query family (Q5–Q6)
+//
+// Zone/floor membership comes from real registration data
+// (World.registerZone/registerFloor), never from sensor_id arithmetic
+// (CLAUDE.md §3.5: zone assignment is data the caller registered, not a
+// property derivable from the id). Both queries below fetch member sensor
+// IDs via world.sensorIdsByZone/sensorIdsByFloor, then pull each member's
+// own readings directly via world.readingsForSensor — an index lookup, not
+// a scan of every reading in the world checking membership one by one.
 // ---------------------------------------------------------------------------
 
 /// Q5: Average value for all sensors of a given `sensor_type` in a `zone_id`
 /// over the trailing `hours` window ending at the most recent reading's
 /// timestamp among those matching sensors.
 ///
-/// Zone mapping: zone_id = sensor_id / SENSORS_PER_ZONE.
+/// Zone membership comes from real registration (World.registerZone), not
+/// sensor_id arithmetic — see zoneMembership's doc comment.
 /// Returns 0.0 when no matching readings exist.
 ///
-/// Pure: calls only world.iterateAll — no backend-specific code, no branching
-/// on backend type.
+/// Pure: calls only world.iterateAll/sensorIdsByZone — no backend-specific
+/// code, no branching on backend type.
 pub fn query_avg_zone_type(world: anytype, zone_id: u32, sensor_type: sb.SensorType, hours: u32) !f32 {
-    const all = try world.iterateAll();
-    defer world.allocator.free(all);
+    const member_ids = try world.sensorIdsByZone(zone_id);
+    defer world.allocator.free(member_ids);
+
+    // Fetch each member's own readings once (world.readingsForSensor — an
+    // index lookup, not a full-dataset scan) and collect the type-matching
+    // ones while tracking the latest timestamp among them.
+    var matching: std.ArrayList(sb.SensorReading) = .empty;
+    defer matching.deinit(world.allocator);
 
     var latest_ts: ?i64 = null;
-    for (all) |r| {
-        if (r.sensor_id / SENSORS_PER_ZONE != zone_id) continue;
-        if (r.sensor_type != sensor_type) continue;
-        if (latest_ts == null or r.timestamp > latest_ts.?) {
-            latest_ts = r.timestamp;
+    for (member_ids) |sid| {
+        const readings = try world.readingsForSensor(sid);
+        defer world.allocator.free(readings);
+        for (readings) |r| {
+            if (r.sensor_type != sensor_type) continue;
+            try matching.append(world.allocator, r);
+            if (latest_ts == null or r.timestamp > latest_ts.?) {
+                latest_ts = r.timestamp;
+            }
         }
     }
 
@@ -160,9 +212,7 @@ pub fn query_avg_zone_type(world: anytype, zone_id: u32, sensor_type: sb.SensorT
 
     var sum: f64 = 0;
     var count: usize = 0;
-    for (all) |r| {
-        if (r.sensor_id / SENSORS_PER_ZONE != zone_id) continue;
-        if (r.sensor_type != sensor_type) continue;
+    for (matching.items) |r| {
         if (r.timestamp < start_time or r.timestamp > end_time) continue;
         sum += @as(f64, r.value);
         count += 1;
@@ -176,22 +226,32 @@ pub fn query_avg_zone_type(world: anytype, zone_id: u32, sensor_type: sb.SensorT
 /// `floor_id` over the trailing `hours` window ending at the most recent
 /// reading's timestamp among those matching sensors.
 ///
-/// Floor mapping: floor_id = sensor_id / SENSORS_PER_FLOOR where
-/// SENSORS_PER_FLOOR = SENSORS_PER_ZONE * ZONES_PER_FLOOR.
+/// Floor membership comes from real registration (World.registerFloor),
+/// not sensor_id arithmetic — see floorMembership's doc comment.
 /// Returns Stats{ 0, 0, 0 } when no matching readings exist.
 ///
-/// Pure: calls only world.iterateAll — no backend-specific code, no branching
-/// on backend type.
+/// Pure: calls only world.iterateAll/sensorIdsByFloor — no backend-specific
+/// code, no branching on backend type.
 pub fn query_floor_stats(world: anytype, floor_id: u32, sensor_type: sb.SensorType, hours: u32) !Stats {
-    const all = try world.iterateAll();
-    defer world.allocator.free(all);
+    const member_ids = try world.sensorIdsByFloor(floor_id);
+    defer world.allocator.free(member_ids);
+
+    // Fetch each member's own readings once (world.readingsForSensor — an
+    // index lookup, not a full-dataset scan) and collect the type-matching
+    // ones while tracking the latest timestamp among them.
+    var matching: std.ArrayList(sb.SensorReading) = .empty;
+    defer matching.deinit(world.allocator);
 
     var latest_ts: ?i64 = null;
-    for (all) |r| {
-        if (r.sensor_id / SENSORS_PER_FLOOR != floor_id) continue;
-        if (r.sensor_type != sensor_type) continue;
-        if (latest_ts == null or r.timestamp > latest_ts.?) {
-            latest_ts = r.timestamp;
+    for (member_ids) |sid| {
+        const readings = try world.readingsForSensor(sid);
+        defer world.allocator.free(readings);
+        for (readings) |r| {
+            if (r.sensor_type != sensor_type) continue;
+            try matching.append(world.allocator, r);
+            if (latest_ts == null or r.timestamp > latest_ts.?) {
+                latest_ts = r.timestamp;
+            }
         }
     }
 
@@ -205,9 +265,7 @@ pub fn query_floor_stats(world: anytype, floor_id: u32, sensor_type: sb.SensorTy
     var max_val: f32 = -std.math.floatMax(f32);
     var sum: f64 = 0;
     var count: usize = 0;
-    for (all) |r| {
-        if (r.sensor_id / SENSORS_PER_FLOOR != floor_id) continue;
-        if (r.sensor_type != sensor_type) continue;
+    for (matching.items) |r| {
         if (r.timestamp < start_time or r.timestamp > end_time) continue;
         if (r.value < min_val) min_val = r.value;
         if (r.value > max_val) max_val = r.value;
@@ -336,15 +394,25 @@ pub fn query_daily_zone_rollup(world: anytype, zone_id: u32, sensor_type: sb.Sen
     var result: std.ArrayList(DailyAggregate) = .empty;
     defer result.deinit(world.allocator);
 
-    const all = try world.iterateAll();
-    defer world.allocator.free(all);
+    const member_ids = try world.sensorIdsByZone(zone_id);
+    defer world.allocator.free(member_ids);
+
+    // Fetch each member's own readings once (world.readingsForSensor — an
+    // index lookup, not a full-dataset scan) and collect the type-matching
+    // ones while tracking the latest timestamp among them.
+    var matching: std.ArrayList(sb.SensorReading) = .empty;
+    defer matching.deinit(world.allocator);
 
     var latest_ts: ?i64 = null;
-    for (all) |r| {
-        if (r.sensor_id / SENSORS_PER_ZONE != zone_id) continue;
-        if (r.sensor_type != sensor_type) continue;
-        if (latest_ts == null or r.timestamp > latest_ts.?) {
-            latest_ts = r.timestamp;
+    for (member_ids) |sid| {
+        const readings = try world.readingsForSensor(sid);
+        defer world.allocator.free(readings);
+        for (readings) |r| {
+            if (r.sensor_type != sensor_type) continue;
+            try matching.append(world.allocator, r);
+            if (latest_ts == null or r.timestamp > latest_ts.?) {
+                latest_ts = r.timestamp;
+            }
         }
     }
 
@@ -356,9 +424,7 @@ pub fn query_daily_zone_rollup(world: anytype, zone_id: u32, sensor_type: sb.Sen
     var buckets = std.AutoHashMap(i64, BucketAcc).init(world.allocator);
     defer buckets.deinit();
 
-    for (all) |r| {
-        if (r.sensor_id / SENSORS_PER_ZONE != zone_id) continue;
-        if (r.sensor_type != sensor_type) continue;
+    for (matching.items) |r| {
         if (r.timestamp < start_time or r.timestamp > end_time) continue;
 
         const bucket = @divFloor(r.timestamp, ms_per_day) * ms_per_day;
@@ -408,15 +474,21 @@ pub fn query_daily_zone_rollup(world: anytype, zone_id: u32, sensor_type: sb.Sen
 //     x = @as(f32, sensor_id % 10) * 5.0          -- 0..45 m along X axis
 //     y = @as(f32, sensor_id / 10) * 3.0          -- floor height (3 m/floor)
 //     z = 0.0                                      -- single corridor
+//     (Q9 only — still a synthetic placeholder derived from sensor_id, not
+//     real placement position. Unlike zone/floor, this hasn't been wired
+//     to ZoneLocation.position yet; a real building's spatial queries
+//     would need that the same way Q10's zone/floor queries now need
+//     real registerZone/registerFloor data instead of arithmetic.)
 //
-//   zone hierarchy (matches SENSORS_PER_ZONE / SENSORS_PER_FLOOR constants):
-//     depth 0  = sensor leaf   (zone_id = sensor_id / SENSORS_PER_ZONE)
-//     depth 1  = floor         (zone_id = sensor_id / SENSORS_PER_FLOOR)
+//   zone hierarchy (Q10): real registered topology, not arithmetic —
+//     depth 0  = sensor leaf   (sensors registered to exactly zone_id)
+//     depth 1  = floor         (every zone sharing zone_id's registered floor)
 //     depth 2+ = building root (all sensors)
 //
-// No backend-specific code; queries call only world.iterateAll().
-// HierarchicalStorage wins these queries because its tree index lets it
-// collect subtree leaves without scanning the full dataset.
+// No backend-specific code; Q9 calls only world.iterateAll(), Q10 calls
+// world.sensorIdsByZone/sensorIdsByFloor/floorOfZone. HierarchicalStorage
+// wins Q10 because its tree index lets it collect subtree leaves without
+// scanning the full dataset.
 // ---------------------------------------------------------------------------
 
 /// Derive a deterministic 3-D position from a sensor_id.
@@ -449,88 +521,67 @@ fn vec3DistSq(a: Vec3, b: Vec3) f32 {
 ///
 /// Pure: calls only world.iterateAll() — no backend-specific code.
 pub fn query_spatial_radius(world: anytype, center: Vec3, radius_m: f32) ![]EntityId {
-    const all = try world.iterateAll();
-    defer world.allocator.free(all);
+    // world.allSensorIds() is cached/borrowed at the World level, already
+    // sorted ascending — do not free. Position is per-sensor, not
+    // per-reading, so this only computes each sensor's distance once,
+    // regardless of how many readings that sensor has (see allSensorIds's
+    // doc comment for why iterating readings here was wrong at real scale).
+    const sensor_ids = try world.allSensorIds();
 
     const radius_sq = radius_m * radius_m;
-
-    var seen = std.AutoHashMap(EntityId, void).init(world.allocator);
-    defer seen.deinit();
-
-    for (all) |r| {
-        if (seen.contains(r.sensor_id)) continue;
-        const pos = sensorPosition(r.sensor_id);
-        if (vec3DistSq(pos, center) <= radius_sq) {
-            try seen.put(r.sensor_id, {});
-        }
-    }
 
     var result: std.ArrayList(EntityId) = .empty;
     defer result.deinit(world.allocator);
 
-    var it = seen.keyIterator();
-    while (it.next()) |k| {
-        try result.append(world.allocator, k.*);
-    }
-
-    std.mem.sort(EntityId, result.items, {}, struct {
-        fn lt(_: void, lhs: EntityId, rhs: EntityId) bool {
-            return lhs < rhs;
+    for (sensor_ids) |sid| {
+        const pos = sensorPosition(sid);
+        if (vec3DistSq(pos, center) <= radius_sq) {
+            try result.append(world.allocator, sid);
         }
-    }.lt);
+    }
 
     return try result.toOwnedSlice(world.allocator);
 }
 
 /// Q10: Return all unique sensor IDs reachable from `zone_id` within `depth`
-/// levels of the zone hierarchy (BuildingElement.parent_id encoded as
-/// integer-division zone keys).
+/// levels of the zone hierarchy — real registered topology
+/// (World.registerZone/registerFloor), not sensor_id arithmetic.
 ///
 /// Hierarchy levels:
-///   depth 0  — sensors in exactly zone_id  (sensor_id / SENSORS_PER_ZONE == zone_id)
-///   depth 1  — sensors on the same floor   (sensor_id / SENSORS_PER_FLOOR == floor containing zone_id)
+///   depth 0  — sensors registered to exactly zone_id
+///   depth 1  — sensors on the same floor as zone_id (every zone that
+///              shares zone_id's registered floor)
 ///   depth >= 2 — all sensors in the building
 ///
 /// Only sensors that have at least one reading are returned.
 /// Results are sorted by sensor_id ascending.
 /// Caller owns the returned slice (free with world.allocator).
 ///
-/// depth 0/1 call world.sensorIdsByGroup(group_id, divisor) — the
-/// zone_id/floor_id IS the group key passed into the storage layer, so a
-/// backend that organises data by this exact grouping (e.g. a Floor/Zone
-/// tree) can answer by walking straight to the matching subtree instead
-/// of scanning every reading. Previously this called world.iterateAll()
-/// and filtered client-side for every depth, which meant zone_id never
-/// reached the backend at all — no backend, however it was organised
-/// internally, could do anything but a full scan. depth >= 2 ("all
-/// sensors") still calls iterateAll(): touching the entire dataset is
-/// inherent to that request, not something a subtree walk can shortcut.
+/// depth 0/1 call world.sensorIdsByZone/sensorIdsByFloor — a backend that
+/// organises data by this exact grouping (e.g. a Floor/Zone tree) can
+/// answer by walking straight to the matching subtree instead of scanning
+/// every reading. depth 1 needs the floor zone_id itself belongs to
+/// (world.floorOfZone) — if zone_id was never registered to a floor, there
+/// is nothing to walk and this returns empty, not an error. depth >= 2
+/// ("all sensors") still calls iterateAll(): touching the entire dataset
+/// is inherent to that request, not something a subtree walk can shortcut.
 pub fn query_zone_hierarchy(world: anytype, zone_id: u32, depth: u32) ![]EntityId {
     switch (depth) {
-        0 => return world.sensorIdsByGroup(zone_id, SENSORS_PER_ZONE),
+        0 => return world.sensorIdsByZone(zone_id),
         1 => {
-            const floor_id: u32 = zone_id / ZONES_PER_FLOOR;
-            return world.sensorIdsByGroup(floor_id, SENSORS_PER_FLOOR);
+            const floor_id = world.floorOfZone(zone_id) orelse return &.{};
+            return world.sensorIdsByFloor(floor_id);
         },
         else => {
-            const all = try world.iterateAll();
-            defer world.allocator.free(all);
-
-            var seen = std.AutoHashMap(EntityId, void).init(world.allocator);
-            defer seen.deinit();
-            for (all) |r| try seen.put(r.sensor_id, {});
-
-            var result: std.ArrayList(EntityId) = .empty;
-            defer result.deinit(world.allocator);
-            var it = seen.keyIterator();
-            while (it.next()) |k| try result.append(world.allocator, k.*);
-
-            std.mem.sort(EntityId, result.items, {}, struct {
-                fn lt(_: void, lhs: EntityId, rhs: EntityId) bool {
-                    return lhs < rhs;
-                }
-            }.lt);
-            return try result.toOwnedSlice(world.allocator);
+            // world.allSensorIds() is cached/borrowed at the World level,
+            // already deduped and sorted ascending (see its doc comment) —
+            // clone into an owned slice since this function's contract
+            // (unlike depth 0/1's own sensorIdsByZone/Floor calls) is that
+            // the caller frees the result unconditionally regardless of
+            // depth. Cloning a per-sensor list is far cheaper than the old
+            // iterateAll()+hashset+sort over every reading.
+            const sensor_ids = try world.allSensorIds();
+            return try world.allocator.dupe(EntityId, sensor_ids);
         },
     }
 }
@@ -556,45 +607,32 @@ pub fn query_zone_hierarchy(world: anytype, zone_id: u32, depth: u32) ![]EntityI
 /// is undefined for n<2). Results are sorted by (sensor_id asc, timestamp asc).
 /// Caller owns the slice (free with world.allocator).
 ///
-/// Pure: calls only world.iterateAll() — no backend-specific code.
+/// Pure: calls only world.statsForType/readingsForType — no backend-specific code.
 pub fn query_anomalies(world: anytype, sensor_type: sb.SensorType, std_dev_threshold: f32) ![]AnomalyResult {
-    const all = try world.iterateAll();
-    defer world.allocator.free(all);
+    // Mean/std-dev are cached at the World level (world.statsForType) — the
+    // data doesn't change within a benchmark run, so computing them is
+    // genuinely redundant work past the first call.
+    const stats = try world.statsForType(sensor_type);
+    if (stats.count < 2) return &.{};
 
-    var sum: f64 = 0;
-    var count: usize = 0;
-    for (all) |r| {
-        if (r.sensor_type != sensor_type) continue;
-        sum += @as(f64, r.value);
-        count += 1;
-    }
-
-    if (count < 2) return &.{};
-
-    const mean: f64 = sum / @as(f64, @floatFromInt(count));
-
-    var sq_sum: f64 = 0;
-    for (all) |r| {
-        if (r.sensor_type != sensor_type) continue;
-        const d = @as(f64, r.value) - mean;
-        sq_sum += d * d;
-    }
-    // Population std-dev (divide by N). Sample std-dev would also work; what
-    // matters is that every backend computes it the same way.
-    const variance: f64 = sq_sum / @as(f64, @floatFromInt(count));
-    const std_dev: f64 = @sqrt(variance);
+    // Only this type's own readings (world.readingsForType — an index
+    // lookup, not a scan of the whole dataset checking sensor_type per
+    // row). The selection pass below is NOT cached and still runs in full
+    // on every call — see statsForType's and readingsForType's doc
+    // comments for why that distinction matters.
+    const type_readings = try world.readingsForType(sensor_type);
+    defer world.allocator.free(type_readings);
 
     var result: std.ArrayList(AnomalyResult) = .empty;
     defer result.deinit(world.allocator);
 
-    if (std_dev == 0.0) {
+    if (stats.std_dev == 0.0) {
         // All values identical — no reading is anomalous at any threshold.
         return try result.toOwnedSlice(world.allocator);
     }
 
-    for (all) |r| {
-        if (r.sensor_type != sensor_type) continue;
-        const z: f64 = (@as(f64, r.value) - mean) / std_dev;
+    for (type_readings) |r| {
+        const z: f64 = (@as(f64, r.value) - stats.mean) / stats.std_dev;
         if (@abs(z) > @as(f64, std_dev_threshold)) {
             try result.append(world.allocator, .{
                 .reading = r,
@@ -623,18 +661,26 @@ pub fn query_anomalies(world: anytype, sensor_type: sb.SensorType, std_dev_thres
 /// is returned (earliest start_ts). Equal-timestamp readings break by value.
 ///
 /// Returns null when no qualifying run exists. Pure: calls only
-/// world.rangeByTime over the full time range, which every backend supports.
+/// world.readingsForSensor — an index lookup bounded by this one sensor's
+/// own reading count, not world.rangeByTime(minInt, maxInt), which used to
+/// degrade to a full-dataset scan (the (minInt, maxInt) bounds don't narrow
+/// anything, so every backend's binary search collapsed to "the whole
+/// array" and the sensor_id filter ran against every reading in the world).
 pub fn query_threshold_breach(world: anytype, sensor_id: u32, threshold: f32, min_duration_ms: i64) !?BreachEvent {
-    // Pull every reading for this sensor in chronological order. Bound the
-    // range to the full i64 window so we don't miss anything.
-    const readings = try world.rangeByTime(.{
-        .sensor_id = sensor_id,
-        .start_time = std.math.minInt(i64),
-        .end_time = std.math.maxInt(i64),
-    });
+    const readings = try world.readingsForSensor(sensor_id);
     defer world.allocator.free(readings);
 
     if (readings.len == 0) return null;
+
+    // readingsForSensor (unlike rangeByTime) makes no ordering guarantee —
+    // sort explicitly. Cheap: bounded by this sensor's own reading count,
+    // not the dataset.
+    const sorted: []sb.SensorReading = @constCast(readings);
+    std.mem.sort(sb.SensorReading, sorted, {}, struct {
+        fn lt(_: void, a: sb.SensorReading, b: sb.SensorReading) bool {
+            return a.timestamp < b.timestamp;
+        }
+    }.lt);
 
     var run_start_ts: ?i64 = null;
     var run_end_ts: i64 = 0;
@@ -693,41 +739,24 @@ pub fn query_latest_single(world: anytype, sensor_id: u32) !?sb.SensorReading {
 }
 
 /// Q2: Latest reading per sensor in a zone.
-/// Sensors are mapped to zones by integer division: zone_id = sensor_id /
-/// SENSORS_PER_ZONE. Returns one reading per sensor in the zone, sorted by
-/// sensor_id ascending. Caller owns the returned slice (free with
-/// world.allocator).
-/// Pure: calls only world.iterateAll — no backend-specific code.
+/// Zone membership comes from real registration (World.registerZone), not
+/// sensor_id arithmetic. Returns one reading per sensor in the zone,
+/// sorted by sensor_id ascending (sensorIdsByZone's own contract).
+/// Caller owns the returned slice (free with world.allocator).
+/// Pure: calls only world.sensorIdsByZone/getLatestBySensor — no
+/// backend-specific code.
 pub fn query_latest_zone(world: anytype, zone_id: u32) ![]const sb.SensorReading {
-    const all = try world.iterateAll();
-    defer world.allocator.free(all);
+    const member_ids = try world.sensorIdsByZone(zone_id);
+    defer world.allocator.free(member_ids);
 
     var result: std.ArrayList(sb.SensorReading) = .empty;
     defer result.deinit(world.allocator);
 
-    for (all) |r| {
-        if (r.sensor_id / SENSORS_PER_ZONE != zone_id) continue;
-
-        var found = false;
-        for (result.items) |*existing| {
-            if (existing.sensor_id == r.sensor_id) {
-                if (r.timestamp > existing.timestamp) {
-                    existing.* = r;
-                }
-                found = true;
-                break;
-            }
-        }
-        if (!found) {
-            try result.append(world.allocator, r);
+    for (member_ids) |sid| {
+        if (world.getLatestBySensor(sid)) |latest| {
+            try result.append(world.allocator, latest);
         }
     }
-
-    std.mem.sort(sb.SensorReading, result.items, {}, struct {
-        fn lt(_: void, lhs: sb.SensorReading, rhs: sb.SensorReading) bool {
-            return lhs.sensor_id < rhs.sensor_id;
-        }
-    }.lt);
 
     return try result.toOwnedSlice(world.allocator);
 }
@@ -735,31 +764,34 @@ pub fn query_latest_zone(world: anytype, zone_id: u32) ![]const sb.SensorReading
 /// Q3: Latest reading per sensor of a given type.
 /// Returns one reading per sensor matching sensor_type, sorted by sensor_id
 /// ascending. Caller owns the returned slice (free with world.allocator).
-/// Pure: calls only world.iterateAll — no backend-specific code.
+/// Pure: calls only world.readingsForType — no backend-specific code.
 pub fn query_latest_by_type(world: anytype, sensor_type: sb.SensorType) ![]const sb.SensorReading {
-    const all = try world.iterateAll();
-    defer world.allocator.free(all);
+    // world.readingsForType is an index lookup scoped to this type (not a
+    // full-dataset scan via iterateAll — see readingsForType's doc
+    // comment). Owned; must free.
+    const type_readings = try world.readingsForType(sensor_type);
+    defer world.allocator.free(type_readings);
+
+    // Track latest-per-sensor via a hash map, not a linear scan of the
+    // result list: at real per-sensor-type volume (hundreds of sensors,
+    // tens of thousands of readings each) a linear "already seen?" scan
+    // over the growing result list made this O(readings x distinct
+    // sensors) instead of O(readings).
+    var latest = std.AutoHashMap(u32, sb.SensorReading).init(world.allocator);
+    defer latest.deinit();
+
+    for (type_readings) |r| {
+        const gop = try latest.getOrPut(r.sensor_id);
+        if (!gop.found_existing or r.timestamp > gop.value_ptr.timestamp) {
+            gop.value_ptr.* = r;
+        }
+    }
 
     var result: std.ArrayList(sb.SensorReading) = .empty;
     defer result.deinit(world.allocator);
 
-    for (all) |r| {
-        if (r.sensor_type != sensor_type) continue;
-
-        var found = false;
-        for (result.items) |*existing| {
-            if (existing.sensor_id == r.sensor_id) {
-                if (r.timestamp > existing.timestamp) {
-                    existing.* = r;
-                }
-                found = true;
-                break;
-            }
-        }
-        if (!found) {
-            try result.append(world.allocator, r);
-        }
-    }
+    var it = latest.valueIterator();
+    while (it.next()) |v| try result.append(world.allocator, v.*);
 
     std.mem.sort(sb.SensorReading, result.items, {}, struct {
         fn lt(_: void, lhs: sb.SensorReading, rhs: sb.SensorReading) bool {

@@ -85,92 +85,66 @@ const MS_PER_HOUR = fixtures.MS_PER_HOUR;
 // call them in a tight loop without leaking.
 // ---------------------------------------------------------------------------
 
-fn q1_wrapper(world: anytype, sensor_id: u32) !void {
+pub fn q1_wrapper(world: anytype, sensor_id: u32) !void {
     _ = try queries.query_latest_single(world, sensor_id);
 }
 
-fn q2_wrapper(world: anytype, zone_id: u32) !void {
+pub fn q2_wrapper(world: anytype, zone_id: u32) !void {
     const result = try queries.query_latest_zone(world, zone_id);
     world.allocator.free(result);
 }
 
-fn q3_wrapper(world: anytype, sensor_type: sb.SensorType) !void {
+pub fn q3_wrapper(world: anytype, sensor_type: sb.SensorType) !void {
     const result = try queries.query_latest_by_type(world, sensor_type);
     world.allocator.free(result);
 }
 
-fn q5_wrapper(world: anytype, zone_id: u32, sensor_type: sb.SensorType, hours: u32) !void {
+pub fn q5_wrapper(world: anytype, zone_id: u32, sensor_type: sb.SensorType, hours: u32) !void {
     _ = try queries.query_avg_zone_type(world, zone_id, sensor_type, hours);
 }
 
-fn q6_wrapper(world: anytype, floor_id: u32, sensor_type: sb.SensorType, hours: u32) !void {
+pub fn q6_wrapper(world: anytype, floor_id: u32, sensor_type: sb.SensorType, hours: u32) !void {
     _ = try queries.query_floor_stats(world, floor_id, sensor_type, hours);
 }
 
-fn q7_wrapper(world: anytype, sensor_id: u32, days: u32) !void {
+pub fn q7_wrapper(world: anytype, sensor_id: u32, days: u32) !void {
     const result = try queries.query_hourly_rollup(world, sensor_id, days);
     world.allocator.free(result);
 }
 
-fn q8_wrapper(world: anytype, zone_id: u32, sensor_type: sb.SensorType) !void {
+pub fn q8_wrapper(world: anytype, zone_id: u32, sensor_type: sb.SensorType) !void {
     const result = try queries.query_daily_zone_rollup(world, zone_id, sensor_type);
     world.allocator.free(result);
 }
 
-fn q9_wrapper(world: anytype, center: queries.Vec3, radius_m: f32) !void {
+pub fn q9_wrapper(world: anytype, center: queries.Vec3, radius_m: f32) !void {
     const result = try queries.query_spatial_radius(world, center, radius_m);
     world.allocator.free(result);
 }
 
-fn q10_wrapper(world: anytype, zone_id: u32, depth: u32) !void {
+pub fn q10_wrapper(world: anytype, zone_id: u32, depth: u32) !void {
     const result = try queries.query_zone_hierarchy(world, zone_id, depth);
     world.allocator.free(result);
 }
 
-fn q11_wrapper(world: anytype, sensor_type: sb.SensorType, std_dev_threshold: f32) !void {
+pub fn q11_wrapper(world: anytype, sensor_type: sb.SensorType, std_dev_threshold: f32) !void {
     const result = try queries.query_anomalies(world, sensor_type, std_dev_threshold);
     world.allocator.free(result);
 }
 
-fn q12_wrapper(world: anytype, sensor_id: u32, threshold: f32, min_duration_ms: i64) !void {
+pub fn q12_wrapper(world: anytype, sensor_id: u32, threshold: f32, min_duration_ms: i64) !void {
     _ = try queries.query_threshold_breach(world, sensor_id, threshold, min_duration_ms);
 }
 
-test "equivalence: query_avg_window across all six backends" {
-    const dataset = try generateDataset(std.testing.allocator);
-    defer std.testing.allocator.free(dataset);
-
-    const test_cases = [_]struct { sensor: u32, hours: u32 }{
-        .{ .sensor = 0, .hours = 1 },
-        .{ .sensor = 0, .hours = 6 },
-        .{ .sensor = 0, .hours = 24 },
-        .{ .sensor = 0, .hours = 50 },
-        .{ .sensor = 3, .hours = 1 },
-        .{ .sensor = 3, .hours = 12 },
-        .{ .sensor = 3, .hours = 50 },
-        .{ .sensor = 9, .hours = 1 },
-        .{ .sensor = 9, .hours = 24 },
-        .{ .sensor = 9, .hours = 50 },
-    };
-
-    const tolerance: f32 = 1e-5;
-
-    for (test_cases) |tc| {
-        var results: [backends.len]f32 = undefined;
-
-        inline for (0..backends.len) |i| {
-            const b = backends[i];
-            var world = try World(b.T).init(std.testing.allocator);
-            defer world.deinit();
-            try insertDataset(&world, dataset);
-            results[i] = try queries.query_avg_window(&world, tc.sensor, tc.hours);
-        }
-
-        for (1..results.len) |i| {
-            try std.testing.expectApproxEqAbs(results[0], results[i], tolerance);
-        }
-    }
-}
+// query_avg_window/latest_single/latest_zone/latest_by_type/avg_zone_type/
+// floor_stats/hourly_rollup/daily_zone_rollup cross-backend equivalence is
+// proven once, in queries.zig (the canonical home for the 12 query
+// patterns — see its header comment). Re-asserting the same property here,
+// against the same seeded dataset with the same test cases, caught nothing
+// queries.zig didn't already catch; it only doubled compile/test time.
+// This file keeps the two equivalence checks that are NOT covered there:
+// the raw World interface methods (getLatestBySensor, rangeByTime), which
+// queries.zig's query-level tests never exercise directly.
 
 test "equivalence: getLatestBySensor across all six backends" {
     const dataset = try generateDataset(std.testing.allocator);
@@ -202,306 +176,19 @@ test "equivalence: getLatestBySensor across all six backends" {
     }
 }
 
-test "equivalence: query_latest_single across all six backends" {
+test "equivalence: getLatestBySensor agrees on null across all six backends (nonexistent sensor, and empty world)" {
     const dataset = try generateDataset(std.testing.allocator);
     defer std.testing.allocator.free(dataset);
 
-    for (0..NUM_SENSORS) |s| {
-        const sensor: u32 = @intCast(s);
-        var results: [backends.len]?sb.SensorReading = undefined;
+    inline for (backends) |b| {
+        var populated = try World(b.T).init(std.testing.allocator);
+        defer populated.deinit();
+        try insertDataset(&populated, dataset);
+        try std.testing.expect(populated.getLatestBySensor(999) == null);
 
-        inline for (0..backends.len) |i| {
-            const b = backends[i];
-            var world = try World(b.T).init(std.testing.allocator);
-            defer world.deinit();
-            try insertDataset(&world, dataset);
-            results[i] = try queries.query_latest_single(&world, sensor);
-        }
-
-        const ref = results[0];
-        for (1..results.len) |i| {
-            if (ref) |r| {
-                try std.testing.expect(results[i] != null);
-                try std.testing.expectEqual(r.sensor_id, results[i].?.sensor_id);
-                try std.testing.expectEqual(r.timestamp, results[i].?.timestamp);
-                try std.testing.expectApproxEqAbs(r.value, results[i].?.value, 1e-5);
-            } else {
-                try std.testing.expect(results[i] == null);
-            }
-        }
-    }
-}
-
-test "equivalence: query_latest_zone across all six backends" {
-    const dataset = try generateDataset(std.testing.allocator);
-    defer std.testing.allocator.free(dataset);
-
-    const zone_cases = [_]u32{ 0, 1 };
-
-    for (zone_cases) |zone_id| {
-        var lengths: [backends.len]usize = undefined;
-        var first_sensors: [backends.len]u32 = undefined;
-        var last_sensors: [backends.len]u32 = undefined;
-        var first_ts: [backends.len]i64 = undefined;
-        var last_ts: [backends.len]i64 = undefined;
-        var sums: [backends.len]f64 = undefined;
-
-        inline for (0..backends.len) |i| {
-            const b = backends[i];
-            var world = try World(b.T).init(std.testing.allocator);
-            defer world.deinit();
-            try insertDataset(&world, dataset);
-            const result = try queries.query_latest_zone(&world, zone_id);
-            defer std.testing.allocator.free(result);
-
-            lengths[i] = result.len;
-            if (result.len > 0) {
-                first_sensors[i] = result[0].sensor_id;
-                last_sensors[i] = result[result.len - 1].sensor_id;
-                first_ts[i] = result[0].timestamp;
-                last_ts[i] = result[result.len - 1].timestamp;
-                var sum: f64 = 0;
-                for (result) |r| sum += @as(f64, r.value);
-                sums[i] = sum;
-            }
-        }
-
-        for (1..backends.len) |i| {
-            try std.testing.expectEqual(lengths[0], lengths[i]);
-            if (lengths[0] > 0) {
-                try std.testing.expectEqual(first_sensors[0], first_sensors[i]);
-                try std.testing.expectEqual(last_sensors[0], last_sensors[i]);
-                try std.testing.expectEqual(first_ts[0], first_ts[i]);
-                try std.testing.expectEqual(last_ts[0], last_ts[i]);
-                try std.testing.expectApproxEqAbs(sums[0], sums[i], 1e-3);
-            }
-        }
-    }
-}
-
-test "equivalence: query_latest_by_type across all six backends" {
-    const dataset = try generateDataset(std.testing.allocator);
-    defer std.testing.allocator.free(dataset);
-
-    const type_cases = [_]sb.SensorType{ .temperature, .humidity, .co2, .occupancy, .energy };
-
-    for (type_cases) |st| {
-        var lengths: [backends.len]usize = undefined;
-        var first_sensors: [backends.len]u32 = undefined;
-        var last_sensors: [backends.len]u32 = undefined;
-        var first_ts: [backends.len]i64 = undefined;
-        var last_ts: [backends.len]i64 = undefined;
-        var sums: [backends.len]f64 = undefined;
-
-        inline for (0..backends.len) |i| {
-            const b = backends[i];
-            var world = try World(b.T).init(std.testing.allocator);
-            defer world.deinit();
-            try insertDataset(&world, dataset);
-            const result = try queries.query_latest_by_type(&world, st);
-            defer std.testing.allocator.free(result);
-
-            lengths[i] = result.len;
-            if (result.len > 0) {
-                first_sensors[i] = result[0].sensor_id;
-                last_sensors[i] = result[result.len - 1].sensor_id;
-                first_ts[i] = result[0].timestamp;
-                last_ts[i] = result[result.len - 1].timestamp;
-                var sum: f64 = 0;
-                for (result) |r| sum += @as(f64, r.value);
-                sums[i] = sum;
-            }
-        }
-
-        for (1..backends.len) |i| {
-            try std.testing.expectEqual(lengths[0], lengths[i]);
-            if (lengths[0] > 0) {
-                try std.testing.expectEqual(first_sensors[0], first_sensors[i]);
-                try std.testing.expectEqual(last_sensors[0], last_sensors[i]);
-                try std.testing.expectEqual(first_ts[0], first_ts[i]);
-                try std.testing.expectEqual(last_ts[0], last_ts[i]);
-                try std.testing.expectApproxEqAbs(sums[0], sums[i], 1e-3);
-            }
-        }
-    }
-}
-
-test "equivalence: query_avg_zone_type across all six backends" {
-    const dataset = try generateDataset(std.testing.allocator);
-    defer std.testing.allocator.free(dataset);
-
-    const test_cases = [_]struct { zone: u32, st: sb.SensorType, hours: u32 }{
-        .{ .zone = 0, .st = .temperature, .hours = 1 },
-        .{ .zone = 0, .st = .temperature, .hours = 24 },
-        .{ .zone = 0, .st = .temperature, .hours = 50 },
-        .{ .zone = 0, .st = .humidity, .hours = 1 },
-        .{ .zone = 0, .st = .humidity, .hours = 50 },
-        .{ .zone = 1, .st = .co2, .hours = 12 },
-        .{ .zone = 1, .st = .co2, .hours = 50 },
-        .{ .zone = 1, .st = .occupancy, .hours = 24 },
-        .{ .zone = 1, .st = .energy, .hours = 1 },
-        .{ .zone = 1, .st = .energy, .hours = 50 },
-    };
-
-    const tolerance: f32 = 1e-5;
-
-    for (test_cases) |tc| {
-        var results: [backends.len]f32 = undefined;
-
-        inline for (0..backends.len) |i| {
-            const b = backends[i];
-            var world = try World(b.T).init(std.testing.allocator);
-            defer world.deinit();
-            try insertDataset(&world, dataset);
-            results[i] = try queries.query_avg_zone_type(&world, tc.zone, tc.st, tc.hours);
-        }
-
-        for (1..results.len) |i| {
-            try std.testing.expectApproxEqAbs(results[0], results[i], tolerance);
-        }
-    }
-}
-
-test "equivalence: query_floor_stats across all six backends" {
-    const dataset = try generateDataset(std.testing.allocator);
-    defer std.testing.allocator.free(dataset);
-
-    const test_cases = [_]struct { floor: u32, st: sb.SensorType, hours: u32 }{
-        .{ .floor = 0, .st = .temperature, .hours = 1 },
-        .{ .floor = 0, .st = .temperature, .hours = 24 },
-        .{ .floor = 0, .st = .temperature, .hours = 50 },
-        .{ .floor = 0, .st = .humidity, .hours = 12 },
-        .{ .floor = 0, .st = .co2, .hours = 50 },
-        .{ .floor = 0, .st = .occupancy, .hours = 1 },
-        .{ .floor = 0, .st = .energy, .hours = 50 },
-    };
-
-    const tolerance: f32 = 1e-5;
-
-    for (test_cases) |tc| {
-        var results: [backends.len]queries.Stats = undefined;
-
-        inline for (0..backends.len) |i| {
-            const b = backends[i];
-            var world = try World(b.T).init(std.testing.allocator);
-            defer world.deinit();
-            try insertDataset(&world, dataset);
-            results[i] = try queries.query_floor_stats(&world, tc.floor, tc.st, tc.hours);
-        }
-
-        for (1..results.len) |i| {
-            try std.testing.expectApproxEqAbs(results[0].min, results[i].min, tolerance);
-            try std.testing.expectApproxEqAbs(results[0].max, results[i].max, tolerance);
-            try std.testing.expectApproxEqAbs(results[0].avg, results[i].avg, tolerance);
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Equivalence tests for Q7/Q8 — only supported_backends (no RingBuffer).
-// ---------------------------------------------------------------------------
-
-test "equivalence: query_hourly_rollup across five supported backends" {
-    const dataset = try generateDataset(std.testing.allocator);
-    defer std.testing.allocator.free(dataset);
-
-    const test_cases = [_]struct { sensor: u32, days: u32 }{
-        .{ .sensor = 0, .days = 1 },
-        .{ .sensor = 0, .days = 2 },
-        .{ .sensor = 3, .days = 1 },
-        .{ .sensor = 9, .days = 2 },
-    };
-
-    for (test_cases) |tc| {
-        var lengths: [supported_backends.len]usize = undefined;
-        var first_buckets: [supported_backends.len]i64 = undefined;
-        var last_buckets: [supported_backends.len]i64 = undefined;
-        var first_counts: [supported_backends.len]u32 = undefined;
-        var last_counts: [supported_backends.len]u32 = undefined;
-        var sums: [supported_backends.len]f64 = undefined;
-
-        inline for (0..supported_backends.len) |i| {
-            const b = supported_backends[i];
-            var world = try World(b.T).init(std.testing.allocator);
-            defer world.deinit();
-            try insertDataset(&world, dataset);
-            const result = try queries.query_hourly_rollup(&world, tc.sensor, tc.days);
-            defer std.testing.allocator.free(result);
-
-            lengths[i] = result.len;
-            if (result.len > 0) {
-                first_buckets[i] = result[0].hour_bucket;
-                last_buckets[i] = result[result.len - 1].hour_bucket;
-                first_counts[i] = result[0].count;
-                last_counts[i] = result[result.len - 1].count;
-                var sum: f64 = 0;
-                for (result) |r| sum += @as(f64, r.avg);
-                sums[i] = sum;
-            }
-        }
-
-        for (1..supported_backends.len) |i| {
-            try std.testing.expectEqual(lengths[0], lengths[i]);
-            if (lengths[0] > 0) {
-                try std.testing.expectEqual(first_buckets[0], first_buckets[i]);
-                try std.testing.expectEqual(last_buckets[0], last_buckets[i]);
-                try std.testing.expectEqual(first_counts[0], first_counts[i]);
-                try std.testing.expectEqual(last_counts[0], last_counts[i]);
-                try std.testing.expectApproxEqAbs(sums[0], sums[i], 1e-3);
-            }
-        }
-    }
-}
-
-test "equivalence: query_daily_zone_rollup across five supported backends" {
-    const dataset = try generateDataset(std.testing.allocator);
-    defer std.testing.allocator.free(dataset);
-
-    const test_cases = [_]struct { zone: u32, st: sb.SensorType }{
-        .{ .zone = 0, .st = .temperature },
-        .{ .zone = 0, .st = .humidity },
-        .{ .zone = 1, .st = .co2 },
-        .{ .zone = 1, .st = .energy },
-    };
-
-    for (test_cases) |tc| {
-        var lengths: [supported_backends.len]usize = undefined;
-        var first_buckets: [supported_backends.len]i64 = undefined;
-        var last_buckets: [supported_backends.len]i64 = undefined;
-        var first_counts: [supported_backends.len]u32 = undefined;
-        var last_counts: [supported_backends.len]u32 = undefined;
-        var sums: [supported_backends.len]f64 = undefined;
-
-        inline for (0..supported_backends.len) |i| {
-            const b = supported_backends[i];
-            var world = try World(b.T).init(std.testing.allocator);
-            defer world.deinit();
-            try insertDataset(&world, dataset);
-            const result = try queries.query_daily_zone_rollup(&world, tc.zone, tc.st);
-            defer std.testing.allocator.free(result);
-
-            lengths[i] = result.len;
-            if (result.len > 0) {
-                first_buckets[i] = result[0].day_bucket;
-                last_buckets[i] = result[result.len - 1].day_bucket;
-                first_counts[i] = result[0].count;
-                last_counts[i] = result[result.len - 1].count;
-                var sum: f64 = 0;
-                for (result) |r| sum += @as(f64, r.avg);
-                sums[i] = sum;
-            }
-        }
-
-        for (1..supported_backends.len) |i| {
-            try std.testing.expectEqual(lengths[0], lengths[i]);
-            if (lengths[0] > 0) {
-                try std.testing.expectEqual(first_buckets[0], first_buckets[i]);
-                try std.testing.expectEqual(last_buckets[0], last_buckets[i]);
-                try std.testing.expectEqual(first_counts[0], first_counts[i]);
-                try std.testing.expectEqual(last_counts[0], last_counts[i]);
-                try std.testing.expectApproxEqAbs(sums[0], sums[i], 1e-3);
-            }
-        }
+        var empty = try World(b.T).init(std.testing.allocator);
+        defer empty.deinit();
+        try std.testing.expect(empty.getLatestBySensor(0) == null);
     }
 }
 
@@ -514,6 +201,17 @@ test "equivalence: rangeByTime across all six backends" {
         .{ .sensor = 0, .start = BASE_TIMESTAMP, .end = BASE_TIMESTAMP + 24 * MS_PER_HOUR },
         .{ .sensor = 5, .start = BASE_TIMESTAMP, .end = BASE_TIMESTAMP + 50 * MS_PER_HOUR },
         .{ .sensor = null, .start = BASE_TIMESTAMP + 20 * MS_PER_HOUR, .end = BASE_TIMESTAMP + 30 * MS_PER_HOUR },
+        // Edge case: exact single-instant range (start == end == a real
+        // reading's timestamp). Never exercised before — boundary-inclusive
+        // logic differs in shape per backend (binary search bounds vs.
+        // linear <= / >= filters) so this is the case most likely to
+        // diverge by an off-by-one.
+        .{ .sensor = 0, .start = BASE_TIMESTAMP, .end = BASE_TIMESTAMP },
+        // Edge case: inverted range (start > end). No documented contract
+        // forbids this input; every backend's filter is `ts < start or ts
+        // > end`, which is unsatisfiable for any ts when start > end, so
+        // this should come back empty everywhere without special-casing.
+        .{ .sensor = null, .start = BASE_TIMESTAMP + 10 * MS_PER_HOUR, .end = BASE_TIMESTAMP },
     };
 
     for (test_cases) |tc| {
@@ -552,6 +250,24 @@ test "equivalence: rangeByTime across all six backends" {
                 try std.testing.expectApproxEqAbs(sums[0], sums[i], 1e-3);
             }
         }
+    }
+}
+
+test "equivalence: inverted rangeByTime (start > end) returns empty on every backend" {
+    const dataset = try generateDataset(std.testing.allocator);
+    defer std.testing.allocator.free(dataset);
+
+    inline for (backends) |b| {
+        var world = try World(b.T).init(std.testing.allocator);
+        defer world.deinit();
+        try insertDataset(&world, dataset);
+
+        const result = try world.rangeByTime(.{
+            .start_time = BASE_TIMESTAMP + 30 * MS_PER_HOUR,
+            .end_time = BASE_TIMESTAMP,
+        });
+        defer std.testing.allocator.free(result);
+        try std.testing.expectEqual(@as(usize, 0), result.len);
     }
 }
 

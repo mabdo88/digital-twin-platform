@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const sb = @import("../storage_backend.zig");
+const ZoneIndex = @import("../zone_index.zig");
 
 const SensorReading = sb.SensorReading;
 const SensorType = sb.SensorType;
@@ -19,13 +20,15 @@ const Self = @This();
 
 allocator: std.mem.Allocator,
 readings: std.ArrayList(SensorReading),
+zone_index: ZoneIndex,
 
 pub fn init(allocator: std.mem.Allocator) !Self {
-    return .{ .allocator = allocator, .readings = .empty };
+    return .{ .allocator = allocator, .readings = .empty, .zone_index = ZoneIndex.init(allocator) };
 }
 
 pub fn deinit(self: *Self) void {
     self.readings.deinit(self.allocator);
+    self.zone_index.deinit();
     self.* = undefined;
 }
 
@@ -38,7 +41,7 @@ pub fn count(self: *const Self) usize {
 }
 
 pub fn memoryUsed(self: *const Self) usize {
-    return self.readings.capacity * @sizeOf(SensorReading);
+    return self.readings.capacity * @sizeOf(SensorReading) + self.zone_index.memoryUsed();
 }
 
 /// Iteration order: insertion order.
@@ -83,27 +86,41 @@ pub fn rangeByTime(self: *const Self, allocator: std.mem.Allocator, q: RangeQuer
     return owned;
 }
 
-/// No grouping structure to exploit — linear scan + filter + dedup, same
-/// cost as iterateAll. See storage_backend.zig's doc comment for the
-/// contract; AoS is the reference "no shortcut available" implementation.
-pub fn sensorIdsByGroup(self: *const Self, allocator: std.mem.Allocator, group_id: u32, divisor: u32) ![]u32 {
-    var seen = std.AutoHashMap(u32, void).init(allocator);
-    defer seen.deinit();
+/// Zone/floor topology bookkeeping delegates to the shared ZoneIndex — see
+/// storage_backend.zig's doc comment for the contract and zone_index.zig's
+/// header for why this is shared rather than copy-pasted per backend.
+pub fn registerZone(self: *Self, sensor_id: u32, zone_id: u32) !void {
+    return self.zone_index.registerZone(sensor_id, zone_id);
+}
 
+pub fn registerFloor(self: *Self, zone_id: u32, floor_id: u32) !void {
+    return self.zone_index.registerFloor(zone_id, floor_id);
+}
+
+pub fn sensorIdsByZone(self: *const Self, allocator: std.mem.Allocator, zone_id: u32) ![]u32 {
+    return self.zone_index.sensorIdsByZone(allocator, zone_id);
+}
+
+pub fn sensorIdsByFloor(self: *const Self, allocator: std.mem.Allocator, floor_id: u32) ![]u32 {
+    return self.zone_index.sensorIdsByFloor(allocator, floor_id);
+}
+
+pub fn floorOfZone(self: *const Self, zone_id: u32) ?u32 {
+    return self.zone_index.floorOfZone(zone_id);
+}
+
+/// Removes every reading of `sensor_type` older than `cutoff_timestamp` via
+/// an in-place stable compaction (readings of other types, and this
+/// backend's zone/floor topology, are untouched). See storage_backend.zig's
+/// pruneOlderThan contract.
+pub fn pruneOlderThan(self: *Self, sensor_type: SensorType, cutoff_timestamp: i64) !void {
+    var write: usize = 0;
     for (self.readings.items) |r| {
-        if (r.sensor_id / divisor != group_id) continue;
-        try seen.put(r.sensor_id, {});
+        if (r.sensor_type == sensor_type and r.timestamp < cutoff_timestamp) continue;
+        self.readings.items[write] = r;
+        write += 1;
     }
-
-    var result = try allocator.alloc(u32, seen.count());
-    var i: usize = 0;
-    var it = seen.keyIterator();
-    while (it.next()) |k| {
-        result[i] = k.*;
-        i += 1;
-    }
-    std.mem.sort(u32, result, {}, std.sort.asc(u32));
-    return result;
+    self.readings.shrinkRetainingCapacity(write);
 }
 
 // ---------------------------------------------------------------------------
@@ -203,6 +220,52 @@ test "AoS: rangeByTime with sensor filter" {
     try std.testing.expectEqual(@as(u32, 1), result[1].sensor_id);
 }
 
+test "AoS: sensorIdsByZone/sensorIdsByFloor reflect real (non-arithmetic) registration" {
+    var backend = try Self.init(std.testing.allocator);
+    defer backend.deinit();
+
+    // Arbitrary, non-sequential ids — like a real building's IFC entity
+    // ids, not a fixed-width sensor_id/N convention.
+    try backend.insert(.{ .sensor_id = 7, .timestamp = 0, .value = 1.0, .sensor_type = .temperature });
+    try backend.insert(.{ .sensor_id = 2, .timestamp = 0, .value = 1.0, .sensor_type = .temperature });
+    try backend.registerZone(7, 4291);
+    try backend.registerZone(2, 4291);
+    try backend.registerFloor(4291, 3);
+
+    const zone = try backend.sensorIdsByZone(std.testing.allocator, 4291);
+    defer std.testing.allocator.free(zone);
+    try std.testing.expectEqualSlices(u32, &.{ 2, 7 }, zone);
+
+    const floor = try backend.sensorIdsByFloor(std.testing.allocator, 3);
+    defer std.testing.allocator.free(floor);
+    try std.testing.expectEqualSlices(u32, &.{ 2, 7 }, floor);
+
+    try std.testing.expectEqual(@as(?u32, 3), backend.floorOfZone(4291));
+
+    // An unregistered zone/floor is empty, not an error.
+    const empty = try backend.sensorIdsByZone(std.testing.allocator, 99);
+    defer std.testing.allocator.free(empty);
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
+}
+
+test "AoS: getLatestBySensor is deterministic across repeated calls when timestamps tie" {
+    var backend = try Self.init(std.testing.allocator);
+    defer backend.deinit();
+
+    // Two readings for the same sensor, same timestamp. The interface
+    // contract (storage_backend.zig) explicitly allows any one of them to
+    // win the tie — it does NOT require agreement with other backends —
+    // but a single backend must keep answering the same way call after
+    // call, not flip-flop.
+    try backend.insert(.{ .sensor_id = 1, .timestamp = 100, .value = 10.0, .sensor_type = .temperature });
+    try backend.insert(.{ .sensor_id = 1, .timestamp = 100, .value = 20.0, .sensor_type = .temperature });
+
+    const first = backend.getLatestBySensor(1).?;
+    const second = backend.getLatestBySensor(1).?;
+    try std.testing.expectEqual(@as(i64, 100), first.timestamp);
+    try std.testing.expectEqual(first.value, second.value);
+}
+
 test "AoS: empty backend" {
     var backend = try Self.init(std.testing.allocator);
     defer backend.deinit();
@@ -217,4 +280,33 @@ test "AoS: empty backend" {
     const rng = try backend.rangeByTime(std.testing.allocator, .{ .start_time = 0, .end_time = 100 });
     defer std.testing.allocator.free(rng);
     try std.testing.expectEqual(@as(usize, 0), rng.len);
+}
+
+test "AoS: pruneOlderThan removes only the matching type older than cutoff" {
+    var backend = try Self.init(std.testing.allocator);
+    defer backend.deinit();
+
+    try backend.insert(.{ .sensor_id = 1, .timestamp = 50, .value = 1.0, .sensor_type = .temperature });
+    try backend.insert(.{ .sensor_id = 1, .timestamp = 150, .value = 2.0, .sensor_type = .temperature });
+    // Same age as the pruned temperature reading, but a different type —
+    // must survive.
+    try backend.insert(.{ .sensor_id = 2, .timestamp = 50, .value = 3.0, .sensor_type = .humidity });
+
+    try backend.pruneOlderThan(.temperature, 100);
+
+    try std.testing.expectEqual(@as(usize, 2), backend.count());
+    const all = try backend.iterateAll(std.testing.allocator);
+    defer std.testing.allocator.free(all);
+
+    var found_old_temp = false;
+    var found_new_temp = false;
+    var found_humidity = false;
+    for (all) |r| {
+        if (r.sensor_type == .temperature and r.timestamp == 50) found_old_temp = true;
+        if (r.sensor_type == .temperature and r.timestamp == 150) found_new_temp = true;
+        if (r.sensor_type == .humidity and r.timestamp == 50) found_humidity = true;
+    }
+    try std.testing.expect(!found_old_temp);
+    try std.testing.expect(found_new_temp);
+    try std.testing.expect(found_humidity);
 }

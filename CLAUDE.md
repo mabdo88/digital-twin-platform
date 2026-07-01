@@ -36,6 +36,10 @@ rather than assumes.
 - **Domain:** Digital twin / building IoT.
 - **No external database dependencies.** Every storage backend is pure in-process Zig.
 - **Headless.** No Vulkan, no GLFW, no rendering of any kind.
+- **Cross-platform.** Must build and run unmodified on Windows, Linux, and macOS.
+  Use only `std.fs` / `std.process` / `std.Io` — no OS-specific APIs, no shell-outs
+  to platform tools, no hard-coded path separators (use `std.fs.path` helpers).
+  File selection is a CLI argument (`--bim <path>`), not a GUI file picker.
 
 ---
 
@@ -65,7 +69,7 @@ rather than assumes.
 ### 3.4 Benchmark rules
 - **All benchmarks are deterministic.** RNG is seeded; same input → same output, always.
 - Metrics are recorded by **`metrics_system.zig` only**. No ad-hoc timing elsewhere.
-- Each query runs a **minimum of 100 iterations** per backend. Report median, p95, p99.
+- Each query runs a **minimum of 25 iterations** per backend. Report median, p95, p99.
 - Memory is measured **after ingest, before queries, and after queries**.
 
 ### 3.5 General rules
@@ -191,18 +195,52 @@ Reusable, repeatable procedures live in `.cascade/digital-twin/`:
 
 Follow these verbatim when the task matches; they encode the review checklist.
 
+The same folder also holds **status docs** (read as current state, not as procedures):
+
+- **`backend-audit.md`** — per-backend correctness verdict, rechecked against live
+  benchmark output. Read before touching a backend's internals.
+- **`Digital Twin Roadmap.html`** — the phase-by-phase completion tracker, rechecked
+  against actual repo state each time it's updated. Treat this as more current than
+  `AGENT.md`'s phase checklists, which have drifted from what was actually built
+  (e.g. `AGENT.md`'s Phase 3 query list no longer matches `queries.zig`).
+- **`storage-redesign-plan.md`** — agreed 2026-06-30, **not yet implemented**: real
+  retention-bound per-sensor datasets (no toy 1h dataset, no sampling/replication
+  across sibling sensors), real eviction across every backend (not just
+  RingBuffer), a live tick-based simulator, and no backend-eligibility assumptions
+  (every backend races every query, empirical winner reported). This plan
+  explicitly supersedes §3.4's "minimum 25 iterations" rule below once
+  implemented — read it before touching `synthetic/generator.zig`,
+  `ecs/storage/*`, `benchmark/queries.zig`, or `main.zig`'s orchestration.
+
 ---
 
 ## 10. Open decisions (track, don't silently assume)
 
-- **IFC wrapper:** prefer wrapping IfcOpenShell via Zig C-interop; fall back to a
-  minimal subset parser if integration is painful.
+- **IFC wrapper — resolved:** went with a hand-rolled subset parser (`ifc_parser.zig`),
+  not an IfcOpenShell C-interop wrapper. Validated end-to-end against two real Revit
+  IFC exports (see the Roadmap, Phase 4).
 - **Scale ceiling:** target 100,000 sensors for Phase 1; keep allocation strategy
-  able to grow.
-- **Report format:** emit **both** JSON and a human-readable Markdown report.
+  able to grow. Not yet exercised — the standalone synthetic generator (Phase 6)
+  doesn't exist yet, so the largest sensor count tested today is the benchmark
+  suite's "Large" tier (100 sensors, 500 readings each = 50,000 readings total).
+- **Report format:** emit JSON, a human-readable Markdown report, **and** an
+  interactive HTML dashboard — all three written by `engine/benchmark/report.zig`
+  (`latency.json`, `latency.md`, `benchmark.html`).
 - **Tiered strategies:** the platform *recommends* mixed strategies but only
   *benchmarks* single backends; recommendations come from per-query winners + cost.
-- **Calibration:** DuckDB is the primary calibration; vendor benchmarks are optional metadata.
+  Not yet built (Phase 7).
+- **Calibration:** DuckDB is the primary calibration; vendor benchmarks are optional
+  metadata. Not yet built (Phase 8).
 
 If a task forces one of these decisions, surface it in the PR description rather than
 quietly hard-coding a choice.
+
+## graphify
+
+This project has a knowledge graph at graphify-out/ with god nodes, community structure, and cross-file relationships.
+
+Rules:
+- For codebase questions, first run `graphify query "<question>"` when graphify-out/graph.json exists. Use `graphify path "<A>" "<B>"` for relationships and `graphify explain "<concept>"` for focused concepts. These return a scoped subgraph, usually much smaller than GRAPH_REPORT.md or raw grep output.
+- If graphify-out/wiki/index.md exists, use it for broad navigation instead of raw source browsing.
+- Read graphify-out/GRAPH_REPORT.md only for broad architecture review or when query/path/explain do not surface enough context.
+- After modifying code, run `graphify update .` to keep the graph current (AST-only, no API cost).

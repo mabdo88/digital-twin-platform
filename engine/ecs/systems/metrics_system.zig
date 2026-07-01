@@ -201,266 +201,146 @@ test "smoke: time query_avg_window on AoS and print percentiles" {
     try std.testing.expectEqual(mem_after_queries, mem_before_queries);
 }
 
-test "scaling: query_avg_window AoS vs SoA vs TimeSeries at 100 / 1k / 10k / 100k iterations" {
+// Was previously six hand-unrolled copies of this exact loop (one per
+// backend, ~250 lines) printing the same table and asserting the same three
+// percentile-ordering invariants each time. Those invariants are a property
+// of timeQuery's own sort+index math, not of the backend being timed, so
+// repeating the assertions per backend never caught a backend-specific bug —
+// it only multiplied compile time and the cost of this test (up to 100k
+// iterations x 6 backends). Looping at comptime keeps the same scaling
+// numbers printed for every backend, with the duplication gone.
+test "scaling: query_avg_window across all six backends at 100 / 1k / 10k iterations" {
     var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
 
-    // Build all worlds with identical data
     const dataset = try generateDataset(std.testing.allocator);
     defer std.testing.allocator.free(dataset);
 
-    var world_aos = try World(aos).init(std.testing.allocator);
-    defer world_aos.deinit();
-    var world_soa = try World(soa).init(std.testing.allocator);
-    defer world_soa.deinit();
-    var world_ts = try World(timeseries).init(std.testing.allocator);
-    defer world_ts.deinit();
-    var world_col = try World(columnar).init(std.testing.allocator);
-    defer world_col.deinit();
-    var world_hier = try World(hierarchical).init(std.testing.allocator);
-    defer world_hier.deinit();
-    var world_rb = try World(ringbuffer).init(std.testing.allocator);
-    defer world_rb.deinit();
+    const iteration_counts = [_]u32{ 100, 1_000, 10_000 };
+    const all_backends = .{
+        .{ "AoS", aos },
+        .{ "SoA", soa },
+        .{ "TimeSeries", timeseries },
+        .{ "Columnar", columnar },
+        .{ "Hierarchical", hierarchical },
+        .{ "RingBuffer", ringbuffer },
+    };
 
-    for (dataset) |r| {
-        try world_aos.insert(r);
-        try world_soa.insert(r);
-        try world_ts.insert(r);
-        try world_col.insert(r);
-        try world_hier.insert(r);
-        try world_rb.insert(r);
-    }
+    std.debug.print("\n=== query_avg_window scaling across all six backends (sensor=0, hours=24) ===\n", .{});
 
-    const mem_aos = sampleMemory(&world_aos);
-    const mem_soa = sampleMemory(&world_soa);
-    const mem_ts = sampleMemory(&world_ts);
-    const mem_col = sampleMemory(&world_col);
-    const mem_hier = sampleMemory(&world_hier);
-    const mem_rb = sampleMemory(&world_rb);
+    inline for (all_backends) |entry| {
+        const name = entry[0];
+        const Backend = entry[1];
 
-    const iteration_counts = [_]u32{ 100, 1_000, 10_000, 100_000 };
+        var world = try World(Backend).init(std.testing.allocator);
+        defer world.deinit();
+        for (dataset) |r| try world.insert(r);
 
-    std.debug.print("\n=== query_avg_window scaling: AoS vs SoA vs TimeSeries vs Columnar vs Hierarchical vs RingBuffer (sensor=0, hours=24) ===\n", .{});
-    std.debug.print("memory: AoS={d} bytes  SoA={d} bytes  TimeSeries={d} bytes  Columnar={d} bytes  Hierarchical={d} bytes  RingBuffer={d} bytes\n\n", .{ mem_aos, mem_soa, mem_ts, mem_col, mem_hier, mem_rb });
-
-    std.debug.print("--- AoS ---\n", .{});
-    std.debug.print("{s:>10} {s:>12} {s:>8} {s:>12} {s:>8} {s:>12} {s:>8} {s:>12} {s:>8} {s:>14}\n", .{
-        "iters",      "median_ns",
-        "med_µs",
-        "p95_ns",
-        "p95_µs",
-        "p99_ns",
-        "p99_µs",
-        "mean_ns",
-        "mean_µs",
-        "throughput",
-    });
-    for (iteration_counts) |n| {
-        const stats = try timeQuery(
-            std.testing.allocator,
-            io,
-            n,
-            queries.query_avg_window,
-            .{ &world_aos, @as(u32, 0), @as(u32, 24) },
-        );
-        std.debug.print("{d:>10} {d:>12} {d:>8.1} {d:>12} {d:>8.1} {d:>12} {d:>8.1} {d:>12} {d:>8.1} {d:>12.0}ops/s\n", .{
-            stats.iterations,
-            stats.median_ns,
-            nsToUs(stats.median_ns),
-            stats.p95_ns,
-            nsToUs(stats.p95_ns),
-            stats.p99_ns,
-            nsToUs(stats.p99_ns),
-            stats.mean_ns,
-            nsToUs(stats.mean_ns),
-            stats.throughputOpsPerSec(),
+        std.debug.print("\n--- {s} (memory={d} bytes) ---\n", .{ name, sampleMemory(&world) });
+        std.debug.print("{s:>10} {s:>12} {s:>8} {s:>12} {s:>8} {s:>12} {s:>8} {s:>12} {s:>8} {s:>14}\n", .{
+            "iters",      "median_ns",
+            "med_µs",
+            "p95_ns",
+            "p95_µs",
+            "p99_ns",
+            "p99_µs",
+            "mean_ns",
+            "mean_µs",
+            "throughput",
         });
-        try std.testing.expectEqual(n, stats.iterations);
-        try std.testing.expect(stats.p95_ns >= stats.median_ns);
-        try std.testing.expect(stats.p99_ns >= stats.p95_ns);
+
+        for (iteration_counts) |n| {
+            const stats = try timeQuery(
+                std.testing.allocator,
+                io,
+                n,
+                queries.query_avg_window,
+                .{ &world, @as(u32, 0), @as(u32, 24) },
+            );
+            std.debug.print("{d:>10} {d:>12} {d:>8.1} {d:>12} {d:>8.1} {d:>12} {d:>8.1} {d:>12} {d:>8.1} {d:>12.0}ops/s\n", .{
+                stats.iterations,
+                stats.median_ns,
+                nsToUs(stats.median_ns),
+                stats.p95_ns,
+                nsToUs(stats.p95_ns),
+                stats.p99_ns,
+                nsToUs(stats.p99_ns),
+                stats.mean_ns,
+                nsToUs(stats.mean_ns),
+                stats.throughputOpsPerSec(),
+            });
+            try std.testing.expectEqual(n, stats.iterations);
+            try std.testing.expect(stats.p95_ns >= stats.median_ns);
+            try std.testing.expect(stats.p99_ns >= stats.p95_ns);
+        }
     }
 
-    std.debug.print("\n--- SoA ---\n", .{});
-    std.debug.print("{s:>10} {s:>12} {s:>8} {s:>12} {s:>8} {s:>12} {s:>8} {s:>12} {s:>8} {s:>14}\n", .{
-        "iters",      "median_ns",
-        "med_µs",
-        "p95_ns",
-        "p95_µs",
-        "p99_ns",
-        "p99_µs",
-        "mean_ns",
-        "mean_µs",
-        "throughput",
-    });
-    for (iteration_counts) |n| {
-        const stats = try timeQuery(
-            std.testing.allocator,
-            io,
-            n,
-            queries.query_avg_window,
-            .{ &world_soa, @as(u32, 0), @as(u32, 24) },
-        );
-        std.debug.print("{d:>10} {d:>12} {d:>8.1} {d:>12} {d:>8.1} {d:>12} {d:>8.1} {d:>12} {d:>8.1} {d:>12.0}ops/s\n", .{
-            stats.iterations,
-            stats.median_ns,
-            nsToUs(stats.median_ns),
-            stats.p95_ns,
-            nsToUs(stats.p95_ns),
-            stats.p99_ns,
-            nsToUs(stats.p99_ns),
-            stats.mean_ns,
-            nsToUs(stats.mean_ns),
-            stats.throughputOpsPerSec(),
-        });
-        try std.testing.expectEqual(n, stats.iterations);
-        try std.testing.expect(stats.p95_ns >= stats.median_ns);
-        try std.testing.expect(stats.p99_ns >= stats.p95_ns);
-    }
-
-    std.debug.print("\n--- TimeSeries ---\n", .{});
-    std.debug.print("{s:>10} {s:>12} {s:>8} {s:>12} {s:>8} {s:>12} {s:>8} {s:>12} {s:>8} {s:>14}\n", .{
-        "iters",      "median_ns",
-        "med_µs",
-        "p95_ns",
-        "p95_µs",
-        "p99_ns",
-        "p99_µs",
-        "mean_ns",
-        "mean_µs",
-        "throughput",
-    });
-    for (iteration_counts) |n| {
-        const stats = try timeQuery(
-            std.testing.allocator,
-            io,
-            n,
-            queries.query_avg_window,
-            .{ &world_ts, @as(u32, 0), @as(u32, 24) },
-        );
-        std.debug.print("{d:>10} {d:>12} {d:>8.1} {d:>12} {d:>8.1} {d:>12} {d:>8.1} {d:>12} {d:>8.1} {d:>12.0}ops/s\n", .{
-            stats.iterations,
-            stats.median_ns,
-            nsToUs(stats.median_ns),
-            stats.p95_ns,
-            nsToUs(stats.p95_ns),
-            stats.p99_ns,
-            nsToUs(stats.p99_ns),
-            stats.mean_ns,
-            nsToUs(stats.mean_ns),
-            stats.throughputOpsPerSec(),
-        });
-        try std.testing.expectEqual(n, stats.iterations);
-        try std.testing.expect(stats.p95_ns >= stats.median_ns);
-        try std.testing.expect(stats.p99_ns >= stats.p95_ns);
-    }
-    std.debug.print("\n--- Columnar ---\n", .{});
-    std.debug.print("{s:>10} {s:>12} {s:>8} {s:>12} {s:>8} {s:>12} {s:>8} {s:>12} {s:>8} {s:>14}\n", .{
-        "iters",      "median_ns",
-        "med_µs",
-        "p95_ns",
-        "p95_µs",
-        "p99_ns",
-        "p99_µs",
-        "mean_ns",
-        "mean_µs",
-        "throughput",
-    });
-    for (iteration_counts) |n| {
-        const stats = try timeQuery(
-            std.testing.allocator,
-            io,
-            n,
-            queries.query_avg_window,
-            .{ &world_col, @as(u32, 0), @as(u32, 24) },
-        );
-        std.debug.print("{d:>10} {d:>12} {d:>8.1} {d:>12} {d:>8.1} {d:>12} {d:>8.1} {d:>12} {d:>8.1} {d:>12.0}ops/s\n", .{
-            stats.iterations,
-            stats.median_ns,
-            nsToUs(stats.median_ns),
-            stats.p95_ns,
-            nsToUs(stats.p95_ns),
-            stats.p99_ns,
-            nsToUs(stats.p99_ns),
-            stats.mean_ns,
-            nsToUs(stats.mean_ns),
-            stats.throughputOpsPerSec(),
-        });
-        try std.testing.expectEqual(n, stats.iterations);
-        try std.testing.expect(stats.p95_ns >= stats.median_ns);
-        try std.testing.expect(stats.p99_ns >= stats.p95_ns);
-    }
-    std.debug.print("\n--- Hierarchical ---\n", .{});
-    std.debug.print("{s:>10} {s:>12} {s:>8} {s:>12} {s:>8} {s:>12} {s:>8} {s:>12} {s:>8} {s:>14}\n", .{
-        "iters",      "median_ns",
-        "med_µs",
-        "p95_ns",
-        "p95_µs",
-        "p99_ns",
-        "p99_µs",
-        "mean_ns",
-        "mean_µs",
-        "throughput",
-    });
-    for (iteration_counts) |n| {
-        const stats = try timeQuery(
-            std.testing.allocator,
-            io,
-            n,
-            queries.query_avg_window,
-            .{ &world_hier, @as(u32, 0), @as(u32, 24) },
-        );
-        std.debug.print("{d:>10} {d:>12} {d:>8.1} {d:>12} {d:>8.1} {d:>12} {d:>8.1} {d:>12} {d:>8.1} {d:>12.0}ops/s\n", .{
-            stats.iterations,
-            stats.median_ns,
-            nsToUs(stats.median_ns),
-            stats.p95_ns,
-            nsToUs(stats.p95_ns),
-            stats.p99_ns,
-            nsToUs(stats.p99_ns),
-            stats.mean_ns,
-            nsToUs(stats.mean_ns),
-            stats.throughputOpsPerSec(),
-        });
-        try std.testing.expectEqual(n, stats.iterations);
-        try std.testing.expect(stats.p95_ns >= stats.median_ns);
-        try std.testing.expect(stats.p99_ns >= stats.p95_ns);
-    }
-    std.debug.print("\n--- RingBuffer ---\n", .{});
-    std.debug.print("{s:>10} {s:>12} {s:>8} {s:>12} {s:>8} {s:>12} {s:>8} {s:>12} {s:>8} {s:>14}\n", .{
-        "iters",      "median_ns",
-        "med_µs",
-        "p95_ns",
-        "p95_µs",
-        "p99_ns",
-        "p99_µs",
-        "mean_ns",
-        "mean_µs",
-        "throughput",
-    });
-    for (iteration_counts) |n| {
-        const stats = try timeQuery(
-            std.testing.allocator,
-            io,
-            n,
-            queries.query_avg_window,
-            .{ &world_rb, @as(u32, 0), @as(u32, 24) },
-        );
-        std.debug.print("{d:>10} {d:>12} {d:>8.1} {d:>12} {d:>8.1} {d:>12} {d:>8.1} {d:>12} {d:>8.1} {d:>12.0}ops/s\n", .{
-            stats.iterations,
-            stats.median_ns,
-            nsToUs(stats.median_ns),
-            stats.p95_ns,
-            nsToUs(stats.p95_ns),
-            stats.p99_ns,
-            nsToUs(stats.p99_ns),
-            stats.mean_ns,
-            nsToUs(stats.mean_ns),
-            stats.throughputOpsPerSec(),
-        });
-        try std.testing.expectEqual(n, stats.iterations);
-        try std.testing.expect(stats.p95_ns >= stats.median_ns);
-        try std.testing.expect(stats.p99_ns >= stats.p95_ns);
-    }
     std.debug.print("\n=== end scaling ===\n", .{});
+}
+
+// ---------------------------------------------------------------------------
+// timeQuery / LatencyStats math — fast, deterministic edge cases that don't
+// need real backend timing noise to exercise. None of these existed before:
+// the only prior coverage of percentile math was incidental, buried inside
+// the 100k-iteration scaling test above.
+// ---------------------------------------------------------------------------
+
+fn constOneNs(_: *u32) !void {}
+
+test "timeQuery at iterations=1: median, p95, p99, min, and max all collapse to the single sample" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var dummy: u32 = 0;
+    const stats = try timeQuery(std.testing.allocator, io, 1, constOneNs, .{&dummy});
+
+    try std.testing.expectEqual(@as(u32, 1), stats.iterations);
+    try std.testing.expectEqual(stats.median_ns, stats.p95_ns);
+    try std.testing.expectEqual(stats.median_ns, stats.p99_ns);
+    try std.testing.expectEqual(stats.median_ns, stats.min_ns);
+    try std.testing.expectEqual(stats.median_ns, stats.max_ns);
+    try std.testing.expectEqual(stats.median_ns, stats.mean_ns);
+}
+
+test "throughputOpsPerSec returns 0.0 for non-positive total_ns instead of dividing by ~zero" {
+    const zero_total = LatencyStats{
+        .iterations = 10,
+        .median_ns = 0,
+        .p95_ns = 0,
+        .p99_ns = 0,
+        .min_ns = 0,
+        .max_ns = 0,
+        .mean_ns = 0,
+        .total_ns = 0,
+    };
+    try std.testing.expectEqual(@as(f64, 0.0), zero_total.throughputOpsPerSec());
+
+    const negative_total = LatencyStats{
+        .iterations = 10,
+        .median_ns = 0,
+        .p95_ns = 0,
+        .p99_ns = 0,
+        .min_ns = 0,
+        .max_ns = 0,
+        .mean_ns = 0,
+        .total_ns = -1,
+    };
+    try std.testing.expectEqual(@as(f64, 0.0), negative_total.throughputOpsPerSec());
+}
+
+test "mean_ns truncates toward zero rather than rounding" {
+    // 100ns over 3 iterations = 33.33...ns; divTrunc must give 33, not 34.
+    const stats = LatencyStats{
+        .iterations = 3,
+        .median_ns = 0,
+        .p95_ns = 0,
+        .p99_ns = 0,
+        .min_ns = 0,
+        .max_ns = 0,
+        .mean_ns = @divTrunc(@as(i64, 100), @as(i64, 3)),
+        .total_ns = 100,
+    };
+    try std.testing.expectEqual(@as(i64, 33), stats.mean_ns);
 }

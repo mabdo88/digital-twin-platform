@@ -1,7 +1,7 @@
 # AGENT.md — Workflow & Operating Guide
 
 This document is **for Claude (or any agent)** working on the digital twin platform.
-Read digital-twin/CLAUDE.md first — that is the law. This explains *how* to work within it.
+Read CLAUDE.md first — that is the law. This explains *how* to work within it.
 
 ---
 
@@ -128,30 +128,48 @@ matches manual inspection.
 **Goal:** Data-driven placement rules, density assumptions, and retention policies.
 
 For each building type (Hospital, Office, Warehouse, Manufacturing, Campus):
-- [ ] Define sensor density (sensors per 10m³).
-- [ ] Define sensor distribution (HVAC zones, equipment rooms, hallways, etc.).
-- [ ] Define typical query mix (cold queries for historical, hot for current state).
-- [ ] Define data retention (30 days? 1 year?).
-- [ ] Store as data (struct or JSON), not code.
+- [x] Define sensor density (sensors per 10m³). `engine/bim/profiles.zig` —
+      `*_RULES` per building type (density_per_100m2 per element/sensor type).
+- [x] Define sensor distribution (HVAC zones, equipment rooms, hallways, etc.).
+      Same `*_RULES` tables — which `ElementType`s host which `SensorType`s.
+- [x] Define typical query mix (cold queries for historical, hot for current state).
+      `*_QUERY_MIX` tables (`QueryWeight{ query, weight, hot }`).
+- [x] Define data retention (30 days? 1 year?). `retention_days` per profile.
+- [x] Store as data (struct or JSON), not code. `getProfile` is a pure table
+      lookup; no branching on building type anywhere else.
 
 Use this in sensor placement: given a building type and a raw IFC, place sensors
-per the profile.
+per the profile. `profile.rules` slots directly into `sensor_placer.PlacementConfig`
+(tested in profiles.zig).
+
+`query_mix` is consumed by `engine/benchmark/report.zig`'s `recommendBackend` —
+weights each profile's queries by importance and ranks backends by how close
+they come to the per-query winner across that weighted mix (added 2026-06-29,
+closing the gap the roadoc tracked as "5.2 — depends on Phase 7"; it only
+needed report.zig's existing per-query latency data, not a $-cost model).
 
 **Hand off when:** Profiles for 5 building types exist, placement is reproducible
-per profile, and reports show per-building-type recommendations.
+per profile, and reports show per-building-type recommendations. ✅ All met —
+see "Recommended Backend by Building Type" in `benchmark-results/latency.md`.
 
 ---
 
 ### Phase 6: Synthetic Data Generator
 **Goal:** Realistic, deterministic sensor readings for any building type.
 
-- [ ] Core generator: statistical models per sensor type (temperature, humidity,
-      power, occupancy).
-- [ ] Determinism: seed the RNG at the start; same seed → same readings.
-- [ ] Physical plausibility: readings respect bounds (temp 0–50°C, humidity 0–100%),
-      daily patterns, equipment off-hours.
-- [ ] Validator: check readings against physical bounds and daily patterns.
-- [ ] Scale to 100,000 sensors (Phase 1 ceiling).
+- [x] Core generator: statistical models per sensor type (temperature, humidity,
+      power, occupancy). `engine/synthetic/generator.zig` — one `SensorProfile`
+      row per `SensorType` (data, not branching code).
+- [x] Determinism: seed the RNG at the start; same seed → same readings.
+- [x] Physical plausibility: readings respect bounds (temp 0–50°C, humidity 0–100%),
+      daily patterns, equipment off-hours. Modeled as one sine wave per sensor
+      type (peak hour + amplitude) clamped to a physical floor/ceiling — a
+      high-amplitude profile's trough IS the equipment-off-hours signal.
+- [x] Validator: check readings against physical bounds and daily patterns.
+      `engine/synthetic/validator.zig` — `validateBounds` + `hasDailyPattern`.
+- [x] Scale to 100,000 sensors (Phase 1 ceiling) — generator-level test only;
+      the full ingest+query benchmark pipeline has not been run at 100K
+      sensors (current scale tiers top out at 100 sensors / 50K readings).
 
 **Hand off when:** Generator produces realistic data, is deterministic, passes validator,
 and benchmarks scale to 100K sensors without memory blowup.
@@ -277,7 +295,7 @@ When you finish a phase:
 
 ## 10. When you're stuck
 
-- **Reread digital-twin/CLAUDE.md.** Violations of the non-negotiables are common mistakes.
+- **Reread CLAUDE.md.** Violations of the non-negotiables are common mistakes.
 - **Check the folder structure.** Files go in specific places.
 - **Golden-result test first.** Write the test before the backend.
 - **Start with stubs.** Implement the interface, then fill it in.

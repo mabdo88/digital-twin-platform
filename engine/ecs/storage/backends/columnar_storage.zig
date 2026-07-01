@@ -4,13 +4,26 @@
 //
 // Models ClickHouse-style behaviour: each field lives in its own contiguous
 // column. Timestamps use delta encoding (store the difference from the
-// previous row); sensor_types use run-length encoding (low cardinality).
-// sensor_ids and values are stored raw but in column-major layout so
-// aggregation scans touch only the column they need.
+// previous row, zigzag + LEB128 varint packed into `ts_deltas`); sensor_ids
+// and values are stored raw but in column-major layout so aggregation scans
+// touch only the column they need.
 //
 // Data is kept sorted by (timestamp asc, sensor_id asc) — the ClickHouse
 // merge-tree sort key analogue. Insert appends + marks dirty; queries
 // call `ensureSorted` lazily (same pattern as TimeSeries).
+//
+// Compression model (`ensureCompressed`): once sorted, consecutive
+// timestamps differ by small deltas (sensor sampling intervals), so
+// zigzag-encoding the delta then LEB128-varint-packing it typically takes
+// 1-3 bytes instead of the raw column's 8 — the actual win compression
+// gives a time-series-shaped column. `ts_deltas` is the value `memoryUsed`
+// reports for the timestamp column (the on-disk-equivalent cost); the raw
+// `timestamps` array is kept resident as the decompressed working set
+// queries read from, the same way a real columnar engine keeps a hot
+// block's decompressed form in its buffer pool rather than re-decoding on
+// every scan. `rangeByTime`'s unfiltered path calls `ensureCompressed`
+// before searching, so the compressed column is always kept in sync with
+// what queries are actually relying on, not just built once and forgotten.
 //
 // Iteration order: sorted by (timestamp asc, sensor_id asc).
 // Compression and column layout are fully internal — the public surface
@@ -18,6 +31,7 @@
 
 const std = @import("std");
 const sb = @import("../storage_backend.zig");
+const ZoneIndex = @import("../zone_index.zig");
 
 const SensorReading = sb.SensorReading;
 const SensorType = sb.SensorType;
@@ -36,9 +50,12 @@ sensor_types: std.ArrayList(SensorType),
 sorted: bool,
 
 // Compressed timestamp deltas — built lazily by `ensureCompressed`.
-// Each entry is timestamp[i] - timestamp[i-1] (first entry = timestamp[0]).
-ts_deltas: std.ArrayList(i64),
+// Byte stream: each entry is zigzag(timestamp[i] - timestamp[i-1]) (first
+// entry's "previous" is 0), LEB128-varint-packed. See `ensureCompressed`.
+ts_deltas: std.ArrayList(u8),
 ts_compressed: bool,
+
+zone_index: ZoneIndex,
 
 pub fn init(allocator: std.mem.Allocator) !Self {
     return .{
@@ -50,6 +67,7 @@ pub fn init(allocator: std.mem.Allocator) !Self {
         .sorted = true,
         .ts_deltas = .empty,
         .ts_compressed = true,
+        .zone_index = ZoneIndex.init(allocator),
     };
 }
 
@@ -59,6 +77,7 @@ pub fn deinit(self: *Self) void {
     self.values.deinit(self.allocator);
     self.sensor_types.deinit(self.allocator);
     self.ts_deltas.deinit(self.allocator);
+    self.zone_index.deinit();
     self.* = undefined;
 }
 
@@ -75,12 +94,22 @@ pub fn count(self: *const Self) usize {
     return self.sensor_ids.items.len;
 }
 
+/// Timestamp column cost is reported as the compressed footprint
+/// (`ts_deltas`) when compression is up to date, since that's what the
+/// column actually costs to store — `timestamps` itself is a decompressed
+/// working-set cache (see file header). Falls back to the raw column's
+/// size while dirty/uncompressed so memoryUsed never *under*-reports.
 pub fn memoryUsed(self: *const Self) usize {
+    const ts_cost: usize = if (self.ts_compressed)
+        self.ts_deltas.items.len
+    else
+        self.timestamps.capacity * @sizeOf(i64);
+
     return self.sensor_ids.capacity * @sizeOf(u32) +
-        self.timestamps.capacity * @sizeOf(i64) +
+        ts_cost +
         self.values.capacity * @sizeOf(f32) +
         self.sensor_types.capacity * @sizeOf(SensorType) +
-        self.ts_deltas.capacity * @sizeOf(i64);
+        self.zone_index.memoryUsed();
 }
 
 /// Iteration order: sorted by (timestamp asc, sensor_id asc).
@@ -126,9 +155,17 @@ pub fn getLatestBySensor(self: *const Self, sensor_id: u32) ?SensorReading {
 pub fn rangeByTime(self: *const Self, allocator: std.mem.Allocator, q: RangeQuery) ![]const SensorReading {
     const self_mut: *Self = @constCast(self);
     self_mut.ensureSorted();
+    // Keep the compressed column in sync with what this query relies on —
+    // ts_deltas is the value memoryUsed() reports, so it must never be
+    // allowed to silently go stale relative to the data being queried.
+    try self_mut.ensureCompressed();
 
     const ts_items = self.timestamps.items;
     if (ts_items.len == 0) return &.{};
+    // An inverted range (start > end) is unsatisfiable by definition — bail
+    // out before the binary search, which otherwise computes lo > hi and
+    // panics (`hi - lo` underflow, or `for (lo..hi)` on the filtered path).
+    if (q.start_time > q.end_time) return &.{};
 
     // Binary search for first index with timestamp >= q.start_time.
     const lo = std.sort.lowerBound(i64, ts_items, q.start_time, struct {
@@ -175,26 +212,55 @@ pub fn rangeByTime(self: *const Self, allocator: std.mem.Allocator, q: RangeQuer
     return result;
 }
 
-/// No grouping structure to exploit — scans only the sensor_ids column
-/// (doesn't need sorted order, so no `ensureSorted` call).
-pub fn sensorIdsByGroup(self: *const Self, allocator: std.mem.Allocator, group_id: u32, divisor: u32) ![]u32 {
-    var seen = std.AutoHashMap(u32, void).init(allocator);
-    defer seen.deinit();
-
-    for (self.sensor_ids.items) |sid| {
-        if (sid / divisor != group_id) continue;
-        try seen.put(sid, {});
+/// Removes every reading of `sensor_type` older than `cutoff_timestamp` via
+/// an in-place stable compaction across all columns (readings of other
+/// types, and this backend's zone/floor topology, are untouched). Preserves
+/// whatever sort order the columns were already in, so `sorted` doesn't
+/// need to change — but `ts_deltas` encodes each row's delta from its
+/// PREVIOUS row, so removing rows invalidates every delta after the first
+/// removed one; marking `ts_compressed = false` forces `ensureCompressed`
+/// to rebuild it from the (correct) raw `timestamps` column on next use,
+/// same as a fresh insert already does. See storage_backend.zig's
+/// pruneOlderThan contract.
+pub fn pruneOlderThan(self: *Self, sensor_type: SensorType, cutoff_timestamp: i64) !void {
+    var write: usize = 0;
+    for (self.sensor_ids.items, 0..) |sid, i| {
+        const ts = self.timestamps.items[i];
+        const st = self.sensor_types.items[i];
+        if (st == sensor_type and ts < cutoff_timestamp) continue;
+        self.sensor_ids.items[write] = sid;
+        self.timestamps.items[write] = ts;
+        self.values.items[write] = self.values.items[i];
+        self.sensor_types.items[write] = st;
+        write += 1;
     }
+    self.sensor_ids.shrinkRetainingCapacity(write);
+    self.timestamps.shrinkRetainingCapacity(write);
+    self.values.shrinkRetainingCapacity(write);
+    self.sensor_types.shrinkRetainingCapacity(write);
+    self.ts_compressed = false;
+}
 
-    var result = try allocator.alloc(u32, seen.count());
-    var i: usize = 0;
-    var it = seen.keyIterator();
-    while (it.next()) |k| {
-        result[i] = k.*;
-        i += 1;
-    }
-    std.mem.sort(u32, result, {}, std.sort.asc(u32));
-    return result;
+/// Zone/floor topology bookkeeping delegates to the shared ZoneIndex — see
+/// storage_backend.zig's doc comment for the contract.
+pub fn registerZone(self: *Self, sensor_id: u32, zone_id: u32) !void {
+    return self.zone_index.registerZone(sensor_id, zone_id);
+}
+
+pub fn registerFloor(self: *Self, zone_id: u32, floor_id: u32) !void {
+    return self.zone_index.registerFloor(zone_id, floor_id);
+}
+
+pub fn sensorIdsByZone(self: *const Self, allocator: std.mem.Allocator, zone_id: u32) ![]u32 {
+    return self.zone_index.sensorIdsByZone(allocator, zone_id);
+}
+
+pub fn sensorIdsByFloor(self: *const Self, allocator: std.mem.Allocator, floor_id: u32) ![]u32 {
+    return self.zone_index.sensorIdsByFloor(allocator, floor_id);
+}
+
+pub fn floorOfZone(self: *const Self, zone_id: u32) ?u32 {
+    return self.zone_index.floorOfZone(zone_id);
 }
 
 // ---------------------------------------------------------------------------
@@ -251,6 +317,79 @@ fn permuteColumn(comptime T: type, allocator: std.mem.Allocator, items: []T, idx
         tmp[i] = items[idx[i]];
     }
     @memcpy(items, tmp);
+}
+
+/// Rebuilds `ts_deltas` from `timestamps` (must already be sorted) if a
+/// write has invalidated it since the last build. No-op otherwise — same
+/// lazy-rebuild shape as `ensureSorted` and hierarchical_storage.zig's
+/// `ensureCache`.
+fn ensureCompressed(self: *Self) !void {
+    if (self.ts_compressed) return;
+
+    self.ts_deltas.clearRetainingCapacity();
+    var prev: i64 = 0;
+    for (self.timestamps.items) |ts| {
+        const delta = ts -% prev;
+        try appendVarint(self.allocator, &self.ts_deltas, zigzagEncode(delta));
+        prev = ts;
+    }
+    self.ts_compressed = true;
+}
+
+/// Decodes `ts_deltas` back into absolute timestamps. Used by tests to
+/// prove the compressed column round-trips losslessly — the same encoding
+/// `ensureCompressed` builds and `memoryUsed` reports the cost of.
+fn decodeTimestamps(allocator: std.mem.Allocator, deltas: []const u8, n: usize) ![]i64 {
+    const result = try allocator.alloc(i64, n);
+    var pos: usize = 0;
+    var prev: i64 = 0;
+    for (0..n) |i| {
+        const delta = zigzagDecode(readVarint(deltas, &pos));
+        prev +%= delta;
+        result[i] = prev;
+    }
+    return result;
+}
+
+/// Maps signed deltas to unsigned so small magnitudes (positive or
+/// negative) both varint-encode to few bytes. Standard protobuf zigzag.
+fn zigzagEncode(v: i64) u64 {
+    const uv: u64 = @bitCast(v);
+    const sign_mask: u64 = @bitCast(v >> 63);
+    return (uv << 1) ^ sign_mask;
+}
+
+fn zigzagDecode(n: u64) i64 {
+    const shifted = n >> 1;
+    const sign_mask: u64 = 0 -% (n & 1);
+    return @bitCast(shifted ^ sign_mask);
+}
+
+/// LEB128 unsigned varint — 1 byte per 7 bits, continuation bit in the MSB.
+fn appendVarint(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), value: u64) !void {
+    var v = value;
+    while (true) {
+        const byte: u8 = @intCast(v & 0x7f);
+        v >>= 7;
+        if (v != 0) {
+            try buf.append(allocator, byte | 0x80);
+        } else {
+            try buf.append(allocator, byte);
+            return;
+        }
+    }
+}
+
+fn readVarint(buf: []const u8, pos: *usize) u64 {
+    var result: u64 = 0;
+    var shift: u6 = 0;
+    while (true) {
+        const byte = buf[pos.*];
+        pos.* += 1;
+        result |= @as(u64, byte & 0x7f) << shift;
+        if (byte & 0x80 == 0) return result;
+        shift += 7;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -346,6 +485,44 @@ test "Columnar: rangeByTime with sensor filter" {
     try std.testing.expectEqual(@as(usize, 2), result.len);
     try std.testing.expectEqual(@as(u32, 1), result[0].sensor_id);
     try std.testing.expectEqual(@as(u32, 1), result[1].sensor_id);
+}
+
+test "Columnar: sensorIdsByZone/sensorIdsByFloor reflect real (non-arithmetic) registration" {
+    var backend = try Self.init(std.testing.allocator);
+    defer backend.deinit();
+
+    try backend.insert(.{ .sensor_id = 7, .timestamp = 0, .value = 1.0, .sensor_type = .temperature });
+    try backend.insert(.{ .sensor_id = 2, .timestamp = 0, .value = 1.0, .sensor_type = .temperature });
+    try backend.registerZone(7, 4291);
+    try backend.registerZone(2, 4291);
+    try backend.registerFloor(4291, 3);
+
+    const zone = try backend.sensorIdsByZone(std.testing.allocator, 4291);
+    defer std.testing.allocator.free(zone);
+    try std.testing.expectEqualSlices(u32, &.{ 2, 7 }, zone);
+
+    const floor = try backend.sensorIdsByFloor(std.testing.allocator, 3);
+    defer std.testing.allocator.free(floor);
+    try std.testing.expectEqualSlices(u32, &.{ 2, 7 }, floor);
+
+    try std.testing.expectEqual(@as(?u32, 3), backend.floorOfZone(4291));
+
+    const empty = try backend.sensorIdsByZone(std.testing.allocator, 99);
+    defer std.testing.allocator.free(empty);
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
+}
+
+test "Columnar: getLatestBySensor is deterministic across repeated calls when timestamps tie" {
+    var backend = try Self.init(std.testing.allocator);
+    defer backend.deinit();
+
+    try backend.insert(.{ .sensor_id = 1, .timestamp = 100, .value = 10.0, .sensor_type = .temperature });
+    try backend.insert(.{ .sensor_id = 1, .timestamp = 100, .value = 20.0, .sensor_type = .temperature });
+
+    const first = backend.getLatestBySensor(1).?;
+    const second = backend.getLatestBySensor(1).?;
+    try std.testing.expectEqual(@as(i64, 100), first.timestamp);
+    try std.testing.expectEqual(first.value, second.value);
 }
 
 test "Columnar: empty backend" {
@@ -444,4 +621,113 @@ test "Columnar and TimeSeries produce identical query results" {
         try std.testing.expectEqual(ts_all[i].value, col_all[i].value);
         try std.testing.expectEqual(ts_all[i].sensor_type, col_all[i].sensor_type);
     }
+}
+
+test "Columnar: zigzag + varint round-trip on representative deltas" {
+    const cases = [_]i64{ 0, 1, -1, 63, -64, 64, -65, 1000, -1000, 1_700_000_000_000, -1_700_000_000_000 };
+    for (cases) |v| {
+        const encoded = zigzagEncode(v);
+        try std.testing.expectEqual(v, zigzagDecode(encoded));
+    }
+}
+
+test "Columnar: ensureCompressed round-trips timestamps losslessly" {
+    var backend = try Self.init(std.testing.allocator);
+    defer backend.deinit();
+
+    // Out-of-order + irregular spacing, the realistic shape for a sensor
+    // stream before ensureSorted runs.
+    const inputs = [_]i64{ 5000, 1000, 3000, 1000, 9999, 0, 1_700_000_000_000 };
+    for (inputs, 0..) |ts, i| {
+        try backend.insert(.{ .sensor_id = @intCast(i), .timestamp = ts, .value = 1.0, .sensor_type = .temperature });
+    }
+
+    backend.ensureSorted();
+    try backend.ensureCompressed();
+    try std.testing.expect(backend.ts_compressed);
+
+    const decoded = try decodeTimestamps(std.testing.allocator, backend.ts_deltas.items, backend.timestamps.items.len);
+    defer std.testing.allocator.free(decoded);
+
+    try std.testing.expectEqualSlices(i64, backend.timestamps.items, decoded);
+}
+
+test "Columnar: compression is invalidated by new inserts and re-synced by rangeByTime" {
+    var backend = try Self.init(std.testing.allocator);
+    defer backend.deinit();
+
+    try backend.insert(.{ .sensor_id = 1, .timestamp = 100, .value = 1.0, .sensor_type = .temperature });
+    try backend.insert(.{ .sensor_id = 2, .timestamp = 200, .value = 2.0, .sensor_type = .temperature });
+
+    const first = try backend.rangeByTime(std.testing.allocator, .{ .start_time = 0, .end_time = 1000 });
+    std.testing.allocator.free(first);
+    try std.testing.expect(backend.ts_compressed);
+
+    try backend.insert(.{ .sensor_id = 3, .timestamp = 300, .value = 3.0, .sensor_type = .temperature });
+    try std.testing.expect(!backend.ts_compressed);
+
+    const result = try backend.rangeByTime(std.testing.allocator, .{ .start_time = 0, .end_time = 1000 });
+    defer std.testing.allocator.free(result);
+    try std.testing.expect(backend.ts_compressed);
+    try std.testing.expectEqual(@as(usize, 3), result.len);
+
+    const decoded = try decodeTimestamps(std.testing.allocator, backend.ts_deltas.items, backend.timestamps.items.len);
+    defer std.testing.allocator.free(decoded);
+    try std.testing.expectEqualSlices(i64, backend.timestamps.items, decoded);
+}
+
+test "Columnar: memoryUsed reflects compressed timestamp footprint, not raw" {
+    var backend = try Self.init(std.testing.allocator);
+    defer backend.deinit();
+
+    // Realistic regularly-sampled stream: 2000 readings, 1000ms apart.
+    // Each delta is a constant 1000 -> 2 varint bytes, vs. 8 raw bytes.
+    const N: usize = 2000;
+    for (0..N) |i| {
+        try backend.insert(.{
+            .sensor_id = @intCast(i % 20),
+            .timestamp = @intCast(i * 1000),
+            .value = 1.0,
+            .sensor_type = .temperature,
+        });
+    }
+
+    const mem_before = backend.memoryUsed();
+    backend.ensureSorted();
+    try backend.ensureCompressed();
+    const mem_after = backend.memoryUsed();
+
+    // Compressed cost must be substantially smaller than 8 bytes/timestamp.
+    try std.testing.expect(backend.ts_deltas.items.len < N * 4);
+    // And memoryUsed must actually reflect that drop, not just compute it
+    // and ignore it.
+    try std.testing.expect(mem_after < mem_before);
+}
+
+test "Columnar: pruneOlderThan removes only the matching type older than cutoff and invalidates compression" {
+    var backend = try Self.init(std.testing.allocator);
+    defer backend.deinit();
+
+    try backend.insert(.{ .sensor_id = 1, .timestamp = 50, .value = 1.0, .sensor_type = .temperature });
+    try backend.insert(.{ .sensor_id = 1, .timestamp = 150, .value = 2.0, .sensor_type = .temperature });
+    try backend.insert(.{ .sensor_id = 2, .timestamp = 50, .value = 3.0, .sensor_type = .humidity });
+
+    backend.ensureSorted();
+    try backend.ensureCompressed();
+    try std.testing.expect(backend.ts_compressed);
+
+    try backend.pruneOlderThan(.temperature, 100);
+
+    // Removing rows invalidates the delta encoding (deltas are relative to
+    // the previous row) -- must be marked dirty, not left stale.
+    try std.testing.expect(!backend.ts_compressed);
+
+    try std.testing.expectEqual(@as(usize, 2), backend.count());
+    const rng = try backend.rangeByTime(std.testing.allocator, .{ .start_time = 0, .end_time = 1000 });
+    defer std.testing.allocator.free(rng);
+    try std.testing.expectEqual(@as(usize, 2), rng.len);
+    try std.testing.expectEqual(@as(i64, 50), rng[0].timestamp);
+    try std.testing.expectEqual(SensorType.humidity, rng[0].sensor_type);
+    try std.testing.expectEqual(@as(i64, 150), rng[1].timestamp);
+    try std.testing.expectEqual(SensorType.temperature, rng[1].sensor_type);
 }

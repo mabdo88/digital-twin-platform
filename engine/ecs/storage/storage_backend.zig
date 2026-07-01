@@ -81,7 +81,12 @@ pub fn assertImplements(comptime T: type) void {
     if (!@hasDecl(T, "iterateAll")) @compileError("StorageBackend: " ++ @typeName(T) ++ " missing pub fn iterateAll");
     if (!@hasDecl(T, "getLatestBySensor")) @compileError("StorageBackend: " ++ @typeName(T) ++ " missing pub fn getLatestBySensor");
     if (!@hasDecl(T, "rangeByTime")) @compileError("StorageBackend: " ++ @typeName(T) ++ " missing pub fn rangeByTime");
-    if (!@hasDecl(T, "sensorIdsByGroup")) @compileError("StorageBackend: " ++ @typeName(T) ++ " missing pub fn sensorIdsByGroup");
+    if (!@hasDecl(T, "registerZone")) @compileError("StorageBackend: " ++ @typeName(T) ++ " missing pub fn registerZone");
+    if (!@hasDecl(T, "registerFloor")) @compileError("StorageBackend: " ++ @typeName(T) ++ " missing pub fn registerFloor");
+    if (!@hasDecl(T, "sensorIdsByZone")) @compileError("StorageBackend: " ++ @typeName(T) ++ " missing pub fn sensorIdsByZone");
+    if (!@hasDecl(T, "sensorIdsByFloor")) @compileError("StorageBackend: " ++ @typeName(T) ++ " missing pub fn sensorIdsByFloor");
+    if (!@hasDecl(T, "floorOfZone")) @compileError("StorageBackend: " ++ @typeName(T) ++ " missing pub fn floorOfZone");
+    if (!@hasDecl(T, "pruneOlderThan")) @compileError("StorageBackend: " ++ @typeName(T) ++ " missing pub fn pruneOlderThan");
 }
 
 // ---------------------------------------------------------------------------
@@ -150,31 +155,77 @@ pub fn assertImplements(comptime T: type) void {
 //      with `allocator`.
 //      Empty behaviour: returns an empty slice (&.{}).
 //
-//  pub fn sensorIdsByGroup(self: *const T, allocator: std.mem.Allocator, group_id: u32, divisor: u32) ![]u32
+//  pub fn registerZone(self: *T, sensor_id: u32, zone_id: u32) !void
 //
-//      Return every DISTINCT sensor_id with at least one stored reading
-//      where `sensor_id / divisor == group_id`. This is the generic
-//      "give me every sensor under this branch of the zone/floor tree"
-//      primitive backing hierarchy queries (Q10) — it exists so a query
-//      can express "which sensors are in this group" WITHOUT calling
-//      iterateAll() and filtering client-side, which would force every
-//      backend through a full scan regardless of how it organises data
-//      internally.
+//      Record which zone a sensor lives in. This is TOPOLOGY, not a
+//      reading: it comes from real placement data (sensor_placer.zig's
+//      ZoneLocation for a real building, or a synthetic equivalent for
+//      benchmark fixtures) and is established once per sensor, decoupled
+//      from how many readings that sensor later produces. There is
+//      deliberately NO arithmetic relationship between sensor_id and
+//      zone_id assumed anywhere in this interface — a real building's
+//      zones hold a variable number of sensors with arbitrary IDs (the
+//      source IFC entity id), not a fixed-width block.
+//      Calling this again for the same sensor_id moves it to the new
+//      zone_id (last write wins). Safe to call before or after any
+//      `insert` for that sensor.
+//      May fail on allocation.
 //
-//      Most backends implement this as a linear scan + filter (the same
-//      cost as iterateAll, since they have no grouping structure to
-//      exploit). A backend that internally partitions data by sensor_id
-//      division (e.g. a backend with a Floor/Zone tree) can instead walk
-//      directly to the matching node(s) and read off just that subtree's
-//      leaves — touching a fraction of the dataset instead of all of it.
-//      `divisor` is an arbitrary caller-supplied grouping width; backends
-//      MUST return correct results for any divisor (falling back to a
-//      scan when it doesn't match their internal partitioning), not just
-//      the values their own internal structure happens to use.
+//  pub fn registerFloor(self: *T, zone_id: u32, floor_id: u32) !void
+//
+//      Record which floor a zone belongs to. One call per zone (not per
+//      sensor) — floor membership is a property of the zone, mirroring
+//      ZoneMetadata.floor_level in the real BIM pipeline. Calling this
+//      again for the same zone_id moves it to the new floor_id.
+//      May fail on allocation.
+//
+//  pub fn sensorIdsByZone(self: *const T, allocator: std.mem.Allocator, zone_id: u32) ![]u32
+//
+//      Every DISTINCT sensor_id registered (via registerZone) under
+//      zone_id. A backend that indexes by zone internally (e.g. a
+//      Floor/Zone tree) can walk straight to that subtree; others scan
+//      their zone registrations (cheap: one entry per sensor, not per
+//      reading).
 //      Results are sorted by sensor_id ascending.
 //      Ownership: the caller owns the returned slice and must free it
 //      with `allocator`.
-//      Empty behaviour: returns an empty slice (&.{}).
+//      Empty behaviour: returns an empty slice (&.{}) — including for a
+//      zone_id nothing was ever registered under. Not an error.
+//
+//  pub fn sensorIdsByFloor(self: *const T, allocator: std.mem.Allocator, floor_id: u32) ![]u32
+//
+//      Every DISTINCT sensor_id registered under any zone whose
+//      registerFloor call named this floor_id.
+//      Results are sorted by sensor_id ascending.
+//      Ownership/empty behaviour: same as sensorIdsByZone.
+//
+//  pub fn floorOfZone(self: *const T, zone_id: u32) ?u32
+//
+//      The floor_id most recently registered (via registerFloor) for
+//      zone_id, or null if that zone has never been registered to a
+//      floor. No allocation — a value lookup, like getLatestBySensor.
+//
+//  pub fn pruneOlderThan(self: *T, sensor_type: SensorType, cutoff_timestamp: i64) !void
+//
+//      Remove every stored reading of `sensor_type` whose timestamp is
+//      strictly less than `cutoff_timestamp`. Readings of other sensor
+//      types, and zone/floor topology (registerZone/registerFloor), are
+//      untouched — topology is independent of how many readings a sensor
+//      has (see registerZone's contract above).
+//
+//      This models real per-sensor-type retention: a single backend
+//      instance holds every sensor type at once, but each type's
+//      retention window differs (e.g. temperature 90 days vs. structural
+//      7 years), so the caller prunes per type with that type's own
+//      cutoff, not once globally for the whole backend.
+//
+//      Fallible like insert(): most backends compact in place with no
+//      allocation, but RingBuffer's circular layout needs a small
+//      scratch allocation (bounded by one sensor's own capacity, not the
+//      dataset) to compact safely without corrupting entries not yet
+//      read. Safe to call when no reading of that type is old enough to
+//      remove (a no-op). Does not affect readings of other sensor types
+//      or a sensor's zone/floor registration.
 
 // ---------------------------------------------------------------------------
 // Tests — verify the interface types and assertImplements compile.
@@ -226,19 +277,69 @@ const StubBackend = struct {
     pub fn rangeByTime(_: *const StubBackend, _: std.mem.Allocator, _: RangeQuery) ![]const SensorReading {
         return &.{};
     }
-    pub fn sensorIdsByGroup(_: *const StubBackend, _: std.mem.Allocator, _: u32, _: u32) ![]u32 {
+    pub fn registerZone(_: *StubBackend, _: u32, _: u32) !void {}
+    pub fn registerFloor(_: *StubBackend, _: u32, _: u32) !void {}
+    pub fn sensorIdsByZone(_: *const StubBackend, _: std.mem.Allocator, _: u32) ![]u32 {
         return &.{};
     }
+    pub fn sensorIdsByFloor(_: *const StubBackend, _: std.mem.Allocator, _: u32) ![]u32 {
+        return &.{};
+    }
+    pub fn floorOfZone(_: *const StubBackend, _: u32) ?u32 {
+        return null;
+    }
+    pub fn pruneOlderThan(_: *StubBackend, _: SensorType, _: i64) !void {}
 };
 
 test "assertImplements accepts a valid backend" {
     assertImplements(StubBackend);
 }
 
-test "assertImplements rejects a non-struct type" {
-    // This test verifies at comptime that passing a non-struct triggers
-    // a compile error. We use a comptime-only check that does not actually
-    // invoke assertImplements on the wrong type (which would stop the
-    // build). Instead we verify the function exists and is callable.
-    comptime assertImplements(StubBackend);
+/// A second stub with extra public methods beyond the required interface.
+/// CLAUDE.md §3.2 says backends should expose no extra public methods, but
+/// that's a style rule enforced by review, not by `assertImplements` itself:
+/// the check only looks for the required `@hasDecl`s, so it is purely
+/// additive and never rejects a type for having more than the interface
+/// asks for. This test documents that present (lenient) behavior so a
+/// future tightening of `assertImplements` is a deliberate decision, not an
+/// accidental regression.
+const ExtendedBackend = struct {
+    pub fn init(_: std.mem.Allocator) !ExtendedBackend {
+        return .{};
+    }
+    pub fn deinit(_: *ExtendedBackend) void {}
+    pub fn insert(_: *ExtendedBackend, _: SensorReading) !void {}
+    pub fn count(_: *const ExtendedBackend) usize {
+        return 0;
+    }
+    pub fn memoryUsed(_: *const ExtendedBackend) usize {
+        return 0;
+    }
+    pub fn iterateAll(_: *const ExtendedBackend, _: std.mem.Allocator) ![]const SensorReading {
+        return &.{};
+    }
+    pub fn getLatestBySensor(_: *const ExtendedBackend, _: u32) ?SensorReading {
+        return null;
+    }
+    pub fn rangeByTime(_: *const ExtendedBackend, _: std.mem.Allocator, _: RangeQuery) ![]const SensorReading {
+        return &.{};
+    }
+    pub fn registerZone(_: *ExtendedBackend, _: u32, _: u32) !void {}
+    pub fn registerFloor(_: *ExtendedBackend, _: u32, _: u32) !void {}
+    pub fn sensorIdsByZone(_: *const ExtendedBackend, _: std.mem.Allocator, _: u32) ![]u32 {
+        return &.{};
+    }
+    pub fn sensorIdsByFloor(_: *const ExtendedBackend, _: std.mem.Allocator, _: u32) ![]u32 {
+        return &.{};
+    }
+    pub fn floorOfZone(_: *const ExtendedBackend, _: u32) ?u32 {
+        return null;
+    }
+    pub fn pruneOlderThan(_: *ExtendedBackend, _: SensorType, _: i64) !void {}
+    // Not part of the StorageBackend interface — should not affect the check.
+    pub fn debugDump(_: *const ExtendedBackend) void {}
+};
+
+test "assertImplements ignores extra public methods beyond the interface" {
+    assertImplements(ExtendedBackend);
 }

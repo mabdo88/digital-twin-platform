@@ -6,25 +6,33 @@
 // Models graph-db behaviour: readings are stored in per-sensor leaf
 // nodes of a tree index. The zone-hierarchy query (Q10) traverses the
 // tree to collect sensors from a subtree directly (e.g. "all sensors on
-// floor 2") via `sensorIdsByGroup`, instead of scanning every reading.
+// floor 2") via `sensorIdsByZone`/`sensorIdsByFloor`, instead of scanning
+// every reading.
 //
 // The tree is an internal detail invisible to queries — the public
 // surface is exactly the StorageBackend interface. The tree makes
 // per-sensor lookups O(1) (hash map from sensor_id to leaf node) and
-// `sensorIdsByGroup` O(num_floors + num_zones_on_that_floor) instead of
-// O(num_readings) when the caller's divisor matches a tree level.
+// `sensorIdsByZone`/`sensorIdsByFloor` O(zone/floor subtree size) instead
+// of O(num_readings).
 //
-// Zone assignment (deterministic, derived from sensor_id) MUST match the
-// topology engine/benchmark/dataset.zig defines (SENSORS_PER_ZONE=5,
-// SENSORS_PER_FLOOR=10) — these are duplicated as local constants below
-// rather than imported, since storage backends sit below the benchmark
-// layer and must not depend on it. If dataset.zig's topology ever
-// changes, these constants need to change with it or the tree's fast
-// path in `sensorIdsByGroup` silently stops matching and falls back to a
-// full scan (still correct, just slower — see the `else` branch there):
-//   floor = sensor_id / SENSORS_PER_FLOOR (10)
-//   zone  = sensor_id / SENSORS_PER_ZONE (5)
-//   sensor = sensor_id (leaf)
+// Zone/floor placement is REAL topology, not sensor_id arithmetic: a
+// sensor's zone comes from `registerZone` (called once, mirroring
+// sensor_placer.zig's ZoneLocation for a real building, or a synthetic
+// equivalent for benchmark fixtures), and a zone's floor comes from
+// `registerFloor` (mirroring ZoneMetadata.floor_level). There is
+// deliberately no arithmetic relationship assumed between sensor_id and
+// zone_id anywhere in this file — a real building's zones hold a variable
+// number of sensors with arbitrary ids (the source IFC entity id), not a
+// fixed-width block. (An earlier version of this file derived zone/floor
+// from `sensor_id / 5` / `sensor_id / 10`, duplicated from
+// engine/benchmark/dataset.zig's synthetic fixture — that only ever
+// matched the benchmark's own made-up topology, never a real building's.)
+//
+// `insert` doesn't need to know a sensor's zone: a sensor with no
+// registration yet gets a leaf parented under `unassigned_zone` (itself
+// under root), and `registerZone`/`registerFloor` re-parent nodes into
+// the right place whenever they're called, in either order, relative to
+// `insert`.
 //
 // Iteration order: sorted by (timestamp asc, sensor_id asc). The sorted
 // view is cached and only rebuilt when `insert` has run since the last
@@ -40,32 +48,42 @@ const SensorReading = sb.SensorReading;
 const SensorType = sb.SensorType;
 const RangeQuery = sb.RangeQuery;
 
-/// Tree topology — must match engine/benchmark/dataset.zig. See file
-/// header comment for why these are duplicated rather than imported.
-const SENSORS_PER_ZONE: u32 = 5;
-const SENSORS_PER_FLOOR: u32 = 10;
-
 const Self = @This();
 
-// Tree node — represents a Floor or Zone, or a Sensor leaf.
-// Internal only; never exposed through the interface.
+// Tree node — represents a Floor, a Zone, or a Sensor leaf, or one of the
+// two "unassigned" catch-all buckets. Internal only; never exposed
+// through the interface. `key` means: for a Floor node, its floor_id; for
+// a Zone node, its zone_id; for a Sensor leaf, its sensor_id. Unused
+// (0) for root and the two unassigned buckets, which are found via
+// dedicated fields, never by key lookup.
 const Node = struct {
     parent: ?u32,
     children: std.ArrayList(u32),
     readings: ?std.ArrayList(SensorReading),
     sensor_id: ?u32,
-    zone_key: u32,
+    key: u32,
     /// Latest reading by timestamp for this leaf, maintained incrementally
     /// on insert (same pattern ringbuffer_storage.zig's SensorBuffer.latest
     /// already uses) so getLatestBySensor is O(1) instead of O(readings on
-    /// this leaf). Null for non-leaf (Floor/Zone) nodes.
+    /// this leaf). Null for non-leaf nodes.
     latest: ?SensorReading,
 };
 
 allocator: std.mem.Allocator,
 nodes: std.ArrayList(Node),
 sensor_to_node: std.AutoHashMap(u32, u32),
+/// zone_id -> node index, for direct (non-scanning) lookup in registerZone
+/// and sensorIdsByZone.
+zone_to_node: std.AutoHashMap(u32, u32),
+/// floor_id -> node index, same purpose for floors.
+floor_to_node: std.AutoHashMap(u32, u32),
 root: u32,
+/// Holds leaves for sensors that have been inserted but never registered
+/// to a zone via registerZone.
+unassigned_zone: u32,
+/// Holds zone nodes that have been created (via registerZone) but never
+/// registered to a floor via registerFloor.
+unassigned_floor: u32,
 total_count: usize,
 
 /// Flattened, timestamp-sorted view of every reading — rebuilt lazily by
@@ -81,21 +99,39 @@ pub fn init(allocator: std.mem.Allocator) !Self {
         .allocator = allocator,
         .nodes = .empty,
         .sensor_to_node = std.AutoHashMap(u32, u32).init(allocator),
+        .zone_to_node = std.AutoHashMap(u32, u32).init(allocator),
+        .floor_to_node = std.AutoHashMap(u32, u32).init(allocator),
         .root = 0,
+        .unassigned_zone = 0,
+        .unassigned_floor = 0,
         .total_count = 0,
         .sorted_cache = .empty,
         .cache_valid = true,
     };
-    try self.nodes.append(allocator, .{
-        .parent = null,
+
+    try self.nodes.append(allocator, emptyNode(null, 0));
+    self.root = 0;
+
+    try self.nodes.append(allocator, emptyNode(self.root, 0));
+    self.unassigned_floor = 1;
+    try self.nodes.items[self.root].children.append(allocator, self.unassigned_floor);
+
+    try self.nodes.append(allocator, emptyNode(self.root, 0));
+    self.unassigned_zone = 2;
+    try self.nodes.items[self.root].children.append(allocator, self.unassigned_zone);
+
+    return self;
+}
+
+fn emptyNode(parent: ?u32, key: u32) Node {
+    return .{
+        .parent = parent,
         .children = .empty,
         .readings = null,
         .sensor_id = null,
-        .zone_key = 0,
+        .key = key,
         .latest = null,
-    });
-    self.root = 0;
-    return self;
+    };
 }
 
 pub fn deinit(self: *Self) void {
@@ -107,12 +143,14 @@ pub fn deinit(self: *Self) void {
     }
     self.nodes.deinit(self.allocator);
     self.sensor_to_node.deinit();
+    self.zone_to_node.deinit();
+    self.floor_to_node.deinit();
     self.sorted_cache.deinit(self.allocator);
     self.* = undefined;
 }
 
 pub fn insert(self: *Self, reading: SensorReading) !void {
-    const leaf_idx = try self.ensureSensorPath(reading.sensor_id);
+    const leaf_idx = try self.ensureLeaf(reading.sensor_id);
     const node = &self.nodes.items[leaf_idx];
     if (node.readings == null) {
         node.readings = .empty;
@@ -138,6 +176,8 @@ pub fn memoryUsed(self: *const Self) usize {
         }
     }
     total += self.sensor_to_node.capacity() * (@sizeOf(u32) + @sizeOf(u32));
+    total += self.zone_to_node.capacity() * (@sizeOf(u32) + @sizeOf(u32));
+    total += self.floor_to_node.capacity() * (@sizeOf(u32) + @sizeOf(u32));
     total += self.sorted_cache.capacity * @sizeOf(SensorReading);
     return total;
 }
@@ -212,6 +252,10 @@ pub fn rangeByTime(self: *const Self, allocator: std.mem.Allocator, q: RangeQuer
     try self_mut.ensureCache();
     const items = self.sorted_cache.items;
     if (items.len == 0) return &.{};
+    // An inverted range (start > end) is unsatisfiable by definition — bail
+    // out before the binary search, which otherwise computes lo > hi and
+    // panics on `hi - lo` underflowing below.
+    if (q.start_time > q.end_time) return &.{};
 
     const lo = std.sort.lowerBound(SensorReading, items, q.start_time, struct {
         fn cmp(ctx: i64, item: SensorReading) std.math.Order {
@@ -229,43 +273,99 @@ pub fn rangeByTime(self: *const Self, allocator: std.mem.Allocator, q: RangeQuer
     return result;
 }
 
-/// See storage_backend.zig's doc comment for the contract. Fast path: when
-/// `divisor` matches one of this tree's own levels (Zone or Floor), walk
-/// directly to the matching node and collect its leaf sensor_ids — never
-/// touching nodes outside that subtree. Any other divisor falls back to a
-/// full scan (still correct, just without the shortcut).
-pub fn sensorIdsByGroup(self: *const Self, allocator: std.mem.Allocator, group_id: u32, divisor: u32) ![]u32 {
+/// See storage_backend.zig's doc comment for the contract. Creates the
+/// sensor's leaf if it doesn't exist yet (registerZone may run before any
+/// insert for that sensor), then re-parents it under the zone node
+/// (creating that too if needed, initially under unassigned_floor until
+/// registerFloor names its real floor).
+pub fn registerZone(self: *Self, sensor_id: u32, zone_id: u32) !void {
+    const leaf_idx = try self.ensureLeaf(sensor_id);
+    const zone_idx = try self.ensureZoneNode(zone_id);
+    try self.reparent(leaf_idx, zone_idx);
+}
+
+/// See storage_backend.zig's doc comment for the contract. One call per
+/// zone (not per sensor) — re-parents the zone node under the floor node.
+pub fn registerFloor(self: *Self, zone_id: u32, floor_id: u32) !void {
+    const zone_idx = try self.ensureZoneNode(zone_id);
+    const floor_idx = try self.ensureFloorNode(floor_id);
+    try self.reparent(zone_idx, floor_idx);
+}
+
+pub fn floorOfZone(self: *const Self, zone_id: u32) ?u32 {
+    const zone_idx = self.zone_to_node.get(zone_id) orelse return null;
+    const floor_node = self.nodes.items[zone_idx].parent orelse return null;
+    if (floor_node == self.unassigned_floor) return null;
+    return self.nodes.items[floor_node].key;
+}
+
+/// Removes every reading of `sensor_type` older than `cutoff_timestamp`,
+/// per sensor leaf, via the same in-place stable compaction the flat
+/// backends use — readings live per-leaf here, so each leaf's own
+/// `readings` list is compacted independently. `latest` is recomputed from
+/// the surviving readings only if the previous latest reading was itself
+/// pruned (cheap: bounded by that one sensor's own remaining reading
+/// count, not the tree). Tree structure, zone/floor topology, and
+/// `sensor_to_node`/`zone_to_node`/`floor_to_node` are untouched — pruning
+/// only ever removes readings, never a sensor's place in the tree. See
+/// storage_backend.zig's pruneOlderThan contract.
+pub fn pruneOlderThan(self: *Self, sensor_type: SensorType, cutoff_timestamp: i64) !void {
+    for (self.nodes.items) |*node| {
+        if (node.readings == null) continue;
+        const readings = &node.readings.?;
+        var write: usize = 0;
+        var removed: usize = 0;
+        for (readings.items) |r| {
+            if (r.sensor_type == sensor_type and r.timestamp < cutoff_timestamp) {
+                removed += 1;
+                continue;
+            }
+            readings.items[write] = r;
+            write += 1;
+        }
+        if (removed == 0) continue;
+        readings.shrinkRetainingCapacity(write);
+        self.total_count -= removed;
+
+        if (node.latest) |latest| {
+            if (latest.sensor_type == sensor_type and latest.timestamp < cutoff_timestamp) {
+                var new_latest: ?SensorReading = null;
+                for (readings.items) |r| {
+                    if (new_latest == null or r.timestamp > new_latest.?.timestamp) new_latest = r;
+                }
+                node.latest = new_latest;
+            }
+        }
+    }
+    self.cache_valid = false;
+}
+
+/// Walks straight to the zone node (O(1) hashmap lookup) and collects its
+/// leaf sensor_ids — never touches nodes outside that subtree.
+pub fn sensorIdsByZone(self: *const Self, allocator: std.mem.Allocator, zone_id: u32) ![]u32 {
     var result: std.ArrayList(u32) = .empty;
     defer result.deinit(allocator);
 
-    if (divisor == SENSORS_PER_ZONE) {
-        const floor_id = group_id / (SENSORS_PER_FLOOR / SENSORS_PER_ZONE);
-        if (self.findChild(self.root, floor_id)) |floor_idx| {
-            if (self.findChild(floor_idx, group_id)) |zone_idx| {
-                try self.collectLeafSensorIds(zone_idx, &result, allocator);
-            }
-        }
-    } else if (divisor == SENSORS_PER_FLOOR) {
-        if (self.findChild(self.root, group_id)) |floor_idx| {
-            try self.collectLeafSensorIds(floor_idx, &result, allocator);
-        }
-    } else {
-        for (self.nodes.items) |node| {
-            if (node.sensor_id) |sid| {
-                if (sid / divisor == group_id) try result.append(allocator, sid);
-            }
-        }
+    if (self.zone_to_node.get(zone_id)) |zone_idx| {
+        try self.collectLeafSensorIds(zone_idx, &result, allocator);
     }
 
     std.mem.sort(u32, result.items, {}, std.sort.asc(u32));
     return result.toOwnedSlice(allocator);
 }
 
-fn findChild(self: *const Self, parent_idx: u32, zone_key: u32) ?u32 {
-    for (self.nodes.items[parent_idx].children.items) |child_idx| {
-        if (self.nodes.items[child_idx].zone_key == zone_key) return child_idx;
+/// Walks straight to the floor node and collects every leaf under every
+/// zone parented to it.
+pub fn sensorIdsByFloor(self: *const Self, allocator: std.mem.Allocator, floor_id: u32) ![]u32 {
+    var result: std.ArrayList(u32) = .empty;
+    defer result.deinit(allocator);
+
+    if (self.floor_to_node.get(floor_id)) |floor_idx| {
+        try self.collectLeafSensorIds(floor_idx, &result, allocator);
     }
-    return null;
+
+    std.mem.sort(u32, result.items, {}, std.sort.asc(u32));
+    return result.toOwnedSlice(allocator);
 }
 
 fn collectLeafSensorIds(self: *const Self, node_idx: u32, out: *std.ArrayList(u32), allocator: std.mem.Allocator) !void {
@@ -280,56 +380,66 @@ fn collectLeafSensorIds(self: *const Self, node_idx: u32, out: *std.ArrayList(u3
 }
 
 // ---------------------------------------------------------------------------
-// Internal — tree path management
+// Internal — tree node management
 // ---------------------------------------------------------------------------
 
-fn ensureSensorPath(self: *Self, sensor_id: u32) !u32 {
+fn ensureLeaf(self: *Self, sensor_id: u32) !u32 {
     if (self.sensor_to_node.get(sensor_id)) |idx| return idx;
 
-    const floor_key = sensor_id / SENSORS_PER_FLOOR;
-    const zone_key = sensor_id / SENSORS_PER_ZONE;
-
-    const floor_idx = try self.ensureChild(self.root, floor_key);
-    const zone_idx = try self.ensureChild(floor_idx, zone_key);
-    const leaf_idx = try self.createLeaf(zone_idx, sensor_id);
-
-    try self.sensor_to_node.put(sensor_id, leaf_idx);
-    return leaf_idx;
-}
-
-fn ensureChild(self: *Self, parent_idx: u32, zone_key: u32) !u32 {
-    for (self.nodes.items[parent_idx].children.items) |child_idx| {
-        if (self.nodes.items[child_idx].zone_key == zone_key) {
-            return child_idx;
-        }
-    }
     const idx: u32 = @intCast(self.nodes.items.len);
     try self.nodes.append(self.allocator, .{
-        .parent = parent_idx,
-        .children = .empty,
-        .readings = null,
-        .sensor_id = null,
-        .zone_key = zone_key,
-        .latest = null,
-    });
-    // Access parent after append — append may reallocate nodes.items
-    try self.nodes.items[parent_idx].children.append(self.allocator, idx);
-    return idx;
-}
-
-fn createLeaf(self: *Self, parent_idx: u32, sensor_id: u32) !u32 {
-    const idx: u32 = @intCast(self.nodes.items.len);
-    try self.nodes.append(self.allocator, .{
-        .parent = parent_idx,
+        .parent = self.unassigned_zone,
         .children = .empty,
         .readings = null,
         .sensor_id = sensor_id,
-        .zone_key = sensor_id,
+        .key = sensor_id,
         .latest = null,
     });
-    // Access parent after append — append may reallocate nodes.items
-    try self.nodes.items[parent_idx].children.append(self.allocator, idx);
+    try self.nodes.items[self.unassigned_zone].children.append(self.allocator, idx);
+    try self.sensor_to_node.put(sensor_id, idx);
     return idx;
+}
+
+fn ensureZoneNode(self: *Self, zone_id: u32) !u32 {
+    if (self.zone_to_node.get(zone_id)) |idx| return idx;
+
+    const idx: u32 = @intCast(self.nodes.items.len);
+    try self.nodes.append(self.allocator, emptyNode(self.unassigned_floor, zone_id));
+    try self.nodes.items[self.unassigned_floor].children.append(self.allocator, idx);
+    try self.zone_to_node.put(zone_id, idx);
+    return idx;
+}
+
+fn ensureFloorNode(self: *Self, floor_id: u32) !u32 {
+    if (self.floor_to_node.get(floor_id)) |idx| return idx;
+
+    const idx: u32 = @intCast(self.nodes.items.len);
+    try self.nodes.append(self.allocator, emptyNode(self.root, floor_id));
+    try self.nodes.items[self.root].children.append(self.allocator, idx);
+    try self.floor_to_node.put(floor_id, idx);
+    return idx;
+}
+
+fn removeChild(self: *Self, parent_idx: u32, child_idx: u32) void {
+    const children = &self.nodes.items[parent_idx].children;
+    for (children.items, 0..) |c, i| {
+        if (c == child_idx) {
+            _ = children.swapRemove(i);
+            return;
+        }
+    }
+}
+
+/// Moves `child_idx` from its current parent (if any) to `new_parent_idx`.
+/// No-op if it's already there.
+fn reparent(self: *Self, child_idx: u32, new_parent_idx: u32) !void {
+    const old_parent = self.nodes.items[child_idx].parent;
+    if (old_parent) |op| {
+        if (op == new_parent_idx) return;
+        self.removeChild(op, child_idx);
+    }
+    self.nodes.items[child_idx].parent = new_parent_idx;
+    try self.nodes.items[new_parent_idx].children.append(self.allocator, child_idx);
 }
 
 // ---------------------------------------------------------------------------
@@ -425,6 +535,44 @@ test "Hierarchical: rangeByTime with sensor filter" {
     try std.testing.expectEqual(@as(u32, 1), result[1].sensor_id);
 }
 
+test "Hierarchical: sensorIdsByZone/sensorIdsByFloor reflect real (non-arithmetic) registration" {
+    var backend = try Self.init(std.testing.allocator);
+    defer backend.deinit();
+
+    try backend.insert(.{ .sensor_id = 7, .timestamp = 0, .value = 1.0, .sensor_type = .temperature });
+    try backend.insert(.{ .sensor_id = 2, .timestamp = 0, .value = 1.0, .sensor_type = .temperature });
+    try backend.registerZone(7, 4291);
+    try backend.registerZone(2, 4291);
+    try backend.registerFloor(4291, 3);
+
+    const zone = try backend.sensorIdsByZone(std.testing.allocator, 4291);
+    defer std.testing.allocator.free(zone);
+    try std.testing.expectEqualSlices(u32, &.{ 2, 7 }, zone);
+
+    const floor = try backend.sensorIdsByFloor(std.testing.allocator, 3);
+    defer std.testing.allocator.free(floor);
+    try std.testing.expectEqualSlices(u32, &.{ 2, 7 }, floor);
+
+    try std.testing.expectEqual(@as(?u32, 3), backend.floorOfZone(4291));
+
+    const empty = try backend.sensorIdsByZone(std.testing.allocator, 99);
+    defer std.testing.allocator.free(empty);
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
+}
+
+test "Hierarchical: getLatestBySensor is deterministic across repeated calls when timestamps tie" {
+    var backend = try Self.init(std.testing.allocator);
+    defer backend.deinit();
+
+    try backend.insert(.{ .sensor_id = 1, .timestamp = 100, .value = 10.0, .sensor_type = .temperature });
+    try backend.insert(.{ .sensor_id = 1, .timestamp = 100, .value = 20.0, .sensor_type = .temperature });
+
+    const first = backend.getLatestBySensor(1).?;
+    const second = backend.getLatestBySensor(1).?;
+    try std.testing.expectEqual(@as(i64, 100), first.timestamp);
+    try std.testing.expectEqual(first.value, second.value);
+}
+
 test "Hierarchical: empty backend" {
     var backend = try Self.init(std.testing.allocator);
     defer backend.deinit();
@@ -459,47 +607,95 @@ test "Hierarchical: out-of-order inserts handled correctly" {
     try std.testing.expectEqual(@as(i64, 300), all[2].timestamp);
 }
 
-test "Hierarchical: tree structure creates correct zone hierarchy" {
+test "Hierarchical: tree structure creates correct zone hierarchy from real registration" {
     var backend = try Self.init(std.testing.allocator);
     defer backend.deinit();
 
-    // sensor 0  → floor 0 (0/10), zone 0 (0/5)
-    // sensor 3  → floor 0,         zone 0   (same zone as sensor 0)
-    // sensor 7  → floor 0,         zone 1   (same floor, different zone)
-    // sensor 23 → floor 2 (23/10), zone 4 (23/5)  (different floor entirely)
+    // Arbitrary, non-sequential ids — like a real building: zone 4291 and
+    // zone 88 both sit on floor 2; zone 50 sits on floor 0.
     try backend.insert(.{ .sensor_id = 0, .timestamp = 100, .value = 1.0, .sensor_type = .temperature });
     try backend.insert(.{ .sensor_id = 3, .timestamp = 100, .value = 2.0, .sensor_type = .temperature });
     try backend.insert(.{ .sensor_id = 7, .timestamp = 100, .value = 3.0, .sensor_type = .temperature });
     try backend.insert(.{ .sensor_id = 23, .timestamp = 100, .value = 4.0, .sensor_type = .temperature });
 
-    // Root + floor0 + floor2 + zone0 + zone1 + zone4 + sensor0 + sensor3 + sensor7 + sensor23
-    // = 10 nodes
-    try std.testing.expectEqual(@as(usize, 10), backend.nodes.items.len);
-    try std.testing.expectEqual(@as(u32, 0), backend.root);
+    try backend.registerZone(0, 4291);
+    try backend.registerZone(3, 4291);
+    try backend.registerZone(7, 88);
+    try backend.registerZone(23, 50);
+    try backend.registerFloor(4291, 2);
+    try backend.registerFloor(88, 2);
+    try backend.registerFloor(50, 0);
 
-    // Root has 2 children (floor 0, floor 2)
-    try std.testing.expectEqual(@as(usize, 2), backend.nodes.items[0].children.items.len);
+    // sensorIdsByZone exercises the real subtree-walk fast path: zone 4291
+    // should contain exactly sensors 0 and 3, not sensor 7 (zone 88, same
+    // floor) or sensor 23 (a different floor entirely).
+    const zone4291 = try backend.sensorIdsByZone(std.testing.allocator, 4291);
+    defer std.testing.allocator.free(zone4291);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 3 }, zone4291);
 
-    // All 4 sensors are leaf nodes with readings
-    try std.testing.expectEqual(@as(usize, 4), backend.count());
+    // Floor 2 should contain sensors 0, 3, and 7 (both its zones), but
+    // not sensor 23 (floor 0).
+    const floor2 = try backend.sensorIdsByFloor(std.testing.allocator, 2);
+    defer std.testing.allocator.free(floor2);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 3, 7 }, floor2);
 
-    // sensorIdsByGroup exercises the actual subtree-walk fast path: zone 0
-    // (divisor=SENSORS_PER_ZONE=5) should contain exactly sensors 0 and 3,
-    // not sensor 7 (zone 1) or sensor 23 (a different floor entirely).
-    const zone0 = try backend.sensorIdsByGroup(std.testing.allocator, 0, SENSORS_PER_ZONE);
-    defer std.testing.allocator.free(zone0);
-    try std.testing.expectEqualSlices(u32, &.{ 0, 3 }, zone0);
-
-    // Floor 0 (divisor=SENSORS_PER_FLOOR=10) should contain sensors 0, 3,
-    // and 7 (both its zones), but not sensor 23 (floor 2).
-    const floor0 = try backend.sensorIdsByGroup(std.testing.allocator, 0, SENSORS_PER_FLOOR);
-    defer std.testing.allocator.free(floor0);
-    try std.testing.expectEqualSlices(u32, &.{ 0, 3, 7 }, floor0);
-
-    // An empty/nonexistent group returns an empty slice, not a crash.
-    const empty = try backend.sensorIdsByGroup(std.testing.allocator, 999, SENSORS_PER_ZONE);
+    // An empty/nonexistent zone or floor returns an empty slice, not a crash.
+    const empty = try backend.sensorIdsByZone(std.testing.allocator, 999999);
     defer std.testing.allocator.free(empty);
     try std.testing.expectEqual(@as(usize, 0), empty.len);
+}
+
+test "Hierarchical: a sensor inserted before registration lands in the unassigned bucket, then moves on registerZone" {
+    var backend = try Self.init(std.testing.allocator);
+    defer backend.deinit();
+
+    try backend.insert(.{ .sensor_id = 5, .timestamp = 0, .value = 1.0, .sensor_type = .temperature });
+
+    // Not registered yet — must not appear under any real zone.
+    const before = try backend.sensorIdsByZone(std.testing.allocator, 10);
+    defer std.testing.allocator.free(before);
+    try std.testing.expectEqual(@as(usize, 0), before.len);
+
+    try backend.registerZone(5, 10);
+
+    const after = try backend.sensorIdsByZone(std.testing.allocator, 10);
+    defer std.testing.allocator.free(after);
+    try std.testing.expectEqualSlices(u32, &.{5}, after);
+
+    // getLatestBySensor must still work — registration never touched the
+    // reading data, only where the leaf is parented.
+    try std.testing.expectEqual(@as(i64, 0), backend.getLatestBySensor(5).?.timestamp);
+}
+
+test "Hierarchical: re-registering a sensor's zone moves it, not duplicates it" {
+    var backend = try Self.init(std.testing.allocator);
+    defer backend.deinit();
+
+    try backend.insert(.{ .sensor_id = 1, .timestamp = 0, .value = 1.0, .sensor_type = .temperature });
+    try backend.registerZone(1, 100);
+    try backend.registerZone(1, 200);
+
+    const zone100 = try backend.sensorIdsByZone(std.testing.allocator, 100);
+    defer std.testing.allocator.free(zone100);
+    try std.testing.expectEqual(@as(usize, 0), zone100.len);
+
+    const zone200 = try backend.sensorIdsByZone(std.testing.allocator, 200);
+    defer std.testing.allocator.free(zone200);
+    try std.testing.expectEqualSlices(u32, &.{1}, zone200);
+}
+
+test "Hierarchical: floorOfZone reflects the most recent registerFloor call, null if never registered" {
+    var backend = try Self.init(std.testing.allocator);
+    defer backend.deinit();
+
+    try backend.insert(.{ .sensor_id = 1, .timestamp = 0, .value = 1.0, .sensor_type = .temperature });
+    try backend.registerZone(1, 4291);
+    try std.testing.expect(backend.floorOfZone(4291) == null);
+
+    try backend.registerFloor(4291, 0);
+    try std.testing.expectEqual(@as(?u32, 0), backend.floorOfZone(4291));
+    try backend.registerFloor(4291, 3);
+    try std.testing.expectEqual(@as(?u32, 3), backend.floorOfZone(4291));
 }
 
 test "Hierarchical and TimeSeries produce identical query results" {
@@ -563,4 +759,42 @@ test "Hierarchical and TimeSeries produce identical query results" {
         try std.testing.expectEqual(ts_all[i].value, hier_all[i].value);
         try std.testing.expectEqual(ts_all[i].sensor_type, hier_all[i].sensor_type);
     }
+}
+
+test "Hierarchical: pruneOlderThan removes only the matching type older than cutoff and recomputes latest" {
+    var backend = try Self.init(std.testing.allocator);
+    defer backend.deinit();
+
+    try backend.insert(.{ .sensor_id = 1, .timestamp = 50, .value = 1.0, .sensor_type = .temperature });
+    // This is sensor 1's latest reading, and it's the one that gets pruned
+    // -- latest must be recomputed from the surviving reading, not left
+    // stale or nulled out entirely.
+    try backend.insert(.{ .sensor_id = 1, .timestamp = 90, .value = 2.0, .sensor_type = .temperature });
+    try backend.insert(.{ .sensor_id = 1, .timestamp = 150, .value = 3.0, .sensor_type = .temperature });
+    try backend.insert(.{ .sensor_id = 2, .timestamp = 50, .value = 4.0, .sensor_type = .humidity });
+
+    try backend.pruneOlderThan(.temperature, 100);
+
+    try std.testing.expectEqual(@as(usize, 2), backend.count());
+
+    const latest = backend.getLatestBySensor(1).?;
+    try std.testing.expectEqual(@as(i64, 150), latest.timestamp);
+    try std.testing.expectEqual(@as(f32, 3.0), latest.value);
+
+    // Untouched: different type, different sensor.
+    const other_latest = backend.getLatestBySensor(2).?;
+    try std.testing.expectEqual(@as(i64, 50), other_latest.timestamp);
+}
+
+test "Hierarchical: pruneOlderThan that empties a sensor's readings nulls its latest" {
+    var backend = try Self.init(std.testing.allocator);
+    defer backend.deinit();
+
+    try backend.insert(.{ .sensor_id = 1, .timestamp = 50, .value = 1.0, .sensor_type = .temperature });
+    try backend.insert(.{ .sensor_id = 1, .timestamp = 90, .value = 2.0, .sensor_type = .temperature });
+
+    try backend.pruneOlderThan(.temperature, 100);
+
+    try std.testing.expectEqual(@as(usize, 0), backend.count());
+    try std.testing.expect(backend.getLatestBySensor(1) == null);
 }
