@@ -30,6 +30,7 @@ const queries = @import("benchmark/queries.zig");
 const runner = @import("benchmark/runner.zig");
 const metrics = @import("ecs/systems/metrics_system.zig");
 const report = @import("benchmark/report.zig");
+const cost_model = @import("benchmark/cost_model.zig");
 const schematic = @import("benchmark/schematic.zig");
 
 const Args = struct {
@@ -880,6 +881,29 @@ fn writeRecommendationReport(
     }
 
     try md.print(allocator, "\nSee `schematic.svg` in this directory for a floor-by-floor map of placed sensors.\n", .{});
+
+    // Cost estimate — cloud-equivalent $/year per backend + naive vs optimised
+    const all_backend_names = comptime blk: {
+        var names: [runner.backends.len][]const u8 = undefined;
+        for (runner.backends, 0..) |b, i| names[i] = b.name;
+        break :blk names;
+    };
+    // Real-time queries are ~3 of 12 patterns; estimate their fraction of
+    // total query volume (latest_* are high-frequency, ~1/sec each, while
+    // historical/aggregate are ~1/min — so real-time is the majority of
+    // total query count).
+    const realtime_query_fraction = 0.7;
+    try cost_model.writeCostSection(
+        &md,
+        allocator,
+        rows,
+        &all_backend_names,
+        compound.realtime.winner,
+        compound.historical.winner,
+        realtime_query_fraction,
+        cost_model.DEFAULT_WORKLOAD,
+        cost_model.DEFAULT_PRICING,
+    );
 
     const cwd = std.Io.Dir.cwd();
     cwd.createDirPath(io, output_dir) catch |err| switch (err) {

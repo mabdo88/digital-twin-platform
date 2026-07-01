@@ -270,11 +270,14 @@ Columnar/TimeSeries's indexing overhead isn't worth paying for.
 11. ~~Compound recommendations (recommendCompound)~~ — **done 2026-07-01**.
 12. ~~CLAUDE.md §3.4 edit~~ — **done 2026-07-01**.
 13. ~~Obsolete test cleanup~~ — **done 2026-07-01** (19 tests removed).
+14. ~~Cost model (Phase 7.3-7.4)~~ — **done 2026-07-01**. `cost_model.zig`
+    estimates annual cloud-equivalent $/year per backend from measured memory
+    footprint and query throughput; naive-vs-optimised comparison shows
+    savings from running only the two recommended winners.
 
 **Still open (low priority / future work):**
 - Retire the AoS/SoA-only equivalence tests' assumption of small uniform data — low priority.
 - Time-compression factor for the live simulator — undecided, not needed until live-tick real-time matters.
-- Cost model (`cost_model.zig`) — Phase 7.3-7.4, not started.
 - DuckDB calibration — Phase 8, not started.
 - Sensor failure modes (dropout, stale, drift) — Phase 6.2, not started.
 

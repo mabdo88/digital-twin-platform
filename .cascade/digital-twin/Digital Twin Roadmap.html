@@ -92,7 +92,7 @@
     </div>
     <div class="card">
       <div class="card-label">Known gap</div>
-      <p>Phase 5 (building-type profiles) deliberately removed 2026-06-30 — superseded by per-sensor-type canonical data, see Phase 5 notes. Phase 6 done except sensor failure modes (6.2 — dropout/stale/drift). Phase 7: per-query winner table, compound recommendations (real-time vs historical tracks), and per-sensor-type recommendations now exist; a $-cost model and naive-vs-optimised comparison still don't. The 25-iteration sampling methodology is retired (single-shot against real data). Phase 8 (DuckDB calibration) hasn't been started.</p>
+      <p>Phase 5 (building-type profiles) deliberately removed 2026-06-30 — superseded by per-sensor-type canonical data, see Phase 5 notes. Phase 6 done except sensor failure modes (6.2 — dropout/stale/drift). Phase 7 complete: per-query winner table, compound recommendations, per-sensor-type recommendations, and cloud-equivalent cost model all implemented. The 25-iteration sampling methodology is retired (single-shot against real data). Phase 8 (DuckDB calibration) hasn't been started.</p>
     </div>
   </div>
 
@@ -190,7 +190,7 @@ var PHASES = [
       { code: '6.4', title: 'Deterministic seeded RNG', done: true,
         note: 'generate() seeds one std.Random.DefaultPrng from config.seed, consumed in sensor order — same sensors + config always produce byte-identical output (tested).' },
       { code: '6.5', title: 'Scale from 100 to 100,000 sensors', done: true,
-        note: 'Generator tested at scale up to 100,000 sensors. Full pipeline (main.zig) now generates real per-sensor retention-depth data for every placed sensor — tested end-to-end against real IFC files (16 sensors → 1M+ readings). dataset.zig\\'s internal scale tiers (100 sensors) remain as a CI regression fixture, not a ceiling.' }
+        note: 'Generator tested at scale up to 100,000 sensors. Full pipeline (main.zig) now generates real per-sensor retention-depth data for every placed sensor — tested end-to-end against real IFC files (16 sensors → 1M+ readings). dataset.zig\'s internal scale tiers (100 sensors) remain as a CI regression fixture, not a ceiling.' }
     ]
   },
   {
@@ -200,11 +200,13 @@ var PHASES = [
       { code: '7.1', title: 'Per-query winner table', done: true,
         note: 'engine/benchmark/report.zig\'s writeWinners() — per scale, per query, lowest-median backend plus runner-up and speedup ratio. Already existed before the 2026-06-29 recheck; this entry was stale.' },
       { code: '7.2', title: 'Per-sensor-type recommendation', done: true,
-        note: 'Implemented 2026-07-01 as compound per-type recommendations: main.zig runs recommendCompound for each placed sensor type, scoped to that type\\'s canonical type-scoped queries. Results shown in console output and recommendation.md. The old per-building-type recommendBackend() is removed; EXPECTED_WINNERS table removed; recommendations are now compound (real-time track + historical track) per building and per sensor type.' },
-      { code: '7.3', title: 'Cost model + formula', done: false, note: 'Not started — engine/benchmark/cost_model.zig does not exist.' },
-      { code: '7.4', title: 'Naive vs optimised cost comparison', done: false, note: 'Not started — depends on 7.3.' },
+        note: 'Implemented 2026-07-01 as compound per-type recommendations: main.zig runs recommendCompound for each placed sensor type, scoped to that type\'s canonical type-scoped queries. Results shown in console output and recommendation.md. The old per-building-type recommendBackend() is removed; EXPECTED_WINNERS table removed; recommendations are now compound (real-time track + historical track) per building and per sensor type.' },
+      { code: '7.3', title: 'Cost model + formula', done: true,
+        note: 'Implemented 2026-07-01: engine/benchmark/cost_model.zig. Estimates annual cloud-equivalent cost per backend from measured memory footprint (storage $/TB-year) and query throughput (query $/M operations). Pricing is a disclosed data table (public cloud rates, mid-2026), not hard-coded code. Outputs a per-backend cost table + naive-vs-optimised comparison in recommendation.md.' },
+      { code: '7.4', title: 'Naive vs optimised cost comparison', done: true,
+        note: 'Implemented 2026-07-01 alongside 7.3. naiveTotalCost sums all deployment backends; optimisedCost computes just the compound recommendation\'s two winners (real-time + historical) with query cost split by real-time fraction. Savings $ and % shown in recommendation.md.' },
       { code: '7.5', title: 'JSON + Markdown output', done: true,
-        note: 'latency.md / latency.json / benchmark.html cover raw per-query latency. recommendation.md (written by main.zig) emits the compound recommendation: real-time winner + historical winner, per-building and per-sensor-type. Winner-by-COST still doesn\'t exist (needs 7.3) but this task was specifically about output format, which is done.' }
+        note: 'latency.md / latency.json / benchmark.html cover raw per-query latency. recommendation.md (written by main.zig) emits the compound recommendation: real-time winner + historical winner, per-building and per-sensor-type, plus a cloud-equivalent cost estimate (7.3-7.4).' }
     ]
   },
   {
