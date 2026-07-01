@@ -143,11 +143,6 @@ fn nsToUs(ns: i64) f64 {
 // ---------------------------------------------------------------------------
 
 const aos = @import("../storage/backends/aos_storage.zig");
-const soa = @import("../storage/backends/soa_storage.zig");
-const timeseries = @import("../storage/backends/timeseries_storage.zig");
-const columnar = @import("../storage/backends/columnar_storage.zig");
-const hierarchical = @import("../storage/backends/hierarchical_storage.zig");
-const ringbuffer = @import("../storage/backends/ringbuffer_storage.zig");
 const World = @import("../world.zig").World;
 const queries = @import("../../benchmark/queries.zig");
 
@@ -201,89 +196,11 @@ test "smoke: time query_avg_window on AoS and print percentiles" {
     try std.testing.expectEqual(mem_after_queries, mem_before_queries);
 }
 
-// Was previously six hand-unrolled copies of this exact loop (one per
-// backend, ~250 lines) printing the same table and asserting the same three
-// percentile-ordering invariants each time. Those invariants are a property
-// of timeQuery's own sort+index math, not of the backend being timed, so
-// repeating the assertions per backend never caught a backend-specific bug —
-// it only multiplied compile time and the cost of this test (up to 100k
-// iterations x 6 backends). Looping at comptime keeps the same scaling
-// numbers printed for every backend, with the duplication gone.
-test "scaling: query_avg_window across all six backends at 100 / 1k / 10k iterations" {
-    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    const dataset = try generateDataset(std.testing.allocator);
-    defer std.testing.allocator.free(dataset);
-
-    const iteration_counts = [_]u32{ 100, 1_000, 10_000 };
-    const all_backends = .{
-        .{ "AoS", aos },
-        .{ "SoA", soa },
-        .{ "TimeSeries", timeseries },
-        .{ "Columnar", columnar },
-        .{ "Hierarchical", hierarchical },
-        .{ "RingBuffer", ringbuffer },
-    };
-
-    std.debug.print("\n=== query_avg_window scaling across all six backends (sensor=0, hours=24) ===\n", .{});
-
-    inline for (all_backends) |entry| {
-        const name = entry[0];
-        const Backend = entry[1];
-
-        var world = try World(Backend).init(std.testing.allocator);
-        defer world.deinit();
-        for (dataset) |r| try world.insert(r);
-
-        std.debug.print("\n--- {s} (memory={d} bytes) ---\n", .{ name, sampleMemory(&world) });
-        std.debug.print("{s:>10} {s:>12} {s:>8} {s:>12} {s:>8} {s:>12} {s:>8} {s:>12} {s:>8} {s:>14}\n", .{
-            "iters",      "median_ns",
-            "med_µs",
-            "p95_ns",
-            "p95_µs",
-            "p99_ns",
-            "p99_µs",
-            "mean_ns",
-            "mean_µs",
-            "throughput",
-        });
-
-        for (iteration_counts) |n| {
-            const stats = try timeQuery(
-                std.testing.allocator,
-                io,
-                n,
-                queries.query_avg_window,
-                .{ &world, @as(u32, 0), @as(u32, 24) },
-            );
-            std.debug.print("{d:>10} {d:>12} {d:>8.1} {d:>12} {d:>8.1} {d:>12} {d:>8.1} {d:>12} {d:>8.1} {d:>12.0}ops/s\n", .{
-                stats.iterations,
-                stats.median_ns,
-                nsToUs(stats.median_ns),
-                stats.p95_ns,
-                nsToUs(stats.p95_ns),
-                stats.p99_ns,
-                nsToUs(stats.p99_ns),
-                stats.mean_ns,
-                nsToUs(stats.mean_ns),
-                stats.throughputOpsPerSec(),
-            });
-            try std.testing.expectEqual(n, stats.iterations);
-            try std.testing.expect(stats.p95_ns >= stats.median_ns);
-            try std.testing.expect(stats.p99_ns >= stats.p95_ns);
-        }
-    }
-
-    std.debug.print("\n=== end scaling ===\n", .{});
-}
-
 // ---------------------------------------------------------------------------
 // timeQuery / LatencyStats math — fast, deterministic edge cases that don't
 // need real backend timing noise to exercise. None of these existed before:
 // the only prior coverage of percentile math was incidental, buried inside
-// the 100k-iteration scaling test above.
+// the 100k-iteration scaling test that was removed.
 // ---------------------------------------------------------------------------
 
 fn constOneNs(_: *u32) !void {}

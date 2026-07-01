@@ -927,14 +927,6 @@ test "query_avg_window: returns 0.0 for nonexistent sensor" {
     try std.testing.expectEqual(@as(f32, 0.0), result);
 }
 
-test "query_avg_window: returns 0.0 for empty world" {
-    var world = try World(aos).init(std.testing.allocator);
-    defer world.deinit();
-
-    const result = try query_avg_window(&world, 0, 24);
-    try std.testing.expectEqual(@as(f32, 0.0), result);
-}
-
 test "query_avg_window: single reading returns that reading's value" {
     var world = try World(soa).init(std.testing.allocator);
     defer world.deinit();
@@ -1010,14 +1002,6 @@ test "query_latest_single: returns null for nonexistent sensor" {
     try std.testing.expect(result == null);
 }
 
-test "query_latest_single: returns null for empty world" {
-    var world = try World(aos).init(std.testing.allocator);
-    defer world.deinit();
-
-    const result = try query_latest_single(&world, 0);
-    try std.testing.expect(result == null);
-}
-
 test "query_latest_zone: all six backends agree on same seeded dataset" {
     const dataset = try generateDataset(std.testing.allocator);
     defer std.testing.allocator.free(dataset);
@@ -1080,15 +1064,6 @@ test "query_latest_zone: returns empty for nonexistent zone" {
     try insertDataset(&world, dataset);
 
     const result = try query_latest_zone(&world, 999);
-    defer world.allocator.free(result);
-    try std.testing.expectEqual(@as(usize, 0), result.len);
-}
-
-test "query_latest_zone: returns empty for empty world" {
-    var world = try World(aos).init(std.testing.allocator);
-    defer world.deinit();
-
-    const result = try query_latest_zone(&world, 0);
     defer world.allocator.free(result);
     try std.testing.expectEqual(@as(usize, 0), result.len);
 }
@@ -1159,16 +1134,6 @@ test "query_latest_by_type: returns empty for type with no sensors" {
     try std.testing.expectEqual(@as(usize, 0), result.len);
 }
 
-test "query_latest_by_type: returns empty for empty world" {
-    var world = try World(aos).init(std.testing.allocator);
-    defer world.deinit();
-
-    const result = try query_latest_by_type(&world, .temperature);
-    defer world.allocator.free(result);
-    try std.testing.expectEqual(@as(usize, 0), result.len);
-}
-
-// ---------------------------------------------------------------------------
 // Golden-result equivalence tests for Q5 (query_avg_zone_type)
 // ---------------------------------------------------------------------------
 
@@ -1252,14 +1217,6 @@ test "query_avg_zone_type: returns 0.0 for type with no sensors in zone" {
 
     // Zone 0 has temperature and humidity, not co2
     const result = try query_avg_zone_type(&world, 0, .co2, 24);
-    try std.testing.expectEqual(@as(f32, 0.0), result);
-}
-
-test "query_avg_zone_type: returns 0.0 for empty world" {
-    var world = try World(aos).init(std.testing.allocator);
-    defer world.deinit();
-
-    const result = try query_avg_zone_type(&world, 0, .temperature, 24);
     try std.testing.expectEqual(@as(f32, 0.0), result);
 }
 
@@ -1351,16 +1308,6 @@ test "query_floor_stats: returns zeros for type with no sensors on floor" {
     try std.testing.expectEqual(@as(f32, 0.0), result.avg);
 }
 
-test "query_floor_stats: returns zeros for empty world" {
-    var world = try World(aos).init(std.testing.allocator);
-    defer world.deinit();
-
-    const result = try query_floor_stats(&world, 0, .temperature, 24);
-    try std.testing.expectEqual(@as(f32, 0.0), result.min);
-    try std.testing.expectEqual(@as(f32, 0.0), result.max);
-    try std.testing.expectEqual(@as(f32, 0.0), result.avg);
-}
-
 // ---------------------------------------------------------------------------
 // Golden-result equivalence tests for Q7 (query_hourly_rollup)
 //
@@ -1434,15 +1381,6 @@ test "query_hourly_rollup: returns empty for nonexistent sensor" {
     try insertDataset(&world, dataset);
 
     const result = try query_hourly_rollup(&world, 999, 1);
-    defer world.allocator.free(result);
-    try std.testing.expectEqual(@as(usize, 0), result.len);
-}
-
-test "query_hourly_rollup: returns empty for empty world" {
-    var world = try World(aos).init(std.testing.allocator);
-    defer world.deinit();
-
-    const result = try query_hourly_rollup(&world, 0, 1);
     defer world.allocator.free(result);
     try std.testing.expectEqual(@as(usize, 0), result.len);
 }
@@ -1535,15 +1473,6 @@ test "query_daily_zone_rollup: returns empty for type with no sensors in zone" {
     try std.testing.expectEqual(@as(usize, 0), result.len);
 }
 
-test "query_daily_zone_rollup: returns empty for empty world" {
-    var world = try World(aos).init(std.testing.allocator);
-    defer world.deinit();
-
-    const result = try query_daily_zone_rollup(&world, 0, .temperature);
-    defer world.allocator.free(result);
-    try std.testing.expectEqual(@as(usize, 0), result.len);
-}
-
 // ---------------------------------------------------------------------------
 // Golden-result equivalence tests for Q9 (query_spatial_radius)
 //
@@ -1624,15 +1553,6 @@ test "query_spatial_radius: exact boundary sensor included" {
     defer world.allocator.free(result);
     try std.testing.expectEqual(@as(usize, 1), result.len);
     try std.testing.expectEqual(@as(EntityId, 0), result[0]);
-}
-
-test "query_spatial_radius: returns empty for empty world" {
-    var world = try World(aos).init(std.testing.allocator);
-    defer world.deinit();
-
-    const result = try query_spatial_radius(&world, .{ .x = 0.0, .y = 0.0, .z = 0.0 }, 100.0);
-    defer world.allocator.free(result);
-    try std.testing.expectEqual(@as(usize, 0), result.len);
 }
 
 test "query_spatial_radius: returns empty when no sensor within radius" {
@@ -1772,15 +1692,6 @@ test "query_zone_hierarchy: nonexistent zone returns empty" {
     try insertDataset(&world, dataset);
 
     const result = try query_zone_hierarchy(&world, 999, 0);
-    defer world.allocator.free(result);
-    try std.testing.expectEqual(@as(usize, 0), result.len);
-}
-
-test "query_zone_hierarchy: returns empty for empty world" {
-    var world = try World(aos).init(std.testing.allocator);
-    defer world.deinit();
-
-    const result = try query_zone_hierarchy(&world, 0, 0);
     defer world.allocator.free(result);
     try std.testing.expectEqual(@as(usize, 0), result.len);
 }

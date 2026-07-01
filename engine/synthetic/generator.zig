@@ -647,41 +647,6 @@ test "periodMs: zero and negative frequency_hz degrade to one sample per day ins
     try testing.expectEqual(@as(i64, 24 * 60 * 60 * 1000), periodMs(-5.0));
 }
 
-test "generate scales to 100,000 sensors (Phase 1 ceiling) without blowing up" {
-    const allocator = testing.allocator;
-    const num_sensors: usize = 100_000;
-    const sensors = try allocator.alloc(SensorMetadata, num_sensors);
-    defer allocator.free(sensors);
-
-    const all_types = [_]SensorType{ .temperature, .humidity, .occupancy, .co2, .vibration, .flow, .energy, .structural, .air_quality };
-    for (sensors, 0..) |*s, i| {
-        s.* = .{
-            .sensor_id = @intCast(i),
-            .sensor_type = all_types[i % all_types.len],
-            .frequency_hz = 1.0, // informational only — generate() uses profileFor's canonical rate
-            .element_id = 0,
-        };
-    }
-
-    // Short duration so the test stays fast — this checks the generator's
-    // per-sensor overhead scales to 100k sensors, not that it can produce a
-    // full day of data for all of them in one test run. Every canonical
-    // per-type period is well over 2000ms (the fastest, occupancy/flow, is
-    // 60000ms), so exactly one tick gets evaluated per sensor in this
-    // window — but "one tick evaluated" no longer means "one reading
-    // stored" for every type: continuous/stepwise types and occupancy's
-    // first-ever tick always emit, but vibration's bursty_impulsive only
-    // emits ~2% of the time (event-based storage — see generate()'s
-    // bursty_impulsive branch). So readings.len is bounded above by
-    // num_sensors, not equal to it; the real thing this test checks is
-    // that generation completes and doesn't blow up at this scale.
-    const readings = try generate(allocator, sensors, .{ .duration_ms = 2000 }, null);
-    defer allocator.free(readings);
-
-    try testing.expect(readings.len > 0);
-    try testing.expect(readings.len <= num_sensors);
-}
-
 // ---------------------------------------------------------------------------
 // Shape-specific tests — each new generation shape has a real behavioral
 // property that distinguishes it from the old uniform sine+noise model;

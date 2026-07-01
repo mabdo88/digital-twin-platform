@@ -52,14 +52,9 @@ pub const BackendScore = struct {
     coverage: f64,
 };
 
-pub const Recommendation = struct {
-    scores: []BackendScore, // sorted ascending by score (best first)
-    winner: []const u8,
-};
-
-/// One track of a compound recommendation — same shape as `Recommendation`,
-/// but scoped to one query family group (real-time vs. everything else) and
-/// possibly to a restricted set of eligible backends. Caller frees `scores`.
+/// One track of a compound recommendation — scoped to one query family
+/// group (real-time vs. everything else) and possibly to a restricted set of
+/// eligible backends. Caller frees `scores`.
 pub const TrackRecommendation = struct {
     scores: []BackendScore, // sorted ascending by score (best first)
     winner: []const u8,
@@ -83,7 +78,7 @@ pub const CompoundRecommendation = struct {
 };
 
 /// How much each unit of *uncovered* query weight counts against a backend
-/// in `recommendBackend`'s score (1.0 = as good as tying the per-query
+/// in `scoreBackends`'s score (1.0 = as good as tying the per-query
 /// winner; higher is worse). Set above the this/winner ratios functioning
 /// backends realistically reach (~1-3x) so a coverage gap reliably outweighs
 /// mere slowness: a backend that can't answer a weighted query at all (it
@@ -91,27 +86,6 @@ pub const CompoundRecommendation = struct {
 /// below one that answers it slowly. Not researched — a deliberate,
 /// disclosed policy choice (CLAUDE.md §6 honesty).
 const UNCOVERED_QUERY_PENALTY: f64 = 4.0;
-
-/// Weight every query in `query_mix` by its declared importance and
-/// rank every backend present in `rows` at `scale` by how close it comes to
-/// the per-query winner across that weighted mix. `query_mix` is whatever
-/// the caller derived it to be — main.zig builds it from the union of
-/// `relevant_queries` across whichever sensor types actually got placed
-/// (synthetic/generator.zig's per-type canonical table), not a
-/// building-profile guess. Caller owns `result.scores` (free with
-/// `allocator`).
-pub fn recommendBackend(
-    allocator: std.mem.Allocator,
-    rows: []const RunRow,
-    scale: []const u8,
-    query_mix: []const queries.QueryWeight,
-) !Recommendation {
-    const owned = try scoreBackends(allocator, rows, scale, query_mix, null);
-    return .{
-        .scores = owned,
-        .winner = if (owned.len > 0) owned[0].backend else "none",
-    };
-}
 
 /// True if `name` appears in `eligible`. Used to restrict a track to a
 /// subset of backends (e.g. the historical track excludes the count-capped
@@ -316,11 +290,8 @@ pub fn writeReports(
         }
 
         try md.print(allocator, "\n### Per-query winner (lowest median)\n\n", .{});
-        try md.print(allocator, "Expected/Match come from the storage×query matrix (data, not code — see report.zig's " ++
-            "EXPECTED_WINNERS). They flag disagreement between measured results and textbook expectation; they do " ++
-            "NOT skip any benchmark run (CLAUDE.md §6: measured answers, not assumptions).\n\n", .{});
-        try md.print(allocator, "| Query | Winner | Median µs | Runner-up | Median µs | Speedup | Expected | Match |\n", .{});
-        try md.print(allocator, "|---|---|---:|---|---:|---:|---|---|\n", .{});
+        try md.print(allocator, "| Query | Winner | Median µs | Runner-up | Median µs | Speedup |\n", .{});
+        try md.print(allocator, "|---|---|---:|---|---:|---:|\n", .{});
         try writeWinners(&md, allocator, rows, ds.name);
 
         try md.print(allocator, "\n", .{});
@@ -576,64 +547,6 @@ fn writeHtmlReport(
     try dir.writeFile(io, .{ .sub_path = "benchmark.html", .data = html.items });
 }
 
-// ---------------------------------------------------------------------------
-// Expected-winner matrix — data, not code (CLAUDE.md §3.5). This encodes
-// the storage×query matrix knowledge (Time-Series/Columnar/Hierarchical/
-// RingBuffer only — Lake/Parquet isn't a backend this platform implements,
-// and AoS/SoA are excluded from deployment recommendations, see runner.zig's
-// `backends` doc comment).
-//
-// This table is NOT used to skip benchmarking any query×backend combo —
-// CLAUDE.md §1/§6 requires measured answers, not assumed ones. It is only
-// used to flag when a measured result *disagrees* with the textbook
-// expectation, which is the most useful signal this tool can produce: it
-// tells you when your implementation (or this project's specific data
-// shape) doesn't behave the way the generic matrix predicts.
-// ---------------------------------------------------------------------------
-const ExpectedWinner = struct {
-    query: []const u8,
-    backends: []const []const u8,
-};
-
-const EXPECTED_WINNERS = [_]ExpectedWinner{
-    .{ .query = "query_latest_single", .backends = &.{"RingBuffer"} },
-    .{ .query = "query_latest_zone", .backends = &.{"Hierarchical"} },
-    .{ .query = "query_avg_window", .backends = &.{ "TimeSeries", "Columnar" } },
-    .{ .query = "query_avg_zone_type", .backends = &.{ "TimeSeries", "Columnar" } },
-    .{ .query = "query_floor_stats", .backends = &.{"Columnar"} },
-    .{ .query = "query_hourly_rollup", .backends = &.{"Columnar"} },
-    .{ .query = "query_daily_zone_rollup", .backends = &.{"Columnar"} },
-    .{ .query = "query_spatial_radius", .backends = &.{"Hierarchical"} },
-    .{ .query = "query_zone_hierarchy", .backends = &.{"Hierarchical"} },
-    .{ .query = "query_anomalies", .backends = &.{ "TimeSeries", "RingBuffer" } },
-    .{ .query = "query_threshold_breach", .backends = &.{"RingBuffer"} },
-};
-
-fn expectedWinnersFor(query: []const u8) ?[]const []const u8 {
-    for (EXPECTED_WINNERS) |e| {
-        if (std.mem.eql(u8, e.query, query)) return e.backends;
-    }
-    return null;
-}
-
-/// null = no expectation recorded for this query (e.g. query_latest_by_type
-/// isn't in the source matrix). true/false = measured winner does/doesn't
-/// appear in the expected set.
-fn matchesExpected(query: []const u8, actual_backend: []const u8) ?bool {
-    const expected = expectedWinnersFor(query) orelse return null;
-    for (expected) |b| {
-        if (std.mem.eql(u8, b, actual_backend)) return true;
-    }
-    return false;
-}
-
-fn printExpectedList(w: *std.ArrayList(u8), allocator: std.mem.Allocator, backends_list: []const []const u8) !void {
-    for (backends_list, 0..) |b, i| {
-        if (i > 0) try w.print(allocator, "/", .{});
-        try w.print(allocator, "{s}", .{b});
-    }
-}
-
 /// For each unique query within a given scale, find the backend with the
 /// lowest median latency and the runner-up; emit a Markdown row.
 fn writeWinners(w: *std.ArrayList(u8), allocator: std.mem.Allocator, rows: []const RunRow, scale: []const u8) !void {
@@ -670,10 +583,6 @@ fn writeWinners(w: *std.ArrayList(u8), allocator: std.mem.Allocator, rows: []con
             const best = rows[bi];
             const best_us = @as(f64, @floatFromInt(best.stats.median_ns)) / 1000.0;
 
-            const expected = expectedWinnersFor(r.query);
-            const match = matchesExpected(r.query, best.backend);
-            const match_str: []const u8 = if (match) |m| (if (m) "matches" else "contradicts") else "—";
-
             if (second_idx) |si| {
                 const second = rows[si];
                 const second_us = @as(f64, @floatFromInt(second.stats.median_ns)) / 1000.0;
@@ -682,27 +591,20 @@ fn writeWinners(w: *std.ArrayList(u8), allocator: std.mem.Allocator, rows: []con
                         @as(f64, @floatFromInt(best.stats.median_ns))
                 else
                     0.0;
-                try w.print(allocator, "| {s} | **{s}** | {d:.1} | {s} | {d:.1} | {d:.2}× | ", .{
+                try w.print(allocator, "| {s} | **{s}** | {d:.1} | {s} | {d:.1} | {d:.2}× |\n", .{
                     r.query, best.backend, best_us, second.backend, second_us, speedup,
                 });
             } else {
-                try w.print(allocator, "| {s} | **{s}** | {d:.1} | — | — | — | ", .{
+                try w.print(allocator, "| {s} | **{s}** | {d:.1} | — | — | — |\n", .{
                     r.query, best.backend, best_us,
                 });
             }
-
-            if (expected) |e| {
-                try printExpectedList(w, allocator, e);
-            } else {
-                try w.print(allocator, "—", .{});
-            }
-            try w.print(allocator, " | {s} |\n", .{match_str});
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Tests — recommendBackend (AGENT.md Phase 5.2: query_mix-weighted scoring).
+// Tests — recommendCompound (compound recommendation scoring).
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
@@ -724,146 +626,6 @@ fn testRow(scale: []const u8, query: []const u8, backend: []const u8, median_ns:
             .total_ns = median_ns * 25,
         },
     };
-}
-
-test "recommendBackend: weighting toward a backend's strong query picks it as winner" {
-    const rows = [_]RunRow{
-        testRow("Small", "query_threshold_breach", "A", 10),
-        testRow("Small", "query_threshold_breach", "B", 100),
-        testRow("Small", "query_daily_zone_rollup", "A", 100),
-        testRow("Small", "query_daily_zone_rollup", "B", 10),
-    };
-
-    const hot_mix = [_]queries.QueryWeight{
-        .{ .query = .threshold_breach, .weight = 10.0, .hot = true },
-        .{ .query = .daily_zone_rollup, .weight = 1.0, .hot = false },
-    };
-
-    const rec = try recommendBackend(testing.allocator, &rows, "Small", &hot_mix);
-    defer testing.allocator.free(rec.scores);
-    try testing.expectEqualStrings("A", rec.winner);
-}
-
-test "recommendBackend: swapping the weights flips the winner" {
-    const rows = [_]RunRow{
-        testRow("Small", "query_threshold_breach", "A", 10),
-        testRow("Small", "query_threshold_breach", "B", 100),
-        testRow("Small", "query_daily_zone_rollup", "A", 100),
-        testRow("Small", "query_daily_zone_rollup", "B", 10),
-    };
-
-    const cold_mix = [_]queries.QueryWeight{
-        .{ .query = .threshold_breach, .weight = 1.0, .hot = true },
-        .{ .query = .daily_zone_rollup, .weight = 10.0, .hot = false },
-    };
-
-    const rec = try recommendBackend(testing.allocator, &rows, "Small", &cold_mix);
-    defer testing.allocator.free(rec.scores);
-    try testing.expectEqualStrings("B", rec.winner);
-}
-
-test "recommendBackend: a backend missing data for a weighted query gets partial coverage, not a crash" {
-    const rows = [_]RunRow{
-        testRow("Small", "query_threshold_breach", "A", 10),
-        testRow("Small", "query_threshold_breach", "B", 20),
-        testRow("Small", "query_daily_zone_rollup", "A", 50),
-        // B has no row for query_daily_zone_rollup — e.g. RingBuffer
-        // excluded from historical rollups in runner.zig's real data.
-    };
-
-    const mix = [_]queries.QueryWeight{
-        .{ .query = .threshold_breach, .weight = 1.0, .hot = true },
-        .{ .query = .daily_zone_rollup, .weight = 1.0, .hot = false },
-    };
-
-    const rec = try recommendBackend(testing.allocator, &rows, "Small", &mix);
-    defer testing.allocator.free(rec.scores);
-
-    try testing.expectEqual(@as(usize, 2), rec.scores.len);
-    for (rec.scores) |s| {
-        if (std.mem.eql(u8, s.backend, "A")) {
-            try testing.expectApproxEqAbs(@as(f64, 1.0), s.coverage, 1e-9);
-        } else if (std.mem.eql(u8, s.backend, "B")) {
-            try testing.expectApproxEqAbs(@as(f64, 0.5), s.coverage, 1e-9);
-        }
-    }
-}
-
-test "recommendBackend: coverage gaps are penalized, not silently averaged away" {
-    // A and B tie on the one query B can serve; A additionally serves a
-    // second, equally-weighted query B has no data for. The old scoring
-    // averaged B only over its covered query (score 1.0, tying A); the
-    // coverage penalty must now rank the fully-covered A strictly ahead.
-    const rows = [_]RunRow{
-        testRow("Small", "query_threshold_breach", "A", 10),
-        testRow("Small", "query_threshold_breach", "B", 10),
-        testRow("Small", "query_daily_zone_rollup", "A", 10),
-        // B: no query_daily_zone_rollup row.
-    };
-    const mix = [_]queries.QueryWeight{
-        .{ .query = .threshold_breach, .weight = 1.0, .hot = true },
-        .{ .query = .daily_zone_rollup, .weight = 1.0, .hot = false },
-    };
-
-    const rec = try recommendBackend(testing.allocator, &rows, "Small", &mix);
-    defer testing.allocator.free(rec.scores);
-
-    try testing.expectEqualStrings("A", rec.winner);
-    for (rec.scores) |s| {
-        if (std.mem.eql(u8, s.backend, "A")) {
-            // Full coverage, wins both queries: (1*1.0 + 1*1.0) / 2 = 1.0.
-            try testing.expectApproxEqAbs(@as(f64, 1.0), s.score, 1e-9);
-        } else {
-            // Covers 1 of 2 weighted queries at ratio 1.0, penalized on the
-            // other: (1*1.0 + UNCOVERED_QUERY_PENALTY*1) / 2 = 2.5.
-            try testing.expectApproxEqAbs(@as(f64, 2.5), s.score, 1e-9);
-        }
-    }
-}
-
-test "recommendBackend: no rows at the requested scale returns an empty, non-crashing result" {
-    const rows = [_]RunRow{
-        testRow("Large", "query_threshold_breach", "A", 10),
-    };
-    const mix = [_]queries.QueryWeight{
-        .{ .query = .threshold_breach, .weight = 1.0, .hot = true },
-    };
-
-    const rec = try recommendBackend(testing.allocator, &rows, "Small", &mix);
-    defer testing.allocator.free(rec.scores);
-
-    try testing.expectEqual(@as(usize, 0), rec.scores.len);
-    try testing.expectEqualStrings("none", rec.winner);
-}
-
-test "recommendBackend: a real per-type query mix resolves against real query_specs names to a clear winner" {
-    // Exercises queryNameStr's mapping against every QueryName a real
-    // canonical per-type table weights (synthetic/generator.zig's
-    // STRUCTURAL_QUERIES — equipment-health type, exercises
-    // anomalies/threshold_breach/avg_zone_type), with rows shaped like a
-    // real runner.zig run (every weighted query name present, for two
-    // backends).
-    const structural_mix = [_]queries.QueryWeight{
-        .{ .query = .latest_single, .weight = 2.0, .hot = true },
-        .{ .query = .avg_zone_type, .weight = 2.0, .hot = false },
-        .{ .query = .daily_zone_rollup, .weight = 2.0, .hot = false },
-        .{ .query = .anomalies, .weight = 5.0, .hot = true },
-        .{ .query = .threshold_breach, .weight = 4.0, .hot = true },
-        .{ .query = .spatial_radius, .weight = 2.0, .hot = true },
-    };
-    var rows: std.ArrayList(RunRow) = .empty;
-    defer rows.deinit(testing.allocator);
-    for (structural_mix) |qw| {
-        try rows.append(testing.allocator, testRow("Small", queryNameStr(qw.query), "TimeSeries", 50));
-        try rows.append(testing.allocator, testRow("Small", queryNameStr(qw.query), "Columnar", 100));
-    }
-
-    const rec = try recommendBackend(testing.allocator, rows.items, "Small", &structural_mix);
-    defer testing.allocator.free(rec.scores);
-
-    try testing.expectEqualStrings("TimeSeries", rec.winner);
-    try testing.expectEqual(@as(usize, 2), rec.scores.len);
-    try testing.expectApproxEqAbs(@as(f64, 1.0), rec.scores[0].coverage, 1e-9);
 }
 
 test "recommendCompound: RingBuffer wins real-time track, excluded from historical track" {
