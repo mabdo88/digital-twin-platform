@@ -1,11 +1,16 @@
 # Storage/Benchmark Redesign Plan (agreed 2026-06-30)
 
-> **Status: IN PROGRESS as of 2026-07-01.** Six of eleven implementation steps are
-> done and verified (see "Implementation progress" below); the rest of this
-> document is still the target, not yet built. Check `git log` and the current
-> source before assuming any specific piece is done. Treat this as a status doc
-> per CLAUDE.md §9 — read it before touching `synthetic/generator.zig`,
-> `ecs/storage/*`, `benchmark/queries.zig`, or `main.zig`'s orchestration.
+> **Status: IN PROGRESS as of 2026-07-01, session paused mid-task-#27.** Six full
+> steps (#21-26 in the session's task list) are done, tested, committed, and
+> pushed to `dev`. A seventh (occupancy state-continuity across generate() calls,
+> plus retention-driven GenerateConfig — see "Implementation progress" below) is
+> implemented, tested, and building/passing green — commit it before doing
+> anything else if it isn't already committed (check `git log` / `git status`
+> first). Task #27 itself (using the new retention-driven config in a real
+> per-sensor loop) is NOT finished — main.zig still calls generate() once with
+> the old 1h default. Tasks #28-31 have NOT been started. Read the "Handoff"
+> section near the bottom before touching anything — it's written for a fresh
+> AI/human picking this up cold.
 
 ## Implementation progress (2026-07-01)
 
@@ -266,3 +271,92 @@ Columnar/TimeSeries's indexing overhead isn't worth paying for.
    retiring the 25-iteration methodology, and the main.zig rewire.
 7. Time-compression factor for the live simulator.
 8. The CLAUDE.md §3.4 edit reflecting the retired 25-iteration rule.
+
+## Handoff (2026-07-01) — read this if you're picking this up cold
+
+The user's usage limit forced a mid-task handoff to a different AI. This
+section is written so you don't need the prior conversation — everything
+you need to continue correctly is here or in `backend-audit.md`'s dated
+entries (the canonical, more-detailed record of every fix).
+
+**First, verify the state, don't trust this doc blindly:** run `git log
+--oneline -10` and `zig build test`. If tests aren't green, something
+broke after this was written — stop and figure out why before adding new
+code on top.
+
+**What's done (tasks #21-26 of the session's numbered list, all committed):**
+retention-bound thinking has replaced a flat 1-hour toy dataset almost
+everywhere except the one place that matters most — `main.zig` still
+calls `generate()` with the 1-hour default. Specifically done: the query
+layer was rechecked and two real O(n) scaling bugs fixed
+(`query_latest_by_type`, `query_spatial_radius`/`query_zone_hierarchy`);
+every storage backend gained real per-sensor-type eviction
+(`pruneOlderThan`) and a capacity hint mechanism (`setRetentionHint`); a
+7th backend (Lake, the cheap cold tier) was added and wired into
+`runner.zig`'s single registry; `generator.zig` now stores occupancy as
+transition-only events and vibration as anomaly-only events (not
+continuous streams); retention values were corrected with real research
+(co2/air_quality 3yr, WELL standard; flow 1yr, disclosed as a pragmatic
+non-researched choice).
+
+**What's freshly done, right at the handoff point (verify this landed —
+see "check state" above):** `generate()` gained the ability to carry
+occupancy state across two separate calls (so a "history" call followed
+by a "live" call doesn't manufacture a fake transition at the seam), and
+`GenerateConfig` gained a `now`/optional-`duration_ms` split: when
+`duration_ms` is set (every existing test), nothing changes; when it's
+`null`, each sensor's window becomes `[now - retention_days(that
+sensor's type), now]` — real per-type depth, sourced from `profileFor`.
+
+**What's NOT done — this is the actual remaining work:**
+
+1. **main.zig doesn't use any of this yet.** It still calls
+   `synthetic.generate(allocator, placement.sensors, .{}, null)` — the
+   old 1-hour-for-everyone call. The real production call needs
+   `duration_ms = null` and a real `now` value, generating full retention
+   depth for every placed sensor (not a sampled subset — every sensor
+   gets its own independently-generated dataset, per explicit user
+   instruction earlier in the redesign: "no generate for every sensor...
+   for all the 3200 temperature sensors placed all must have dataset").
+2. **The "live tail" isn't wired in.** The plan (confirmed correct by the
+   user) is NOT a new tick-loop subsystem — it's just a second
+   `generate()` call with a short window starting where history's window
+   ends, using the state-continuity mechanism just added. Nobody calls
+   it yet.
+3. **The 25-iteration/sample-cycling methodology is still live in
+   main.zig** (`pickOverallSamples`, `pickSamplesByType`,
+   `runOneAcrossSamples`, the `Sampler` struct, `TYPE_SAMPLE_CAP`). Per
+   explicit user decision this session, this is retired: once every
+   sensor has real, non-shared data, each query should run ONCE against
+   the real ingested world using real sensor_id/zone_id/floor_id
+   arguments — no repeated-cycling wrapper. This code needs deleting, not
+   patching.
+4. **`recommendBackend()`'s scoring still ignores coverage gaps.** Flagged
+   as an open finding on 2026-06-30, never fixed: a backend with 60%
+   coverage (because it evicted 40% of a type's data) scores only over
+   the 60% it has, instead of being penalized for the 40% it's missing.
+   Once real eviction is actually wired up (main.zig calling
+   `pruneOlderThan`/`setRetentionHint`, which it currently does NOT), this
+   stops being a hypothetical and starts actively producing misleading
+   recommendations — worth fixing before or immediately after the
+   main.zig rewire.
+5. **CLAUDE.md §3.4 still says "minimum 25 iterations."** Update it once
+   #3 above actually lands, not before (don't edit speculatively).
+6. **Retire the AoS/SoA-only equivalence tests' assumption of small
+   uniform data** — not urgent, lower priority than 1-4.
+
+**Two design decisions already made, don't re-litigate them:**
+- The live simulator is NOT new machinery — see #2 above. Do not build a
+  tick-loop/scheduler; it's unnecessary and the user already confirmed
+  the simpler approach ("this is doable don't you think?" — yes, and it's
+  simpler than either of us first assumed).
+- Full per-sensor generation, no sampling, no sharing values across
+  sibling sensors of the same type — the user was explicit and firm about
+  this after initially proposing (and then rejecting) a bounded-sample
+  compromise. Don't reintroduce it to save memory/time without asking.
+
+**One standing behavioral instruction, important given how this session
+started:** do not edit any file while a design/approach is still being
+discussed — only after an explicit go-ahead for that specific change. An
+unauthorized mid-discussion edit earlier this session caused a serious
+trust break that took real effort to recover from. If in doubt, ask.

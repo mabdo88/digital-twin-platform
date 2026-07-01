@@ -264,11 +264,26 @@ pub fn profileFor(sensor_type: SensorType) SensorProfile {
 
 pub const GenerateConfig = struct {
     seed: u64 = 42,
-    /// Simulation start, Unix epoch ms.
+    /// Simulation start, Unix epoch ms. Only used when `duration_ms` is
+    /// non-null (explicit-window mode — see `duration_ms` and `now`).
     start_time: i64 = 1_000_000,
-    /// Total duration to simulate, in ms. Default 1 hour — callers driving
-    /// a full benchmark dataset pass a longer duration explicitly.
-    duration_ms: i64 = 60 * 60 * 1000,
+    /// Explicit window length in ms, applied uniformly to every sensor
+    /// regardless of type, ending at `start_time + duration_ms` — this is
+    /// the test/short-window mode every existing caller already uses
+    /// (bounds-checking, determinism, shape-behavior, scale tests).
+    ///
+    /// If null instead, each sensor's window becomes retention-driven:
+    /// `[now - retention_days(that sensor's type) * ms_per_day, now]` —
+    /// the real per-type history depth (`profileFor`'s `retention_days`
+    /// is the single source of truth; see `now` for the window's end).
+    /// This is what a production caller (main.zig) sets to get real
+    /// per-type volume instead of one uniform window for every type.
+    duration_ms: ?i64 = 60 * 60 * 1000,
+    /// Only consulted when `duration_ms` is null: the simulated "present
+    /// moment" every sensor's retention-bound window ends at. Unix epoch
+    /// ms. Ignored in explicit-window mode (`start_time`/`duration_ms`
+    /// already fully determine the window there).
+    now: i64 = 0,
     /// sensor_id -> last emitted binary_event value, carried over from a
     /// PRIOR generate() call (via that call's out_final_binary_state) —
     /// used only when this call continues that sensor's timeline (e.g. a
@@ -310,12 +325,30 @@ pub fn generate(
     var out: std.ArrayList(SensorReading) = .empty;
     errdefer out.deinit(allocator);
 
-    const end_time = config.start_time + config.duration_ms;
+    const ms_per_day: i64 = 24 * 60 * 60 * 1000;
 
     for (sensors) |sensor| {
         const profile = profileFor(sensor.sensor_type);
         const period_ms = periodMs(profile.frequency_hz);
-        var t: i64 = config.start_time;
+
+        // Explicit-window mode (duration_ms set): every sensor shares the
+        // same [start_time, start_time+duration_ms) window, regardless of
+        // type — this is the test/short-window mode. Retention-driven
+        // mode (duration_ms null): THIS sensor's own window is derived
+        // from its type's canonical retention_days, ending at config.now
+        // — the real per-type history depth main.zig uses in production.
+        var window_start: i64 = undefined;
+        var window_end: i64 = undefined;
+        if (config.duration_ms) |d| {
+            window_start = config.start_time;
+            window_end = config.start_time + d;
+        } else {
+            const retention_ms: i64 = @as(i64, profile.retention_days) * ms_per_day;
+            window_start = config.now - retention_ms;
+            window_end = config.now;
+        }
+
+        var t: i64 = window_start;
 
         // Per-sensor mutable state for the shapes that need memory across
         // samples (binary_event's current state, stepwise_discrete's
@@ -348,7 +381,7 @@ pub fn generate(
         var step_level: f32 = profile.base_value;
         var step_hold: u32 = 0;
 
-        while (t < end_time) : (t += period_ms) {
+        while (t < window_end) : (t += period_ms) {
             switch (profile.shape) {
                 .diurnal_continuous => try out.append(allocator, .{
                     .sensor_id = sensor.sensor_id,
