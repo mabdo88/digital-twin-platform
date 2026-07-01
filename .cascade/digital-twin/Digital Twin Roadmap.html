@@ -88,11 +88,11 @@
   <div class="cards">
     <div class="card">
       <div class="card-label">Rechecked against</div>
-      <p>Actual repo state on 2026-06-30: code, <code>zig build test</code> / <code>zig build bench</code> output, and <code>backend-audit.md</code> — not assumed from the original task list.</p>
+      <p>Actual repo state on 2026-07-01: code, <code>zig build test</code> / <code>zig build</code> output, and <code>backend-audit.md</code> — not assumed from the original task list.</p>
     </div>
     <div class="card">
       <div class="card-label">Known gap</div>
-      <p>Phase 5 (building-type profiles) deliberately removed 2026-06-30 — superseded by per-sensor-type canonical data, see Phase 5 notes. Phase 6 done except sensor failure modes (6.2 — dropout/stale/drift). Phase 7: per-query winner table and a per-sensor-type recommendation now exist; a $-cost model and naive-vs-optimised comparison still don't. <code>recommendBackend()</code>'s score ignores a backend's data-coverage gaps (RingBuffer eviction) — disclosed, not penalized; open, unauthorized fix. Phase 8 (DuckDB calibration) hasn't been started.</p>
+      <p>Phase 5 (building-type profiles) deliberately removed 2026-06-30 — superseded by per-sensor-type canonical data, see Phase 5 notes. Phase 6 done except sensor failure modes (6.2 — dropout/stale/drift). Phase 7: per-query winner table, compound recommendations (real-time vs historical tracks), and per-sensor-type recommendations now exist; a $-cost model and naive-vs-optimised comparison still don't. The 25-iteration sampling methodology is retired (single-shot against real data). Phase 8 (DuckDB calibration) hasn't been started.</p>
     </div>
   </div>
 
@@ -148,7 +148,7 @@ var PHASES = [
       { code: '3.4', title: 'Spatial queries (Q9–Q10)', done: true, note: 'query_spatial_radius/zone_hierarchy implemented.' },
       { code: '3.5', title: 'Anomaly detection (Q11–Q12)', done: true, note: 'query_anomalies/threshold_breach implemented.' },
       { code: '3.6', title: 'Runner loops queries × backends', done: true,
-        note: 'runner.zig loops all 12 queries × all backends automatically; latency.md/json generated. Per-dataset iteration count is now 25 (was 100), changed 2026-06-28.' }
+        note: 'runner.zig loops all 12 queries × all backends automatically; latency.md/json generated. The real per-building path (main.zig) now measures each query once against full per-sensor data (25-iteration sampling retired 2026-07-01). The internal runner.zig regression suite still uses fixed iterations as a CI-style check.' }
     ]
   },
   {
@@ -190,7 +190,7 @@ var PHASES = [
       { code: '6.4', title: 'Deterministic seeded RNG', done: true,
         note: 'generate() seeds one std.Random.DefaultPrng from config.seed, consumed in sensor order — same sensors + config always produce byte-identical output (tested).' },
       { code: '6.5', title: 'Scale from 100 to 100,000 sensors', done: true,
-        note: 'Tested at the generator level up to 100,000 sensors without blowing up. NOT yet exercised through the full multi-backend ingest+query benchmark pipeline — dataset.zig\'s scale tiers still top out at 100 sensors / 50K readings.' }
+        note: 'Generator tested at scale up to 100,000 sensors. Full pipeline (main.zig) now generates real per-sensor retention-depth data for every placed sensor — tested end-to-end against real IFC files (16 sensors → 1M+ readings). dataset.zig\\'s internal scale tiers (100 sensors) remain as a CI regression fixture, not a ceiling.' }
     ]
   },
   {
@@ -199,12 +199,12 @@ var PHASES = [
     tasks: [
       { code: '7.1', title: 'Per-query winner table', done: true,
         note: 'engine/benchmark/report.zig\'s writeWinners() — per scale, per query, lowest-median backend plus runner-up and speedup ratio. Already existed before the 2026-06-29 recheck; this entry was stale.' },
-      { code: '7.2', title: 'Per-sensor-type recommendation', done: false,
-        note: 'Not implemented. 2026-06-29 added a per-BUILDING-TYPE recommendation instead (recommendBackend() weights a profile\'s query_mix against per-query latency, closing Phase 5.2) — a different granularity. A per-sensor-type recommendation (e.g. "energy readings -> Columnar") would need its own query-to-sensor-type mapping and is still open.' },
+      { code: '7.2', title: 'Per-sensor-type recommendation', done: true,
+        note: 'Implemented 2026-07-01 as compound per-type recommendations: main.zig runs recommendCompound for each placed sensor type, scoped to that type\\'s canonical type-scoped queries. Results shown in console output and recommendation.md. The old per-building-type recommendBackend() is removed; EXPECTED_WINNERS table removed; recommendations are now compound (real-time track + historical track) per building and per sensor type.' },
       { code: '7.3', title: 'Cost model + formula', done: false, note: 'Not started — engine/benchmark/cost_model.zig does not exist.' },
       { code: '7.4', title: 'Naive vs optimised cost comparison', done: false, note: 'Not started — depends on 7.3.' },
       { code: '7.5', title: 'JSON + Markdown output', done: true,
-        note: 'latency.md / latency.json / benchmark.html cover raw per-query latency and (added 2026-06-29) the query_mix-weighted per-building-type recommendation ("Recommended Backend by Building Type" section / "recommendations" JSON array). Winner-by-COST still doesn\'t exist (needs 7.3) but this task was specifically about output format, which is done.' }
+        note: 'latency.md / latency.json / benchmark.html cover raw per-query latency. recommendation.md (written by main.zig) emits the compound recommendation: real-time winner + historical winner, per-building and per-sensor-type. Winner-by-COST still doesn\'t exist (needs 7.3) but this task was specifically about output format, which is done.' }
     ]
   },
   {
@@ -233,7 +233,7 @@ function render() {
   var donePct = Math.round((doneTasks / totalTasks) * 100);
 
   document.getElementById('subtitle').textContent =
-    'Headless storage-benchmarking engine · Zig + ECS · 8 phases · ' + totalTasks + ' tasks · rechecked 2026-06-30';
+    'Headless storage-benchmarking engine · Zig + ECS · 8 phases · ' + totalTasks + ' tasks · rechecked 2026-07-01';
   document.getElementById('donePct').textContent = donePct + '% complete';
   document.getElementById('doneFrac').textContent = doneTasks + ' / ' + totalTasks;
   document.getElementById('overallBar').style.width = donePct + '%';
