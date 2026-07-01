@@ -269,6 +269,19 @@ pub const GenerateConfig = struct {
     /// Total duration to simulate, in ms. Default 1 hour — callers driving
     /// a full benchmark dataset pass a longer duration explicitly.
     duration_ms: i64 = 60 * 60 * 1000,
+    /// sensor_id -> last emitted binary_event value, carried over from a
+    /// PRIOR generate() call (via that call's out_final_binary_state) —
+    /// used only when this call continues that sensor's timeline (e.g. a
+    /// short "live" window generated right after a "history" window
+    /// ends). Without this, a follow-up call has no memory of the
+    /// previous call's last state, so its first tick would always emit a
+    /// reading — even if the real state didn't actually change — because
+    /// generate() has no way to tell a genuine transition from "this is
+    /// simply the first tick I've ever seen for this sensor." A sensor_id
+    /// missing from this map (or a null config) behaves exactly like a
+    /// fresh call (first tick always emits). Read-only — not owned or
+    /// freed by generate().
+    initial_binary_state: ?*const std.AutoHashMap(u32, f32) = null,
 };
 
 /// Generate deterministic, physically-plausible readings for every sensor in
@@ -277,10 +290,19 @@ pub const GenerateConfig = struct {
 /// `sensor.frequency_hz`; the type's profile is the single source of truth)
 /// across `config.duration_ms`. Returns a slice owned by the caller (free
 /// with `allocator`). Empty `sensors` returns an empty slice, not an error.
+///
+/// `out_final_binary_state`, if non-null, gets populated with each
+/// binary_event sensor's last emitted value at the end of this call —
+/// pass the SAME map into a follow-up call's `config.initial_binary_state`
+/// (e.g. generating a short "live" window right after a "history" window)
+/// so that call doesn't manufacture a spurious transition on its first
+/// tick. Caller owns this map (create it empty, generate() only inserts
+/// into it — does not clear or take ownership).
 pub fn generate(
     allocator: std.mem.Allocator,
     sensors: []const SensorMetadata,
     config: GenerateConfig,
+    out_final_binary_state: ?*std.AutoHashMap(u32, f32),
 ) ![]SensorReading {
     var prng = std.Random.DefaultPrng.init(config.seed);
     const rand = prng.random();
@@ -300,7 +322,18 @@ pub fn generate(
         // current level/hold). Declared once per sensor, outside the
         // sample loop, so state persists across that sensor's own
         // timeline — only the relevant one is touched per shape.
-        var binary_state: f32 = 0.0;
+        //
+        // binary_state and binary_last_emitted both seed from the SAME
+        // carried-over value (config.initial_binary_state), not just
+        // binary_last_emitted alone — binary_state drives the actual
+        // Markov-chain decision (sampleBinaryEvent's reroll logic), so if
+        // only binary_last_emitted were seeded, the underlying generative
+        // state would still start fresh at 0.0 and could immediately
+        // "disagree" with the carried-over last-emitted value, producing
+        // exactly the spurious-transition artifact this mechanism exists
+        // to prevent.
+        const carried_state: ?f32 = if (config.initial_binary_state) |m| m.get(sensor.sensor_id) else null;
+        var binary_state: f32 = carried_state orelse 0.0;
         // binary_event is an EVENT LOG, not periodic polling: a real
         // occupancy/PIR system only reports a reading when the state
         // actually transitions (occupied <-> unoccupied), never "still
@@ -309,8 +342,9 @@ pub fn generate(
         // where the value actually changed from the last EMITTED value
         // get appended. The first tick always emits (there is no prior
         // emitted value to compare against — a real system reports its
-        // initial state at startup).
-        var binary_last_emitted: ?f32 = null;
+        // initial state at startup) UNLESS config.initial_binary_state
+        // carried one over from a prior call.
+        var binary_last_emitted: ?f32 = carried_state;
         var step_level: f32 = profile.base_value;
         var step_hold: u32 = 0;
 
@@ -358,6 +392,12 @@ pub fn generate(
                         });
                     }
                 },
+            }
+        }
+
+        if (out_final_binary_state) |m| {
+            if (profile.shape == .binary_event) {
+                if (binary_last_emitted) |v| try m.put(sensor.sensor_id, v);
             }
         }
     }
@@ -504,9 +544,9 @@ test "generate is deterministic for a fixed seed" {
         .{ .sensor_id = 1, .sensor_type = .energy, .frequency_hz = 1.0, .element_id = 2 },
     };
 
-    const a = try generate(testing.allocator, &sensors, .{ .duration_ms = 6 * 60 * 60 * 1000 });
+    const a = try generate(testing.allocator, &sensors, .{ .duration_ms = 6 * 60 * 60 * 1000 }, null);
     defer testing.allocator.free(a);
-    const b = try generate(testing.allocator, &sensors, .{ .duration_ms = 6 * 60 * 60 * 1000 });
+    const b = try generate(testing.allocator, &sensors, .{ .duration_ms = 6 * 60 * 60 * 1000 }, null);
     defer testing.allocator.free(b);
 
     try testing.expectEqual(a.len, b.len);
@@ -523,9 +563,9 @@ test "generate: different seeds produce different noise" {
         .{ .sensor_id = 0, .sensor_type = .temperature, .frequency_hz = 1.0, .element_id = 1 },
     };
 
-    const a = try generate(testing.allocator, &sensors, .{ .seed = 1, .duration_ms = 60 * 1000 });
+    const a = try generate(testing.allocator, &sensors, .{ .seed = 1, .duration_ms = 60 * 1000 }, null);
     defer testing.allocator.free(a);
-    const b = try generate(testing.allocator, &sensors, .{ .seed = 2, .duration_ms = 60 * 1000 });
+    const b = try generate(testing.allocator, &sensors, .{ .seed = 2, .duration_ms = 60 * 1000 }, null);
     defer testing.allocator.free(b);
 
     try testing.expectEqual(a.len, b.len);
@@ -546,7 +586,7 @@ test "generate: every reading respects its sensor type's physical bounds" {
     // 3 days, enough for every sensor to pass through peak and trough hours
     // many times — if clamping were broken, this would catch it regardless
     // of which hour the test happens to sample.
-    const readings = try generate(testing.allocator, &sensors, .{ .duration_ms = 3 * 24 * 60 * 60 * 1000 });
+    const readings = try generate(testing.allocator, &sensors, .{ .duration_ms = 3 * 24 * 60 * 60 * 1000 }, null);
     defer testing.allocator.free(readings);
 
     try testing.expect(readings.len > 0);
@@ -558,7 +598,7 @@ test "generate: every reading respects its sensor type's physical bounds" {
 }
 
 test "generate: empty sensor list returns an empty slice, not an error" {
-    const readings = try generate(testing.allocator, &.{}, .{});
+    const readings = try generate(testing.allocator, &.{}, .{}, null);
     defer testing.allocator.free(readings);
     try testing.expectEqual(@as(usize, 0), readings.len);
 }
@@ -602,7 +642,7 @@ test "generate scales to 100,000 sensors (Phase 1 ceiling) without blowing up" {
     // bursty_impulsive branch). So readings.len is bounded above by
     // num_sensors, not equal to it; the real thing this test checks is
     // that generation completes and doesn't blow up at this scale.
-    const readings = try generate(allocator, sensors, .{ .duration_ms = 2000 });
+    const readings = try generate(allocator, sensors, .{ .duration_ms = 2000 }, null);
     defer allocator.free(readings);
 
     try testing.expect(readings.len > 0);
@@ -620,7 +660,7 @@ test "binary_event (occupancy): every reading is exactly 0.0 or 1.0, never fract
     const sensors = [_]SensorMetadata{
         .{ .sensor_id = 0, .sensor_type = .occupancy, .frequency_hz = 1.0, .element_id = 0 },
     };
-    const readings = try generate(testing.allocator, &sensors, .{ .duration_ms = 2 * 24 * 60 * 60 * 1000 });
+    const readings = try generate(testing.allocator, &sensors, .{ .duration_ms = 2 * 24 * 60 * 60 * 1000 }, null);
     defer testing.allocator.free(readings);
 
     try testing.expect(readings.len > 0);
@@ -633,7 +673,7 @@ test "binary_event (occupancy): state has dwell time, not flickering every sampl
     const sensors = [_]SensorMetadata{
         .{ .sensor_id = 0, .sensor_type = .occupancy, .frequency_hz = 1.0, .element_id = 0 },
     };
-    const readings = try generate(testing.allocator, &sensors, .{ .duration_ms = 2 * 24 * 60 * 60 * 1000 });
+    const readings = try generate(testing.allocator, &sensors, .{ .duration_ms = 2 * 24 * 60 * 60 * 1000 }, null);
     defer testing.allocator.free(readings);
 
     // binary_event is an event log: only transitions are stored, so every
@@ -659,11 +699,92 @@ test "binary_event (occupancy): state has dwell time, not flickering every sampl
     try testing.expect(wide_gaps > 0);
 }
 
+test "binary_event (occupancy): carrying over the last emitted state suppresses a spurious transition at a continuation call's first tick" {
+    const sensors = [_]SensorMetadata{
+        .{ .sensor_id = 0, .sensor_type = .occupancy, .frequency_hz = 1.0, .element_id = 0 },
+    };
+    // A window short enough that only ONE tick is ever evaluated (period_ms
+    // for occupancy is 60_000ms, far longer than this 1ms window) — isolates
+    // exactly the "first tick of a continuation call" scenario this
+    // mechanism exists for.
+    const one_tick_config = GenerateConfig{ .seed = 7, .start_time = 5_000_000, .duration_ms = 1 };
+
+    // Baseline: no carried-over state. The first tick of ANY fresh call
+    // always emits (no prior value to compare against), so this must
+    // produce exactly one reading — this is what generate() does today,
+    // without the fix, at the seam between two calls.
+    const baseline = try generate(testing.allocator, &sensors, one_tick_config, null);
+    defer testing.allocator.free(baseline);
+    try testing.expectEqual(@as(usize, 1), baseline.len);
+    const value_this_tick_computes = baseline[0].value;
+
+    // Same seed, same single tick -> sampleBinaryEvent's RNG draws are
+    // identical regardless of the seeded starting state (the reroll-or-not
+    // decision doesn't depend on the current state value), so this call is
+    // guaranteed to compute the exact same value as the baseline call.
+    // Carrying over that SAME value as "the last emitted state" must
+    // therefore suppress the reading entirely (no transition occurred).
+    var carried = std.AutoHashMap(u32, f32).init(testing.allocator);
+    defer carried.deinit();
+    try carried.put(0, value_this_tick_computes);
+
+    const continuation = try generate(testing.allocator, &sensors, .{
+        .seed = one_tick_config.seed,
+        .start_time = one_tick_config.start_time,
+        .duration_ms = one_tick_config.duration_ms,
+        .initial_binary_state = &carried,
+    }, null);
+    defer testing.allocator.free(continuation);
+    try testing.expectEqual(@as(usize, 0), continuation.len);
+
+    // Sanity check the fix isn't a no-op that just always suppresses:
+    // carrying over the OPPOSITE value must still emit, since that's a
+    // real (apparent) transition relative to the carried state.
+    const opposite_value: f32 = if (value_this_tick_computes == 0.0) 1.0 else 0.0;
+    var carried_wrong = std.AutoHashMap(u32, f32).init(testing.allocator);
+    defer carried_wrong.deinit();
+    try carried_wrong.put(0, opposite_value);
+
+    const continuation_wrong = try generate(testing.allocator, &sensors, .{
+        .seed = one_tick_config.seed,
+        .start_time = one_tick_config.start_time,
+        .duration_ms = one_tick_config.duration_ms,
+        .initial_binary_state = &carried_wrong,
+    }, null);
+    defer testing.allocator.free(continuation_wrong);
+    try testing.expectEqual(@as(usize, 1), continuation_wrong.len);
+}
+
+test "binary_event (occupancy): out_final_binary_state captures the last emitted value for a follow-up call to consume" {
+    const sensors = [_]SensorMetadata{
+        .{ .sensor_id = 0, .sensor_type = .occupancy, .frequency_hz = 1.0, .element_id = 0 },
+    };
+
+    var final_state = std.AutoHashMap(u32, f32).init(testing.allocator);
+    defer final_state.deinit();
+
+    const history = try generate(testing.allocator, &sensors, .{
+        .seed = 3,
+        .start_time = 1_000_000,
+        .duration_ms = 24 * 60 * 60 * 1000,
+    }, &final_state);
+    defer testing.allocator.free(history);
+
+    try testing.expect(history.len > 0);
+    const last_reading_value = history[history.len - 1].value;
+
+    // The captured state must match the last EMITTED reading's value —
+    // that's the definition of "last known state" a follow-up call needs.
+    const captured = final_state.get(0);
+    try testing.expect(captured != null);
+    try testing.expectEqual(last_reading_value, captured.?);
+}
+
 test "stepwise_discrete (energy): holds an identical value across consecutive samples, not continuously varying" {
     const sensors = [_]SensorMetadata{
         .{ .sensor_id = 0, .sensor_type = .energy, .frequency_hz = 1.0, .element_id = 0 },
     };
-    const readings = try generate(testing.allocator, &sensors, .{ .duration_ms = 24 * 60 * 60 * 1000 });
+    const readings = try generate(testing.allocator, &sensors, .{ .duration_ms = 24 * 60 * 60 * 1000 }, null);
     defer testing.allocator.free(readings);
 
     try testing.expect(readings.len > 1);
@@ -679,7 +800,7 @@ test "bursty_impulsive (vibration): only burst events are stored, never the base
         .{ .sensor_id = 0, .sensor_type = .vibration, .frequency_hz = 1.0, .element_id = 0 },
     };
     const duration_ms: i64 = 7 * 24 * 60 * 60 * 1000;
-    const readings = try generate(testing.allocator, &sensors, .{ .duration_ms = duration_ms });
+    const readings = try generate(testing.allocator, &sensors, .{ .duration_ms = duration_ms }, null);
     defer testing.allocator.free(readings);
 
     const profile = profileFor(.vibration);

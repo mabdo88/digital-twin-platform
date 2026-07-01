@@ -107,7 +107,7 @@ test "validateBounds: generator output has zero violations across all sensor typ
         sensors[i] = .{ .sensor_id = @intCast(i), .sensor_type = st, .frequency_hz = 0.5, .element_id = 0 };
     }
 
-    const readings = try generator.generate(testing.allocator, &sensors, .{ .duration_ms = 3 * 24 * 60 * 60 * 1000 });
+    const readings = try generator.generate(testing.allocator, &sensors, .{ .duration_ms = 3 * 24 * 60 * 60 * 1000 }, null);
     defer testing.allocator.free(readings);
 
     const violations = try validateBounds(testing.allocator, readings);
@@ -140,7 +140,7 @@ test "hasDailyPattern: generator output shows a measurable day/night cycle for a
     const sensors = [_]generator.SensorMetadata{
         .{ .sensor_id = 0, .sensor_type = .energy, .frequency_hz = 0.5, .element_id = 0 },
     };
-    const readings = try generator.generate(testing.allocator, &sensors, .{ .duration_ms = 5 * 24 * 60 * 60 * 1000 });
+    const readings = try generator.generate(testing.allocator, &sensors, .{ .duration_ms = 5 * 24 * 60 * 60 * 1000 }, null);
     defer testing.allocator.free(readings);
 
     try testing.expect(hasDailyPattern(readings, .energy));

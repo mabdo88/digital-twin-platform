@@ -622,7 +622,7 @@ pub fn main(init: std.process.Init) !void {
     // windows (e.g. 30 days of 100Hz vibration) aren't generated outright.
     std.debug.print("Generating synthetic readings for {d} sensors...\n", .{placement.sensors.len});
     const gen_start = std.Io.Clock.awake.now(io);
-    const readings = try synthetic.generate(allocator, placement.sensors, .{});
+    const readings = try synthetic.generate(allocator, placement.sensors, .{}, null);
     defer allocator.free(readings);
     std.debug.print("Generated {d} synthetic readings ({d:.1}s).\n", .{ readings.len, elapsedSeconds(io, gen_start) });
 
