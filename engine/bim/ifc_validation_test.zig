@@ -74,7 +74,7 @@ test "real IFC: both Revit-exported files parse and place sensors without error"
                 .beam => beams += 1,
                 .wall => walls += 1,
                 .slab => slabs += 1,
-                .equipment => equipment_count += 1,
+                .flow_terminal, .flow_fitting, .flow_controller, .flow_moving_device, .flow_storage_device, .energy_conversion_device, .distribution_control_element, .building_element_proxy, .electric_appliance, .alarm, .cable_segment => equipment_count += 1,
                 else => {},
             }
         }
@@ -85,13 +85,20 @@ test "real IFC: both Revit-exported files parse and place sensors without error"
                 path,
                 model.entities.count(),
                 model.building_elements.len,
-                buildings, storeys, spaces, walls, slabs, beams, flow_segments, equipment_count,
+                buildings,
+                storeys,
+                spaces,
+                walls,
+                slabs,
+                beams,
+                flow_segments,
+                equipment_count,
                 model.zones.len,
                 model.equipment.len,
             },
         );
 
-        // Every .equipment BuildingElement must have a matching
+        // Every equipment-typed BuildingElement must have a matching
         // EquipmentMetadata row (always emitted, even if manufacturer/model
         // end up "" — see components.zig's EquipmentMetadata doc comment).
         try testing.expectEqual(equipment_count, model.equipment.len);
@@ -135,15 +142,26 @@ test "real IFC: both Revit-exported files parse and place sensors without error"
 
         // Placement: with DEFAULT_RULES and the 100 m² area fallback, every
         // matching element produces at least one sensor of each type. These
-        // electrical/services models lean heavily on flow_segments and have
-        // few spaces — but `>=1` is the right floor: the placer should not
-        // silently produce zero sensors on a real building.
+        // electrical/services models lean heavily on equipment types and may
+        // have few spaces — but `>=1` is the right floor: the placer should
+        // not silently produce zero sensors on a real building.
         var p = try placer.place(testing.allocator, model.building_elements, model.zones, .{});
         defer p.deinit();
 
         std.debug.print("  sensors placed: {d}\n", .{p.sensors.len});
 
-        const matching = spaces + flow_segments + beams + equipment_count;
+        // flow_segments no longer get sensors (sensors go on equipment).
+        // Only equipment types with placement rules contribute sensors —
+        // passive types (flow_fitting, alarm, building_element_proxy,
+        // cable_segment, distribution_control_element) don't.
+        var sensor_equipment: usize = 0;
+        for (model.building_elements) |e| {
+            switch (e.element_type) {
+                .flow_terminal, .flow_controller, .flow_moving_device, .flow_storage_device, .energy_conversion_device, .electric_appliance => sensor_equipment += 1,
+                else => {},
+            }
+        }
+        const matching = spaces + beams + sensor_equipment;
         if (matching > 0) {
             try testing.expect(p.sensors.len >= matching);
 

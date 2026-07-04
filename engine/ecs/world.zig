@@ -27,10 +27,16 @@ pub fn World(comptime Backend: type) type {
     return struct {
         backend: Backend,
         allocator: std.mem.Allocator,
-        /// Cache for iterateAll(), valid until the next insert(). See
-        /// iterateAll's doc comment for why this lives here instead of in
-        /// each backend.
+        /// Cache for iterateAll(), valid until the next insert()/prune().
+        /// See iterateAll's doc comment for why this lives here instead of
+        /// in each backend.
         cached_all: ?[]const sb.SensorReading = null,
+        /// Dirty flag — set by insert()/pruneOlderThan(), cleared when
+        /// caches are rebuilt. Instead of eagerly freeing caches on every
+        /// insert (which is wasteful when inserting thousands of readings
+        /// in a loop), we just mark dirty and lazily rebuild on first
+        /// access.
+        cache_dirty: bool = false,
         /// sensor_id -> indices into cached_all for that sensor's own
         /// readings. Lazily built from cached_all on first
         /// readingsForSensor() call, invalidated alongside cached_all on
@@ -46,11 +52,6 @@ pub fn World(comptime Backend: type) type {
         /// type. Same shape as sensor_index, keyed by type instead of
         /// sensor_id. See readingsForType's doc comment.
         type_index: ?std.AutoHashMap(sb.SensorType, std.ArrayList(u32)) = null,
-        /// Every distinct sensor_id present in cached_all, sorted ascending.
-        /// Derived from sensor_index's key set (built once, invalidated
-        /// alongside it on insert()). See allSensorIds's doc comment.
-        all_sensor_ids: ?[]const u32 = null,
-
         const Self = @This();
 
         pub fn init(allocator: std.mem.Allocator) !Self {
@@ -85,32 +86,17 @@ pub fn World(comptime Backend: type) type {
             }
         }
 
-        fn freeAllSensorIds(self: *Self) void {
-            if (self.all_sensor_ids) |ids| {
-                self.allocator.free(ids);
-                self.all_sensor_ids = null;
-            }
-        }
-
         pub fn deinit(self: *Self) void {
             if (self.cached_all) |all| self.allocator.free(all);
             self.freeSensorIndex();
             self.freeTypeStats();
             self.freeTypeIndex();
-            self.freeAllSensorIds();
             self.backend.deinit();
         }
 
         pub fn insert(self: *Self, reading: sb.SensorReading) !void {
-            if (self.cached_all) |all| {
-                self.allocator.free(all);
-                self.cached_all = null;
-            }
-            self.freeSensorIndex();
-            self.freeTypeStats();
-            self.freeTypeIndex();
-            self.freeAllSensorIds();
-            return self.backend.insert(reading);
+            self.cache_dirty = true;
+            try self.backend.insert(reading);
         }
 
         pub fn count(self: *const Self) usize {
@@ -141,6 +127,14 @@ pub fn World(comptime Backend: type) type {
         /// real read-optimized backend (immutable snapshot, rebuilt on
         /// write) would behave.
         pub fn iterateAll(self: *Self) ![]const sb.SensorReading {
+            if (self.cache_dirty) {
+                if (self.cached_all) |all| self.allocator.free(all);
+                self.cached_all = null;
+                self.freeSensorIndex();
+                self.freeTypeStats();
+                self.freeTypeIndex();
+                self.cache_dirty = false;
+            }
             if (self.cached_all) |all| return all;
             const all = try self.backend.iterateAll(self.allocator);
             self.cached_all = all;
@@ -148,8 +142,13 @@ pub fn World(comptime Backend: type) type {
         }
 
         fn ensureSensorIndex(self: *Self) !*std.AutoHashMap(u32, std.ArrayList(u32)) {
+            // iterateAll() handles the dirty flag: if cache_dirty, it
+            // frees cached_all + all indexes first, then rebuilds
+            // cached_all. So after this call, sensor_index is null if
+            // it was invalidated, and we can safely rebuild.
+            _ = try self.iterateAll();
             if (self.sensor_index != null) return &self.sensor_index.?;
-            const all = try self.iterateAll();
+            const all = self.cached_all.?;
             var idx: std.AutoHashMap(u32, std.ArrayList(u32)) = .init(self.allocator);
             errdefer {
                 var it = idx.valueIterator();
@@ -192,32 +191,18 @@ pub fn World(comptime Backend: type) type {
         }
 
         /// Every distinct sensor_id present in the dataset, sorted ascending
-        /// — cached until the next insert(), borrowed (do not free), same
-        /// convention as iterateAll().
+        /// — delegates to the backend's own topology index (zone_of hashmap
+        /// keys or tree leaves), never materializes readings. Owned — caller
+        /// frees with `self.allocator`.
         ///
-        /// Why this exists: query_spatial_radius used to call iterateAll()
-        /// and dedupe by sensor_id while recomputing that sensor's position
-        /// once per READING — at real per-sensor-type volume (tens of
-        /// thousands of readings per sensor) that's the same distance
-        /// calculation repeated tens of thousands of times for one sensor,
-        /// when the answer only ever depends on the distinct sensor count.
-        /// This index is built once from sensor_index's key set (itself
-        /// already cached), so the query becomes O(distinct sensors)
-        /// instead of O(total readings).
-        pub fn allSensorIds(self: *Self) ![]const u32 {
-            if (self.all_sensor_ids) |ids| return ids;
-            const idx = try self.ensureSensorIndex();
-            var ids = try self.allocator.alloc(u32, idx.count());
-            var it = idx.keyIterator();
-            var i: usize = 0;
-            while (it.next()) |k| : (i += 1) ids[i] = k.*;
-            std.mem.sort(u32, ids, {}, struct {
-                fn lt(_: void, a: u32, b: u32) bool {
-                    return a < b;
-                }
-            }.lt);
-            self.all_sensor_ids = ids;
-            return ids;
+        /// Why this exists: query_spatial_radius and query_zone_hierarchy
+        /// (depth >= 2) need the full sensor list. The old implementation
+        /// built this from iterateAll() — a full materialization of every
+        /// reading just to extract distinct sensor IDs. Now each backend
+        /// answers from its own sensor-to-zone/tree index in O(distinct
+        /// sensors), not O(total readings).
+        pub fn allSensorIds(self: *Self) ![]u32 {
+            return self.backend.allSensorIds(self.allocator);
         }
 
         /// Population mean/std-dev/count for every reading of `sensor_type`,
@@ -238,32 +223,31 @@ pub fn World(comptime Backend: type) type {
         /// backend report the same trivial lookup time, telling you nothing
         /// useful about which one is actually better at this query.
         pub fn statsForType(self: *Self, sensor_type: sb.SensorType) !TypeStats {
+            // iterateAll() handles the dirty flag — frees stale type_stats
+            // if needed, then rebuilds cached_all.
+            _ = try self.iterateAll();
             if (self.type_stats == null) {
                 self.type_stats = std.AutoHashMap(sb.SensorType, TypeStats).init(self.allocator);
             }
             if (self.type_stats.?.get(sensor_type)) |cached| return cached;
 
-            const all = try self.iterateAll();
+            const type_readings = try self.readingsForType(sensor_type);
+            defer self.allocator.free(type_readings);
 
-            var sum: f64 = 0;
-            var n: usize = 0;
-            for (all) |r| {
-                if (r.sensor_type != sensor_type) continue;
-                sum += @as(f64, r.value);
-                n += 1;
-            }
-
+            const n = type_readings.len;
             if (n == 0) {
                 const stats = TypeStats{ .mean = 0, .std_dev = 0, .count = 0 };
                 try self.type_stats.?.put(sensor_type, stats);
                 return stats;
             }
 
+            var sum: f64 = 0;
+            for (type_readings) |r| sum += @as(f64, r.value);
+
             const mean: f64 = sum / @as(f64, @floatFromInt(n));
 
             var sq_sum: f64 = 0;
-            for (all) |r| {
-                if (r.sensor_type != sensor_type) continue;
+            for (type_readings) |r| {
                 const d = @as(f64, r.value) - mean;
                 sq_sum += d * d;
             }
@@ -276,8 +260,9 @@ pub fn World(comptime Backend: type) type {
         }
 
         fn ensureTypeIndex(self: *Self) !*std.AutoHashMap(sb.SensorType, std.ArrayList(u32)) {
+            _ = try self.iterateAll();
             if (self.type_index != null) return &self.type_index.?;
-            const all = try self.iterateAll();
+            const all = self.cached_all.?;
             var idx: std.AutoHashMap(sb.SensorType, std.ArrayList(u32)) = .init(self.allocator);
             errdefer {
                 var it = idx.valueIterator();
@@ -327,18 +312,11 @@ pub fn World(comptime Backend: type) type {
         /// Removes every reading of `sensor_type` older than
         /// `cutoff_timestamp` from the backend. Invalidates every
         /// World-level cache (cached_all, sensor_index, type_stats,
-        /// type_index, all_sensor_ids) exactly like insert() does — pruning
+        /// type_index) exactly like insert() does — pruning
         /// changes the underlying dataset just as much as adding to it, and
         /// nothing here is safe to keep serving from a stale snapshot.
         pub fn pruneOlderThan(self: *Self, sensor_type: sb.SensorType, cutoff_timestamp: i64) !void {
-            if (self.cached_all) |all| {
-                self.allocator.free(all);
-                self.cached_all = null;
-            }
-            self.freeSensorIndex();
-            self.freeTypeStats();
-            self.freeTypeIndex();
-            self.freeAllSensorIds();
+            self.cache_dirty = true;
             return self.backend.pruneOlderThan(sensor_type, cutoff_timestamp);
         }
 

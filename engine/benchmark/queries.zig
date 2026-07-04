@@ -201,19 +201,13 @@ pub fn query_avg_zone_type(world: anytype, zone_id: u32, sensor_type: sb.SensorT
     const member_ids = try world.sensorIdsByZone(zone_id);
     defer world.allocator.free(member_ids);
 
-    // Fetch each member's own readings once (world.readingsForSensor — an
-    // index lookup, not a full-dataset scan) and collect the type-matching
-    // ones while tracking the latest timestamp among them.
-    var matching: std.ArrayList(sb.SensorReading) = .empty;
-    defer matching.deinit(world.allocator);
-
+    // Find the latest timestamp among matching sensors via getLatestBySensor
+    // (O(1) per sensor) — avoids fetching all readings just to find the end
+    // of the time window.
     var latest_ts: ?i64 = null;
     for (member_ids) |sid| {
-        const readings = try world.readingsForSensor(sid);
-        defer world.allocator.free(readings);
-        for (readings) |r| {
+        if (world.getLatestBySensor(sid)) |r| {
             if (r.sensor_type != sensor_type) continue;
-            try matching.append(world.allocator, r);
             if (latest_ts == null or r.timestamp > latest_ts.?) {
                 latest_ts = r.timestamp;
             }
@@ -226,12 +220,23 @@ pub fn query_avg_zone_type(world: anytype, zone_id: u32, sensor_type: sb.SensorT
     const window_ms: i64 = @as(i64, hours) * ms_per_hour;
     const start_time: i64 = end_time - window_ms;
 
+    // Use rangeByTime per sensor — pushes the time filter into the backend's
+    // index (binary search / granule index / sorted leaves) instead of
+    // materializing all readings and filtering in application code.
     var sum: f64 = 0;
     var count: usize = 0;
-    for (matching.items) |r| {
-        if (r.timestamp < start_time or r.timestamp > end_time) continue;
-        sum += @as(f64, r.value);
-        count += 1;
+    for (member_ids) |sid| {
+        const readings = try world.rangeByTime(.{
+            .sensor_id = sid,
+            .start_time = start_time,
+            .end_time = end_time,
+        });
+        defer world.allocator.free(readings);
+        for (readings) |r| {
+            if (r.sensor_type != sensor_type) continue;
+            sum += @as(f64, r.value);
+            count += 1;
+        }
     }
 
     if (count == 0) return 0.0;
@@ -252,19 +257,12 @@ pub fn query_floor_stats(world: anytype, floor_id: u32, sensor_type: sb.SensorTy
     const member_ids = try world.sensorIdsByFloor(floor_id);
     defer world.allocator.free(member_ids);
 
-    // Fetch each member's own readings once (world.readingsForSensor — an
-    // index lookup, not a full-dataset scan) and collect the type-matching
-    // ones while tracking the latest timestamp among them.
-    var matching: std.ArrayList(sb.SensorReading) = .empty;
-    defer matching.deinit(world.allocator);
-
+    // Find the latest timestamp among matching sensors via getLatestBySensor
+    // (O(1) per sensor).
     var latest_ts: ?i64 = null;
     for (member_ids) |sid| {
-        const readings = try world.readingsForSensor(sid);
-        defer world.allocator.free(readings);
-        for (readings) |r| {
+        if (world.getLatestBySensor(sid)) |r| {
             if (r.sensor_type != sensor_type) continue;
-            try matching.append(world.allocator, r);
             if (latest_ts == null or r.timestamp > latest_ts.?) {
                 latest_ts = r.timestamp;
             }
@@ -277,16 +275,26 @@ pub fn query_floor_stats(world: anytype, floor_id: u32, sensor_type: sb.SensorTy
     const window_ms: i64 = @as(i64, hours) * ms_per_hour;
     const start_time: i64 = end_time - window_ms;
 
+    // Use rangeByTime per sensor — pushes the time filter into the backend's
+    // index instead of materializing all readings.
     var min_val: f32 = std.math.floatMax(f32);
     var max_val: f32 = -std.math.floatMax(f32);
     var sum: f64 = 0;
     var count: usize = 0;
-    for (matching.items) |r| {
-        if (r.timestamp < start_time or r.timestamp > end_time) continue;
-        if (r.value < min_val) min_val = r.value;
-        if (r.value > max_val) max_val = r.value;
-        sum += @as(f64, r.value);
-        count += 1;
+    for (member_ids) |sid| {
+        const readings = try world.rangeByTime(.{
+            .sensor_id = sid,
+            .start_time = start_time,
+            .end_time = end_time,
+        });
+        defer world.allocator.free(readings);
+        for (readings) |r| {
+            if (r.sensor_type != sensor_type) continue;
+            if (r.value < min_val) min_val = r.value;
+            if (r.value > max_val) max_val = r.value;
+            sum += @as(f64, r.value);
+            count += 1;
+        }
     }
 
     if (count == 0) return .{ .min = 0.0, .max = 0.0, .avg = 0.0 };
@@ -413,19 +421,11 @@ pub fn query_daily_zone_rollup(world: anytype, zone_id: u32, sensor_type: sb.Sen
     const member_ids = try world.sensorIdsByZone(zone_id);
     defer world.allocator.free(member_ids);
 
-    // Fetch each member's own readings once (world.readingsForSensor — an
-    // index lookup, not a full-dataset scan) and collect the type-matching
-    // ones while tracking the latest timestamp among them.
-    var matching: std.ArrayList(sb.SensorReading) = .empty;
-    defer matching.deinit(world.allocator);
-
+    // Find the latest timestamp among matching sensors via getLatestBySensor.
     var latest_ts: ?i64 = null;
     for (member_ids) |sid| {
-        const readings = try world.readingsForSensor(sid);
-        defer world.allocator.free(readings);
-        for (readings) |r| {
+        if (world.getLatestBySensor(sid)) |r| {
             if (r.sensor_type != sensor_type) continue;
-            try matching.append(world.allocator, r);
             if (latest_ts == null or r.timestamp > latest_ts.?) {
                 latest_ts = r.timestamp;
             }
@@ -437,26 +437,36 @@ pub fn query_daily_zone_rollup(world: anytype, zone_id: u32, sensor_type: sb.Sen
     const end_time = latest_ts.?;
     const start_time: i64 = end_time - year_days * ms_per_day;
 
+    // Use rangeByTime per sensor — pushes the time filter into the backend's
+    // index instead of materializing all readings.
     var buckets = std.AutoHashMap(i64, BucketAcc).init(world.allocator);
     defer buckets.deinit();
 
-    for (matching.items) |r| {
-        if (r.timestamp < start_time or r.timestamp > end_time) continue;
+    for (member_ids) |sid| {
+        const readings = try world.rangeByTime(.{
+            .sensor_id = sid,
+            .start_time = start_time,
+            .end_time = end_time,
+        });
+        defer world.allocator.free(readings);
+        for (readings) |r| {
+            if (r.sensor_type != sensor_type) continue;
 
-        const bucket = @divFloor(r.timestamp, ms_per_day) * ms_per_day;
-        const gop = try buckets.getOrPut(bucket);
-        if (!gop.found_existing) {
-            gop.value_ptr.* = .{
-                .sum = @as(f64, r.value),
-                .min = r.value,
-                .max = r.value,
-                .count = 1,
-            };
-        } else {
-            gop.value_ptr.sum += @as(f64, r.value);
-            if (r.value < gop.value_ptr.min) gop.value_ptr.min = r.value;
-            if (r.value > gop.value_ptr.max) gop.value_ptr.max = r.value;
-            gop.value_ptr.count += 1;
+            const bucket = @divFloor(r.timestamp, ms_per_day) * ms_per_day;
+            const gop = try buckets.getOrPut(bucket);
+            if (!gop.found_existing) {
+                gop.value_ptr.* = .{
+                    .sum = @as(f64, r.value),
+                    .min = r.value,
+                    .max = r.value,
+                    .count = 1,
+                };
+            } else {
+                gop.value_ptr.sum += @as(f64, r.value);
+                if (r.value < gop.value_ptr.min) gop.value_ptr.min = r.value;
+                if (r.value > gop.value_ptr.max) gop.value_ptr.max = r.value;
+                gop.value_ptr.count += 1;
+            }
         }
     }
 
@@ -537,12 +547,10 @@ fn vec3DistSq(a: Vec3, b: Vec3) f32 {
 ///
 /// Pure: calls only world.iterateAll() — no backend-specific code.
 pub fn query_spatial_radius(world: anytype, center: Vec3, radius_m: f32) ![]EntityId {
-    // world.allSensorIds() is cached/borrowed at the World level, already
-    // sorted ascending — do not free. Position is per-sensor, not
-    // per-reading, so this only computes each sensor's distance once,
-    // regardless of how many readings that sensor has (see allSensorIds's
-    // doc comment for why iterating readings here was wrong at real scale).
+    // world.allSensorIds() delegates to the backend's topology index —
+    // owned, caller frees. Position is per-sensor, not per-reading.
     const sensor_ids = try world.allSensorIds();
+    defer world.allocator.free(sensor_ids);
 
     const radius_sq = radius_m * radius_m;
 
@@ -589,14 +597,11 @@ pub fn query_zone_hierarchy(world: anytype, zone_id: u32, depth: u32) ![]EntityI
             return world.sensorIdsByFloor(floor_id);
         },
         else => {
-            // world.allSensorIds() is cached/borrowed at the World level,
-            // already deduped and sorted ascending (see its doc comment) —
-            // clone into an owned slice since this function's contract
-            // (unlike depth 0/1's own sensorIdsByZone/Floor calls) is that
-            // the caller frees the result unconditionally regardless of
-            // depth. Cloning a per-sensor list is far cheaper than the old
-            // iterateAll()+hashset+sort over every reading.
+            // world.allSensorIds() is owned (caller frees) — dupe into a
+            // new slice since this function's contract is that the caller
+            // frees the result unconditionally regardless of depth.
             const sensor_ids = try world.allSensorIds();
+            defer world.allocator.free(sensor_ids);
             return try world.allocator.dupe(EntityId, sensor_ids);
         },
     }
@@ -683,20 +688,21 @@ pub fn query_anomalies(world: anytype, sensor_type: sb.SensorType, std_dev_thres
 /// anything, so every backend's binary search collapsed to "the whole
 /// array" and the sensor_id filter ran against every reading in the world).
 pub fn query_threshold_breach(world: anytype, sensor_id: u32, threshold: f32, min_duration_ms: i64) !?BreachEvent {
-    const readings = try world.readingsForSensor(sensor_id);
+    // Use getLatestBySensor to bound the time range, then rangeByTime which
+    // returns sorted results via the backend's index — no manual sort needed.
+    const latest = world.getLatestBySensor(sensor_id) orelse return null;
+
+    const readings = try world.rangeByTime(.{
+        .sensor_id = sensor_id,
+        .start_time = std.math.minInt(i64),
+        .end_time = latest.timestamp,
+    });
     defer world.allocator.free(readings);
 
     if (readings.len == 0) return null;
 
-    // readingsForSensor (unlike rangeByTime) makes no ordering guarantee —
-    // sort explicitly. Cheap: bounded by this sensor's own reading count,
-    // not the dataset.
-    const sorted: []sb.SensorReading = @constCast(readings);
-    std.mem.sort(sb.SensorReading, sorted, {}, struct {
-        fn lt(_: void, a: sb.SensorReading, b: sb.SensorReading) bool {
-            return a.timestamp < b.timestamp;
-        }
-    }.lt);
+    // rangeByTime returns results sorted by timestamp ascending, ties broken
+    // by sensor_id ascending — no explicit sort needed.
 
     var run_start_ts: ?i64 = null;
     var run_end_ts: i64 = 0;

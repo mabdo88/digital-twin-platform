@@ -41,21 +41,35 @@ pub const ElementType = enum {
     slab,
     beam,
     flow_segment,
-    /// Generic MEP/electrical equipment family — IfcFlowTerminal,
-    /// IfcFlowFitting, IfcFlowController, IfcFlowMovingDevice,
-    /// IfcFlowStorageDevice, IfcEnergyConversionDevice,
-    /// IfcDistributionControlElement, IfcBuildingElementProxy,
-    /// IfcElectricAppliance, IfcAlarm, IfcCableCarrierSegment,
-    /// IfcCableSegment. Added after validating against the two real Revit
-    /// exports in assets/IFC/: one of them (2KHRJ17-HASC-SD-710-EV) has ZERO
-    /// IfcSpace/IfcWall/IfcFlowSegment elements but hundreds of these types
-    /// (100 IfcBuildingElementProxy, 33 IfcAlarm, 22 IfcElectricAppliance) —
-    /// without this bucket that file's entire equipment inventory silently
-    /// vanishes into `.other` and the sensor placer emits zero sensors on a
-    /// real building. One coarse bucket (not one enum value per IFC type) to
-    /// match this file's existing granularity (wall/slab/beam, not
-    /// per-material variants).
-    equipment,
+    /// IfcFlowTerminal — endpoints: diffusers, registers, fixtures,
+    /// terminal units. Sensors: flow, temperature.
+    flow_terminal,
+    /// IfcFlowFitting — duct/pipe fittings: elbows, tees, transitions.
+    /// No sensors by default (passive components).
+    flow_fitting,
+    /// IfcFlowController — dampers, valves, VAV boxes. Sensors: flow.
+    flow_controller,
+    /// IfcFlowMovingDevice — pumps, fans, blowers. Sensors: vibration, flow.
+    flow_moving_device,
+    /// IfcFlowStorageDevice — tanks, reservoirs. Sensors: flow.
+    flow_storage_device,
+    /// IfcEnergyConversionDevice — boilers, chillers, heat exchangers.
+    /// Sensors: energy, vibration, flow.
+    energy_conversion_device,
+    /// IfcDistributionControlElement — sensors, actuators, controllers
+    /// (BMS hardware itself). No sensors placed (it IS the sensor).
+    distribution_control_element,
+    /// IfcBuildingElementProxy — non-standard elements, proxy geometry.
+    /// No sensors by default (catch-all for undefined building elements).
+    building_element_proxy,
+    /// IfcElectricAppliance — electrical equipment. Sensors: energy.
+    electric_appliance,
+    /// IfcAlarm — fire/smoke/security alarms. No sensors placed
+    /// (alarm devices, not monitoring sensors).
+    alarm,
+    /// IfcCableCarrierSegment, IfcCableSegment — cable trays, conduits,
+    /// cabling. No sensors by default (passive infrastructure).
+    cable_segment,
     other,
 };
 
@@ -122,8 +136,8 @@ pub const SensorType = @import("../ecs/storage/storage_backend.zig").SensorType;
 pub const SensorMetadata = struct {
     sensor_id: u32,
     sensor_type: SensorType,
-    /// Reporting frequency in Hz (per spec §7.3 defaults: occupancy 0.1 Hz,
-    /// flow/temp 1.0, structural 10.0).
+    /// Reporting frequency in Hz — from synthetic/generator.zig's profileFor,
+    /// the canonical per-type source (e.g. temperature 1/300, energy 1/900).
     frequency_hz: f32,
     /// `ifc_id` of the BuildingElement this sensor is attached to.
     element_id: u32,
@@ -141,11 +155,15 @@ pub const ZoneLocation = struct {
     position: Vec3,
 };
 
-/// Sidecar metadata for `.equipment`-typed BuildingElements, sourced from
-/// IfcRelDefinesByProperties -> IfcPropertySet -> IfcPropertySingleValue
-/// (see ifc_parser.zig's resolveHierarchy). Fields default to "" when the
-/// source file carries no matching property — every `.equipment` element
-/// gets one of these, never a missing/optional record (same "always emit,
+/// Sidecar metadata for equipment-typed BuildingElements (flow_terminal,
+/// flow_fitting, flow_controller, flow_moving_device, flow_storage_device,
+/// energy_conversion_device, distribution_control_element,
+/// building_element_proxy, electric_appliance, alarm, cable_segment),
+/// sourced from IfcRelDefinesByProperties -> IfcPropertySet ->
+/// IfcPropertySingleValue (see ifc_parser.zig's resolveHierarchy). Fields
+/// default to "" when the source file carries no matching property — every
+/// equipment element gets one of these, never a missing/optional record
+/// (same "always emit,
 /// default gracefully" rule ZoneMetadata.area_m2 already follows).
 ///
 /// `age_days` / `efficiency` are NOT extracted: neither real fixture in

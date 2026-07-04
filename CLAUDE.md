@@ -68,12 +68,19 @@ rather than assumes.
 
 ### 3.4 Benchmark rules
 - **All benchmarks are deterministic.** RNG is seeded; same input → same output, always.
-- Metrics are recorded by **`metrics_system.zig` only** (`timeQuery`). No ad-hoc timing elsewhere.
+- Metrics are recorded by **`metrics_system.zig` only** (`timeQuery` for queries,
+  `timeMutation` for state-mutating operations like ingest/prune). No ad-hoc timing elsewhere.
+- **Live day-zero simulation** (replaces the former bulk-preload + live-tail
+  methodology): the building starts at simulated day zero with empty backends.
+  A `synthetic.Stream` feeds readings chunk-by-chunk (1 simulated day per chunk)
+  into each backend, pruning to retention windows as simulated time advances,
+  with queries benchmarked at log-spaced checkpoints. Sim duration derives from
+  the placed sensor types' retention depths (`deriveSimDays`). See
+  `benchmark/simulation.zig` and `.cascade/digital-twin/live-simulation-plan.md`.
 - **Iteration count is workload-dependent, by deliberate design decision (see
   `.cascade/digital-twin/storage-redesign-plan.md`):**
-  - The **real per-building path** (`main.zig`) generates each sensor's own full,
-    retention-depth dataset (no sampling, no sharing across siblings), then measures
-    each query **once** against that real ingested data (`timeQuery` with
+  - The **real per-building path** (`main.zig`) runs the live simulation and
+    measures each query **once** at each checkpoint (`timeQuery` with
     `iterations = 1`). The old "minimum 25 iterations" rule existed only to fake
     statistical spread over a 1-hour toy dataset via resampling; with real per-sensor
     volume there is nothing to resample, so single-shot is the honest measurement.
@@ -124,8 +131,9 @@ engine/
 ├── benchmark/
 │   ├── runner.zig              // Orchestrates runs across all backends
 │   ├── queries.zig             // All 12 query patterns
+│   ├── simulation.zig          // Live day-zero simulation harness
 │   ├── cost_model.zig          // Cloud-cost estimation
-│   └── report.zig              // Report generation
+│   └── report.zig              // Report generation (MD + JSON + HTML)
 ├── calibration/
 │   └── duckdb_adapter.zig      // Optional real-engine validation
 └── main.zig                    // Entry point
@@ -214,13 +222,20 @@ The same folder also holds **status docs** (read as current state, not as proced
   against actual repo state each time it's updated. Treat this as more current than
   `AGENT.md`'s phase checklists, which have drifted from what was actually built
   (e.g. `AGENT.md`'s Phase 3 query list no longer matches `queries.zig`).
-- **`storage-redesign-plan.md`** — agreed 2026-06-30, **implemented**: real
-  retention-bound per-sensor datasets (no toy 1h dataset, no sampling/replication
-  across sibling sensors), a live tail (second `generate()` call, no tick-loop),
-  RingBuffer capped at 10 readings/sensor (flat, all types) via
-  `setRetentionHint`, and compound recommendations splitting real-time vs
-  historical tracks. Read it before touching `synthetic/generator.zig`,
-  `ecs/storage/*`, `benchmark/queries.zig`, or `main.zig`'s orchestration.
+- **`storage-redesign-plan.md`** — agreed 2026-06-30, **implemented and superseded
+  by the live simulation**: real retention-bound per-sensor datasets were the
+  first step; the current methodology is the live day-zero simulation (see
+  `live-simulation-plan.md`). RingBuffer remains capped at 10 readings/sensor
+  (flat, all types) via `setRetentionHint`, and compound recommendations split
+  real-time vs historical tracks. Read it for historical context before
+  touching `synthetic/generator.zig`, `ecs/storage/*`, `benchmark/queries.zig`,
+  or `main.zig`'s orchestration.
+- **`live-simulation-plan.md`** — agreed 2026-07-02, **implemented**: replaces
+  the bulk-preload + live-tail methodology with a streaming simulation. The
+  building starts at day zero with empty backends; a `synthetic.Stream` feeds
+  readings chunk-by-chunk (1 day per chunk), pruning to retention as simulated
+  time advances, with queries benchmarked at log-spaced checkpoints. See
+  `benchmark/simulation.zig` for the implementation.
 
 ---
 

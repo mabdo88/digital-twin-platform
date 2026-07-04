@@ -109,6 +109,18 @@ pub fn floorOfZone(self: *const Self, zone_id: u32) ?u32 {
     return self.zone_index.floorOfZone(zone_id);
 }
 
+pub fn allSensorIds(self: *const Self, allocator: std.mem.Allocator) ![]u32 {
+    var seen = std.AutoHashMap(u32, void).init(allocator);
+    defer seen.deinit();
+    for (self.readings.items) |r| try seen.put(r.sensor_id, {});
+    var result: std.ArrayList(u32) = .empty;
+    defer result.deinit(allocator);
+    var it = seen.keyIterator();
+    while (it.next()) |k| try result.append(allocator, k.*);
+    std.mem.sort(u32, result.items, {}, std.sort.asc(u32));
+    return result.toOwnedSlice(allocator);
+}
+
 /// Removes every reading of `sensor_type` older than `cutoff_timestamp` via
 /// an in-place stable compaction (readings of other types, and this
 /// backend's zone/floor topology, are untouched). See storage_backend.zig's

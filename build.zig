@@ -13,6 +13,7 @@ pub fn build(b: *std.Build) void {
         "engine/metrics_test.zig",
         "engine/bim_test.zig",
         "engine/synthetic_test.zig",
+        "engine/sim_test.zig",
     };
 
     for (targets) |t| {

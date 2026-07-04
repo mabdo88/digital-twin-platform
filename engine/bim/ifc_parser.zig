@@ -99,20 +99,20 @@ fn elementTypeFromIfcName(name: []const u8) ElementType {
     if (T.eq(name, "IFCSLAB")) return .slab;
     if (T.eq(name, "IFCBEAM")) return .beam;
     if (T.eq(name, "IFCFLOWSEGMENT")) return .flow_segment;
-    // Equipment family — see components.zig's ElementType.equipment doc
-    // comment for why this exists and which real file motivated it.
-    if (T.eq(name, "IFCFLOWTERMINAL")) return .equipment;
-    if (T.eq(name, "IFCFLOWFITTING")) return .equipment;
-    if (T.eq(name, "IFCFLOWCONTROLLER")) return .equipment;
-    if (T.eq(name, "IFCFLOWMOVINGDEVICE")) return .equipment;
-    if (T.eq(name, "IFCFLOWSTORAGEDEVICE")) return .equipment;
-    if (T.eq(name, "IFCENERGYCONVERSIONDEVICE")) return .equipment;
-    if (T.eq(name, "IFCDISTRIBUTIONCONTROLELEMENT")) return .equipment;
-    if (T.eq(name, "IFCBUILDINGELEMENTPROXY")) return .equipment;
-    if (T.eq(name, "IFCELECTRICAPPLIANCE")) return .equipment;
-    if (T.eq(name, "IFCALARM")) return .equipment;
-    if (T.eq(name, "IFCCABLECARRIERSEGMENT")) return .equipment;
-    if (T.eq(name, "IFCCABLESEGMENT")) return .equipment;
+    // Granular MEP/electrical types — see components.zig's ElementType
+    // doc comments for which sensors go on each.
+    if (T.eq(name, "IFCFLOWTERMINAL")) return .flow_terminal;
+    if (T.eq(name, "IFCFLOWFITTING")) return .flow_fitting;
+    if (T.eq(name, "IFCFLOWCONTROLLER")) return .flow_controller;
+    if (T.eq(name, "IFCFLOWMOVINGDEVICE")) return .flow_moving_device;
+    if (T.eq(name, "IFCFLOWSTORAGEDEVICE")) return .flow_storage_device;
+    if (T.eq(name, "IFCENERGYCONVERSIONDEVICE")) return .energy_conversion_device;
+    if (T.eq(name, "IFCDISTRIBUTIONCONTROLELEMENT")) return .distribution_control_element;
+    if (T.eq(name, "IFCBUILDINGELEMENTPROXY")) return .building_element_proxy;
+    if (T.eq(name, "IFCELECTRICAPPLIANCE")) return .electric_appliance;
+    if (T.eq(name, "IFCALARM")) return .alarm;
+    if (T.eq(name, "IFCCABLECARRIERSEGMENT")) return .cable_segment;
+    if (T.eq(name, "IFCCABLESEGMENT")) return .cable_segment;
     return .other;
 }
 
@@ -129,10 +129,13 @@ pub const ParsedModel = struct {
     /// `zones[i].zone_id` matches the corresponding `BuildingElement.ifc_id`.
     /// Sorted by zone_id ascending.
     zones: []ZoneMetadata,
-    /// Sidecar metadata for entities that act as equipment. One entry per
-    /// `.equipment`-typed BuildingElement (`equipment[i].element_id` matches
-    /// the corresponding `BuildingElement.ifc_id`). Sorted by element_id
-    /// ascending.
+    /// Sidecar metadata for entities that act as equipment (flow_terminal,
+    /// flow_fitting, flow_controller, flow_moving_device, flow_storage_device,
+    /// energy_conversion_device, distribution_control_element,
+    /// building_element_proxy, electric_appliance, alarm, cable_segment).
+    /// One entry per equipment-typed BuildingElement
+    /// (`equipment[i].element_id` matches the corresponding
+    /// `BuildingElement.ifc_id`). Sorted by element_id ascending.
     equipment: []EquipmentMetadata,
 
     pub fn deinit(self: *ParsedModel) void {
@@ -760,7 +763,7 @@ fn resolveHierarchy(arena: Allocator, entities: *std.AutoHashMapUnmanaged(u32, E
                     .area_m2 = 0,
                 });
             },
-            .equipment => {
+            .flow_terminal, .flow_fitting, .flow_controller, .flow_moving_device, .flow_storage_device, .energy_conversion_device, .distribution_control_element, .building_element_proxy, .electric_appliance, .alarm, .cable_segment => {
                 const props = equipment_props.get(e.id);
                 try equipment.append(arena, .{
                     .element_id = e.id,

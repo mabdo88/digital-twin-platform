@@ -134,6 +134,26 @@ pub fn printLatencyStats(stats: LatencyStats) void {
     );
 }
 
+/// Time a state-mutating operation (e.g. insert, pruneOlderThan) exactly
+/// once. Unlike `timeQuery`, there is no warmup — mutations are not
+/// idempotent, so calling them twice would double the work. Returns the
+/// elapsed time in nanoseconds.
+///
+/// This is the sanctioned timing path for all non-query work in the
+/// simulation (chunk ingest, prune passes), keeping "metrics_system is the
+/// only timing path" (CLAUDE.md §3.4) true for mutations as well as queries.
+pub fn timeMutation(
+    io: Io,
+    comptime mutation_fn: anytype,
+    args: anytype,
+) !i64 {
+    const start = Io.Clock.awake.now(io);
+    try @call(.auto, mutation_fn, args);
+    const end = Io.Clock.awake.now(io);
+    const dur = start.durationTo(end);
+    return @intCast(dur.nanoseconds);
+}
+
 fn nsToUs(ns: i64) f64 {
     return @as(f64, @floatFromInt(ns)) / 1000.0;
 }
@@ -260,4 +280,35 @@ test "mean_ns truncates toward zero rather than rounding" {
         .total_ns = 100,
     };
     try std.testing.expectEqual(@as(i64, 33), stats.mean_ns);
+}
+
+// ---------------------------------------------------------------------------
+// timeMutation tests
+// ---------------------------------------------------------------------------
+
+fn incrementCounter(counter: *u32) !void {
+    counter.* += 1;
+}
+
+test "timeMutation: returns non-negative elapsed time" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var counter: u32 = 0;
+    const ns = try timeMutation(io, incrementCounter, .{&counter});
+
+    try std.testing.expect(ns >= 0);
+    try std.testing.expectEqual(@as(u32, 1), counter);
+}
+
+test "timeMutation: executes exactly once (no warmup)" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var counter: u32 = 0;
+    _ = try timeMutation(io, incrementCounter, .{&counter});
+    // If a warmup were run (like timeQuery), counter would be 2.
+    try std.testing.expectEqual(@as(u32, 1), counter);
 }

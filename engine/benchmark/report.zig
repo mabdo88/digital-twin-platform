@@ -676,3 +676,149 @@ test "recommendCompound: RingBuffer wins real-time track, excluded from historic
     // TimeSeries (50) beats Columnar (80) on every historical query.
     try testing.expectEqualStrings("TimeSeries", compound.historical.winner);
 }
+
+// ---------------------------------------------------------------------------
+// Growth curve + simulation JSON — latency vs building age, and machine-
+// readable sim stats for downstream tooling.
+// ---------------------------------------------------------------------------
+
+const sim_mod = @import("simulation.zig");
+
+/// Write a "Latency vs Building Age" section to the markdown report,
+/// showing how each query's median latency grows as the building
+/// accumulates data from day 1 to steady state.
+pub fn writeGrowthSection(
+    md: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    growth: []const sim_mod.GrowthPoint,
+) !void {
+    if (growth.len == 0) return;
+
+    try md.print(allocator, "\n## Latency vs Building Age (Growth Curve)\n\n", .{});
+    try md.print(allocator, "Each row is one query's median latency at one checkpoint in the " ++
+        "building's simulated lifetime — from day 1 (near-empty) to steady state " ++
+        "(retention-full, actively evicting). This shows whether a backend's query " ++
+        "latency is constant (O(1) access) or grows with data volume.\n\n", .{});
+
+    try md.print(allocator, "| Checkpoint | Day | Backend | Query | Median µs | Live readings | Memory (MB) |\n", .{});
+    try md.print(allocator, "|---|---:|---|---|---:|---:|---:|\n", .{});
+    for (growth) |g| {
+        try md.print(allocator, "| {s} | {d} | {s} | {s} | {d:.1} | {d} | {d:.1} |\n", .{
+            g.label,
+            g.sim_day,
+            g.backend,
+            g.query,
+            @as(f64, @floatFromInt(g.median_ns)) / 1000.0,
+            g.reading_count,
+            @as(f64, @floatFromInt(g.memory_bytes)) / (1024.0 * 1024.0),
+        });
+    }
+}
+
+/// Write a "Simulation Summary" section to the markdown report with
+/// per-backend compression ratios, data volume, and prune statistics.
+pub fn writeSimSection(
+    md: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    sim_stats: []const sim_mod.SimStats,
+    type_volumes: []const sim_mod.TypeVolume,
+) !void {
+    if (sim_stats.len == 0) return;
+
+    try md.print(allocator, "\n## Simulation Summary\n\n", .{});
+    try md.print(allocator, "Per-backend wall-time cost of the live day-zero simulation " ++
+        "(simulated time / wall time = compression ratio), data volume, and prune activity.\n\n", .{});
+
+    try md.print(allocator, "| Backend | Sim days | Wall time (s) | Compression | Generated | Evicted | Prune calls | Stream time (s) | Prune time (s) |\n", .{});
+    try md.print(allocator, "|---|---:|---:|---:|---:|---:|---:|---:|---:|\n", .{});
+    const day_ms: i64 = 24 * 60 * 60 * 1000;
+    for (sim_stats) |s| {
+        const sim_days = @divTrunc(s.sim_ms, day_ms);
+        const wall_s = @as(f64, @floatFromInt(s.wall_ns)) / 1e9;
+        const ingest_s = @as(f64, @floatFromInt(s.ingest_ns)) / 1e9;
+        const prune_s = @as(f64, @floatFromInt(s.prune_ns)) / 1e9;
+        try md.print(allocator, "| {s} | {d} | {d:.1} | {d:.0}× | {d} | {d} | {d} | {d:.1} | {d:.1} |\n", .{
+            s.backend, sim_days, wall_s, s.compressionRatio(), s.generated, s.evicted, s.prune_calls, ingest_s, prune_s,
+        });
+    }
+
+    if (type_volumes.len > 0) {
+        try md.print(allocator, "\n### Steady-state data volume by sensor type\n\n", .{});
+        try md.print(allocator, "| Sensor type | Readings | Bytes (MB) |\n|---|---:|---:|\n", .{});
+        for (type_volumes) |tv| {
+            try md.print(allocator, "| {s} | {d} | {d:.1} |\n", .{
+                @tagName(tv.sensor_type),
+                tv.reading_count,
+                @as(f64, @floatFromInt(tv.bytes)) / (1024.0 * 1024.0),
+            });
+        }
+    }
+}
+
+/// Write machine-readable simulation data as JSON to `simulation.json` in
+/// the output directory. Contains per-backend sim stats, growth points,
+/// and type volumes — everything an external tool needs to plot the growth
+/// curve or compare backends' simulation efficiency.
+pub fn writeSimJson(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir: *std.Io.Dir,
+    sim_stats: []const sim_mod.SimStats,
+    growth: []const sim_mod.GrowthPoint,
+    type_volumes: []const sim_mod.TypeVolume,
+) !void {
+    var json: std.ArrayList(u8) = .empty;
+    defer json.deinit(allocator);
+
+    try json.print(allocator, "{{\n", .{});
+
+    // sim_stats
+    try json.print(allocator, "  \"sim_stats\": [\n", .{});
+    const day_ms: i64 = 24 * 60 * 60 * 1000;
+    for (sim_stats, 0..) |s, i| {
+        const sim_days = @divTrunc(s.sim_ms, day_ms);
+        try json.print(allocator, "    {{\n", .{});
+        try json.print(allocator, "      \"backend\": \"{s}\",\n", .{s.backend});
+        try json.print(allocator, "      \"sim_days\": {d},\n", .{sim_days});
+        try json.print(allocator, "      \"wall_ns\": {d},\n", .{s.wall_ns});
+        try json.print(allocator, "      \"compression_ratio\": {d:.1},\n", .{s.compressionRatio()});
+        try json.print(allocator, "      \"generated\": {d},\n", .{s.generated});
+        try json.print(allocator, "      \"ingested\": {d},\n", .{s.ingested});
+        try json.print(allocator, "      \"evicted\": {d},\n", .{s.evicted});
+        try json.print(allocator, "      \"prune_calls\": {d},\n", .{s.prune_calls});
+        try json.print(allocator, "      \"ingest_ns\": {d},\n", .{s.ingest_ns});
+        try json.print(allocator, "      \"prune_ns\": {d}\n", .{s.prune_ns});
+        try json.print(allocator, "    }}{s}\n", .{if (i + 1 < sim_stats.len) "," else ""});
+    }
+    try json.print(allocator, "  ],\n", .{});
+
+    // growth_points
+    try json.print(allocator, "  \"growth_points\": [\n", .{});
+    for (growth, 0..) |g, i| {
+        try json.print(allocator, "    {{\n", .{});
+        try json.print(allocator, "      \"sim_day\": {d},\n", .{g.sim_day});
+        try json.print(allocator, "      \"label\": \"{s}\",\n", .{g.label});
+        try json.print(allocator, "      \"backend\": \"{s}\",\n", .{g.backend});
+        try json.print(allocator, "      \"query\": \"{s}\",\n", .{g.query});
+        try json.print(allocator, "      \"median_ns\": {d},\n", .{g.median_ns});
+        try json.print(allocator, "      \"memory_bytes\": {d},\n", .{g.memory_bytes});
+        try json.print(allocator, "      \"live_bytes\": {d},\n", .{g.live_bytes});
+        try json.print(allocator, "      \"reading_count\": {d}\n", .{g.reading_count});
+        try json.print(allocator, "    }}{s}\n", .{if (i + 1 < growth.len) "," else ""});
+    }
+    try json.print(allocator, "  ],\n", .{});
+
+    // type_volumes
+    try json.print(allocator, "  \"type_volumes\": [\n", .{});
+    for (type_volumes, 0..) |tv, i| {
+        try json.print(allocator, "    {{\n", .{});
+        try json.print(allocator, "      \"sensor_type\": \"{s}\",\n", .{@tagName(tv.sensor_type)});
+        try json.print(allocator, "      \"reading_count\": {d},\n", .{tv.reading_count});
+        try json.print(allocator, "      \"bytes\": {d}\n", .{tv.bytes});
+        try json.print(allocator, "    }}{s}\n", .{if (i + 1 < type_volumes.len) "," else ""});
+    }
+    try json.print(allocator, "  ]\n", .{});
+    try json.print(allocator, "}}\n", .{});
+
+    try dir.writeFile(io, .{ .sub_path = "simulation.json", .data = json.items });
+}

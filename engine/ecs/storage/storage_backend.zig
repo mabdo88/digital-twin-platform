@@ -88,6 +88,7 @@ pub fn assertImplements(comptime T: type) void {
     if (!@hasDecl(T, "floorOfZone")) @compileError("StorageBackend: " ++ @typeName(T) ++ " missing pub fn floorOfZone");
     if (!@hasDecl(T, "pruneOlderThan")) @compileError("StorageBackend: " ++ @typeName(T) ++ " missing pub fn pruneOlderThan");
     if (!@hasDecl(T, "setRetentionHint")) @compileError("StorageBackend: " ++ @typeName(T) ++ " missing pub fn setRetentionHint");
+    if (!@hasDecl(T, "allSensorIds")) @compileError("StorageBackend: " ++ @typeName(T) ++ " missing pub fn allSensorIds");
 }
 
 // ---------------------------------------------------------------------------
@@ -314,6 +315,9 @@ const StubBackend = struct {
     }
     pub fn pruneOlderThan(_: *StubBackend, _: SensorType, _: i64) !void {}
     pub fn setRetentionHint(_: *StubBackend, _: SensorType, _: usize) !void {}
+    pub fn allSensorIds(_: *const StubBackend, _: std.mem.Allocator) ![]u32 {
+        return &.{};
+    }
 };
 
 test "assertImplements accepts a valid backend" {
@@ -362,6 +366,9 @@ const ExtendedBackend = struct {
     }
     pub fn pruneOlderThan(_: *ExtendedBackend, _: SensorType, _: i64) !void {}
     pub fn setRetentionHint(_: *ExtendedBackend, _: SensorType, _: usize) !void {}
+    pub fn allSensorIds(_: *const ExtendedBackend, _: std.mem.Allocator) ![]u32 {
+        return &.{};
+    }
     // Not part of the StorageBackend interface — should not affect the check.
     pub fn debugDump(_: *const ExtendedBackend) void {}
 };

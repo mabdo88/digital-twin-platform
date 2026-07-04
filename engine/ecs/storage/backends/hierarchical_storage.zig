@@ -3,11 +3,22 @@
 // Hierarchical backend — data indexed by a zone tree
 // (Floor → Zone → Sensor) via parent-child links.
 //
-// Models graph-db behaviour: readings are stored in per-sensor leaf
-// nodes of a tree index. The zone-hierarchy query (Q10) traverses the
-// tree to collect sensors from a subtree directly (e.g. "all sensors on
-// floor 2") via `sensorIdsByZone`/`sensorIdsByFloor`, instead of scanning
-// every reading.
+// Models a graph database (e.g. Neo4j): readings are stored as properties
+// on per-sensor leaf nodes of a tree index. The zone-hierarchy query (Q10)
+// traverses the tree to collect sensors from a subtree directly (e.g. "all
+// sensors on floor 2") via `sensorIdsByZone`/`sensorIdsByFloor`, instead of
+// scanning every reading — matching Neo4j's graph traversal for topology
+// queries.
+//
+// Time-series queries use a temporal property index: each leaf's readings
+// are kept in a single ArrayList sorted by (timestamp asc, sensor_id asc),
+// with lazy sorting (like Neo4j's native range index on a temporal
+// property). `rangeByTime` with a sensor filter binary-searches the sorted
+// array to find the time range — O(log n) instead of O(n) linear scan.
+// `pruneOlderThan` binary-searches for the cutoff timestamp, then compacts
+// only the prefix containing pruned readings — O(log n) to find the cutoff
+// plus O(k) to compact, where k is bounded by that one sensor's readings
+// before the cutoff, not the whole dataset.
 //
 // The tree is an internal detail invisible to queries — the public
 // surface is exactly the StorageBackend interface. The tree makes
@@ -59,7 +70,11 @@ const Self = @This();
 const Node = struct {
     parent: ?u32,
     children: std.ArrayList(u32),
+    /// Sorted ArrayList of readings for leaf nodes (temporal property
+    /// index — sorted by (timestamp asc, sensor_id asc) when `sorted`
+    /// is true). Null for non-leaf nodes.
     readings: ?std.ArrayList(SensorReading),
+    sorted: bool,
     sensor_id: ?u32,
     key: u32,
     /// Latest reading by timestamp for this leaf, maintained incrementally
@@ -128,6 +143,7 @@ fn emptyNode(parent: ?u32, key: u32) Node {
         .parent = parent,
         .children = .empty,
         .readings = null,
+        .sorted = true,
         .sensor_id = null,
         .key = key,
         .latest = null,
@@ -156,6 +172,7 @@ pub fn insert(self: *Self, reading: SensorReading) !void {
         node.readings = .empty;
     }
     try node.readings.?.append(self.allocator, reading);
+    node.sorted = false;
     if (node.latest == null or reading.timestamp > node.latest.?.timestamp) {
         node.latest = reading;
     }
@@ -224,25 +241,34 @@ pub fn getLatestBySensor(self: *const Self, sensor_id: u32) ?SensorReading {
 /// Results ordered by timestamp ascending, ties broken by sensor_id ascending.
 pub fn rangeByTime(self: *const Self, allocator: std.mem.Allocator, q: RangeQuery) ![]const SensorReading {
     if (q.sensor_id) |sid| {
-        // Single-sensor filter: go straight to that leaf, never touch the
-        // rest of the tree or the cache.
-        var result: std.ArrayList(SensorReading) = .empty;
-        defer result.deinit(allocator);
-
+        // Single-sensor filter: go straight to that leaf, binary-search
+        // the sorted array for the time range — O(log n) instead of O(n)
+        // linear scan. Models Neo4j's temporal property range index.
         const node_idx = self.sensor_to_node.get(sid) orelse return &.{};
-        const readings = self.nodes.items[node_idx].readings orelse return &.{};
-        for (readings.items) |r| {
-            if (r.timestamp >= q.start_time and r.timestamp <= q.end_time) {
-                try result.append(allocator, r);
+        const node = &self.nodes.items[node_idx];
+        const readings = node.readings orelse return &.{};
+
+        // Ensure the leaf's readings are sorted (lazy sort).
+        const self_mut: *Self = @constCast(self);
+        try self_mut.ensureLeafSorted(node_idx);
+        const items = readings.items;
+        if (items.len == 0) return &.{};
+        if (q.start_time > q.end_time) return &.{};
+
+        const lo = std.sort.lowerBound(SensorReading, items, q.start_time, struct {
+            fn cmp(ctx: i64, item: SensorReading) std.math.Order {
+                return std.math.order(ctx, item.timestamp);
             }
-        }
-        std.mem.sort(SensorReading, result.items, {}, struct {
-            fn lt(_: void, lhs: SensorReading, rhs: SensorReading) bool {
-                if (lhs.timestamp != rhs.timestamp) return lhs.timestamp < rhs.timestamp;
-                return lhs.sensor_id < rhs.sensor_id;
+        }.cmp);
+        const hi = std.sort.upperBound(SensorReading, items, q.end_time, struct {
+            fn cmp(ctx: i64, item: SensorReading) std.math.Order {
+                return std.math.order(ctx, item.timestamp);
             }
-        }.lt);
-        return result.toOwnedSlice(allocator);
+        }.cmp);
+
+        const result = try allocator.alloc(SensorReading, hi - lo);
+        @memcpy(result, items[lo..hi]);
+        return result;
     }
 
     // No sensor filter — binary-search the cached sorted view instead of
@@ -299,16 +325,14 @@ pub fn floorOfZone(self: *const Self, zone_id: u32) ?u32 {
     return self.nodes.items[floor_node].key;
 }
 
-/// Removes every reading of `sensor_type` older than `cutoff_timestamp`,
-/// per sensor leaf, via the same in-place stable compaction the flat
-/// backends use — readings live per-leaf here, so each leaf's own
-/// `readings` list is compacted independently. `latest` is recomputed from
-/// the surviving readings only if the previous latest reading was itself
-/// pruned (cheap: bounded by that one sensor's own remaining reading
-/// count, not the tree). Tree structure, zone/floor topology, and
-/// `sensor_to_node`/`zone_to_node`/`floor_to_node` are untouched — pruning
-/// only ever removes readings, never a sensor's place in the tree. See
-/// storage_backend.zig's pruneOlderThan contract.
+/// Prunes readings of `sensor_type` older than `cutoff_timestamp` from
+/// every leaf. Uses binary search on the sorted array to find the cutoff
+/// point, then compacts the prefix — O(log n) to find the boundary plus
+/// O(k) to shift surviving readings, where k is bounded by that one
+/// sensor's own reading count. `latest` is recomputed from surviving
+/// readings only if the previous latest was itself pruned. Tree structure,
+/// zone/floor topology, and `sensor_to_node`/`zone_to_node`/`floor_to_node`
+/// are untouched. See storage_backend.zig's pruneOlderThan contract.
 /// Hierarchical has no fixed-capacity concept — see aos_storage.zig's
 /// setRetentionHint for why this is a no-op.
 pub fn setRetentionHint(_: *Self, _: SensorType, _: usize) !void {}
@@ -317,25 +341,57 @@ pub fn pruneOlderThan(self: *Self, sensor_type: SensorType, cutoff_timestamp: i6
     for (self.nodes.items) |*node| {
         if (node.readings == null) continue;
         const readings = &node.readings.?;
-        var write: usize = 0;
-        var removed: usize = 0;
-        for (readings.items) |r| {
-            if (r.sensor_type == sensor_type and r.timestamp < cutoff_timestamp) {
-                removed += 1;
-                continue;
+
+        // Ensure sorted so binary search is valid.
+        if (!node.sorted) {
+            std.mem.sort(SensorReading, readings.items, {}, struct {
+                fn lt(_: void, lhs: SensorReading, rhs: SensorReading) bool {
+                    if (lhs.timestamp != rhs.timestamp) return lhs.timestamp < rhs.timestamp;
+                    return lhs.sensor_id < rhs.sensor_id;
+                }
+            }.lt);
+            node.sorted = true;
+        }
+
+        // Binary search for the cutoff timestamp.
+        const cutoff_idx = std.sort.lowerBound(SensorReading, readings.items, cutoff_timestamp, struct {
+            fn cmp(ctx: i64, item: SensorReading) std.math.Order {
+                return std.math.order(ctx, item.timestamp);
             }
+        }.cmp);
+
+        if (cutoff_idx == 0) continue; // Nothing to prune.
+
+        // Count how many of the pruned prefix matches sensor_type.
+        var pruned: usize = 0;
+        var write: usize = 0;
+        for (readings.items[0..cutoff_idx]) |r| {
+            if (r.sensor_type == sensor_type) {
+                pruned += 1;
+            } else {
+                readings.items[write] = r;
+                write += 1;
+            }
+        }
+
+        // Shift surviving readings from after the cutoff.
+        for (readings.items[cutoff_idx..]) |r| {
             readings.items[write] = r;
             write += 1;
         }
-        if (removed == 0) continue;
-        readings.shrinkRetainingCapacity(write);
-        self.total_count -= removed;
 
+        if (pruned == 0) continue;
+        readings.shrinkRetainingCapacity(write);
+        self.total_count -= pruned;
+
+        // Recompute latest if the current latest was pruned.
         if (node.latest) |latest| {
             if (latest.sensor_type == sensor_type and latest.timestamp < cutoff_timestamp) {
                 var new_latest: ?SensorReading = null;
                 for (readings.items) |r| {
-                    if (new_latest == null or r.timestamp > new_latest.?.timestamp) new_latest = r;
+                    if (new_latest == null or r.timestamp > new_latest.?.timestamp) {
+                        new_latest = r;
+                    }
                 }
                 node.latest = new_latest;
             }
@@ -383,9 +439,38 @@ fn collectLeafSensorIds(self: *const Self, node_idx: u32, out: *std.ArrayList(u3
     }
 }
 
+/// Every distinct sensor_id that has ever been registered, sorted ascending.
+/// Uses sensor_to_node's keys — no tree walk or reading scan needed.
+pub fn allSensorIds(self: *const Self, allocator: std.mem.Allocator) ![]u32 {
+    var result: std.ArrayList(u32) = .empty;
+    defer result.deinit(allocator);
+
+    var it = self.sensor_to_node.keyIterator();
+    while (it.next()) |k| try result.append(allocator, k.*);
+
+    std.mem.sort(u32, result.items, {}, std.sort.asc(u32));
+    return result.toOwnedSlice(allocator);
+}
+
 // ---------------------------------------------------------------------------
 // Internal — tree node management
 // ---------------------------------------------------------------------------
+
+/// Lazily sorts a leaf's readings by (timestamp asc, sensor_id asc) if
+/// they've been modified since the last sort. Models Neo4j's lazy index
+/// maintenance — the index is rebuilt on first query, not on every write.
+fn ensureLeafSorted(self: *Self, node_idx: u32) !void {
+    const node = &self.nodes.items[node_idx];
+    if (node.sorted) return;
+    if (node.readings == null) return;
+    std.mem.sort(SensorReading, node.readings.?.items, {}, struct {
+        fn lt(_: void, lhs: SensorReading, rhs: SensorReading) bool {
+            if (lhs.timestamp != rhs.timestamp) return lhs.timestamp < rhs.timestamp;
+            return lhs.sensor_id < rhs.sensor_id;
+        }
+    }.lt);
+    node.sorted = true;
+}
 
 fn ensureLeaf(self: *Self, sensor_id: u32) !u32 {
     if (self.sensor_to_node.get(sensor_id)) |idx| return idx;
@@ -395,6 +480,7 @@ fn ensureLeaf(self: *Self, sensor_id: u32) !u32 {
         .parent = self.unassigned_zone,
         .children = .empty,
         .readings = null,
+        .sorted = true,
         .sensor_id = sensor_id,
         .key = sensor_id,
         .latest = null,
