@@ -536,10 +536,6 @@ fn reparent(self: *Self, child_idx: u32, new_parent_idx: u32) !void {
 // Tests
 // ---------------------------------------------------------------------------
 
-test "Hierarchical: assertImplements" {
-    sb.assertImplements(Self);
-}
-
 test "Hierarchical: insert N readings and read them back" {
     const N: usize = 100;
     var backend = try Self.init(std.testing.allocator);

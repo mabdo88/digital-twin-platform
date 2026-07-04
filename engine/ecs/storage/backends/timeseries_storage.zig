@@ -333,10 +333,6 @@ fn rebuildLatest(self: *Self) void {
 // Tests
 // ---------------------------------------------------------------------------
 
-test "TimeSeries: assertImplements" {
-    sb.assertImplements(Self);
-}
-
 test "TimeSeries: insert N readings and read them back" {
     const N: usize = 100;
     var backend = try Self.init(std.testing.allocator);

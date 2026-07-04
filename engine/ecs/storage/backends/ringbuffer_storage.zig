@@ -242,10 +242,6 @@ pub fn pruneOlderThan(_: *Self, _: SensorType, _: i64) !void {}
 // Tests
 // ---------------------------------------------------------------------------
 
-test "RingBuffer: assertImplements" {
-    sb.assertImplements(Self);
-}
-
 test "RingBuffer: insert N readings and read them back" {
     const N: usize = 100;
     var backend = try Self.init(std.testing.allocator);

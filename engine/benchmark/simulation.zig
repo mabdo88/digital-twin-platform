@@ -343,17 +343,6 @@ pub fn isTypeScoped(q: queries.QueryName) bool {
     };
 }
 
-/// True if `mix` weights `name` at all — used to decide whether a sensor
-/// type's own canonical relevant_queries (synthetic.profileFor) cares
-/// about a given query, e.g. whether to bother warming anomalies' stats
-/// cache for that type.
-pub fn hasQuery(mix: []const queries.QueryWeight, name: queries.QueryName) bool {
-    for (mix) |qw| {
-        if (qw.query == name) return true;
-    }
-    return false;
-}
-
 /// Filters `mix` down to the type-scoped queries (isTypeScoped) — used to
 /// build a single sensor type's own type-scoped query set for its
 /// per-type recommendation. Caller frees with `allocator`.
@@ -398,8 +387,8 @@ pub fn runOne(
                 .daily_zone_rollup => try runner.q8_wrapper(self.world, s.zone_id, s.sensor_type),
                 .spatial_radius => try runner.q9_wrapper(self.world, s.position, @as(f32, 50.0)),
                 .zone_hierarchy => try runner.q10_wrapper(self.world, s.zone_id, @as(u32, 2)),
-                .anomalies => try runner.q11_wrapper(self.world, s.sensor_type, @as(f32, 1.0)),
-                .threshold_breach => try runner.q12_wrapper(self.world, s.sensor_id, synthetic.profileFor(s.sensor_type).base_value, ONE_HOUR_MS),
+                .anomalies => try runner.q11_wrapper(self.world, s.sensor_type, queries.ANOMALY_STD_DEV_THRESHOLD, queries.ANOMALY_WINDOW_HOURS),
+                .threshold_breach => try runner.q12_wrapper(self.world, s.sensor_id, synthetic.profileFor(s.sensor_type).base_value, ONE_HOUR_MS, queries.THRESHOLD_BREACH_WINDOW_HOURS),
             }
         }
     };
@@ -473,12 +462,12 @@ pub fn runDigest(
             for (ids) |id| d.foldId(id);
         },
         .anomalies => {
-            const rs = try queries.query_anomalies(world, s.sensor_type, @as(f32, 1.0));
+            const rs = try queries.query_anomalies(world, s.sensor_type, queries.ANOMALY_STD_DEV_THRESHOLD, queries.ANOMALY_WINDOW_HOURS);
             defer world.allocator.free(rs);
             for (rs) |a| d.foldReading(a.reading);
         },
         .threshold_breach => {
-            if (try queries.query_threshold_breach(world, s.sensor_id, synthetic.profileFor(s.sensor_type).base_value, ONE_HOUR_MS)) |bev| {
+            if (try queries.query_threshold_breach(world, s.sensor_id, synthetic.profileFor(s.sensor_type).base_value, ONE_HOUR_MS, queries.THRESHOLD_BREACH_WINDOW_HOURS)) |bev| {
                 d.foldId(bev.sensor_id);
                 d.foldTimestamp(bev.start_ts);
                 d.foldTimestamp(bev.end_ts);
@@ -702,29 +691,11 @@ pub fn simulateBackend(
 
         std.debug.print("\n  [{s}] === Checkpoint {s} (day {d}/{d}) ===\n", .{ b.name, cp.label, cp.sim_day, total_days });
 
-        // Force the lazy sort/cache-build/sensor-index every backend
-        // otherwise defers to its first query call — attribute that
-        // one-time cost to the simulation (not benchmark-timed) instead
-        // of letting it silently inflate whichever query happens to run
-        // first at this checkpoint.
+        // Force the lazy sort/cache-build every backend otherwise defers
+        // to its first query call — attribute that one-time cost to the
+        // simulation (not benchmark-timed) instead of letting it silently
+        // inflate whichever query happens to run first at this checkpoint.
         _ = try world.iterateAll();
-        const warm = try world.readingsForSensor(overall_sample.sensor_id);
-        allocator.free(warm);
-
-        // statsForType/readingsForType exist solely for query_anomalies —
-        // only warm what will actually be queried, per each type's own
-        // canonical relevant_queries.
-        var warmed_type_index = false;
-        for (type_samples) |group| {
-            const type_mix = synthetic.profileFor(group.sensor_type).relevant_queries;
-            if (!hasQuery(type_mix, .anomalies)) continue;
-            _ = try world.statsForType(group.sensor_type);
-            if (!warmed_type_index) {
-                const warm_type = try world.readingsForType(group.sensor_type);
-                allocator.free(warm_type);
-                warmed_type_index = true;
-            }
-        }
 
         const warm_done = std.Io.Clock.awake.now(io);
         std.debug.print("  [{s}] warmup done ({d:.1}s)\n", .{ b.name, ns_f.s(cp_start, warm_done) });

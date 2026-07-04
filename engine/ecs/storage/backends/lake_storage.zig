@@ -505,10 +505,6 @@ fn readVarint(buf: []const u8, pos: *usize) u64 {
 // Tests
 // ---------------------------------------------------------------------------
 
-test "Lake: assertImplements" {
-    sb.assertImplements(Self);
-}
-
 test "Lake: insert N readings and read them back" {
     const N: usize = 100;
     var backend = try Self.init(std.testing.allocator);

@@ -198,10 +198,6 @@ pub fn pruneOlderThan(self: *Self, sensor_type: SensorType, cutoff_timestamp: i6
 // Tests
 // ---------------------------------------------------------------------------
 
-test "SoA: assertImplements" {
-    sb.assertImplements(Self);
-}
-
 test "SoA: insert N readings and read them back" {
     const N: usize = 100;
     var backend = try Self.init(std.testing.allocator);

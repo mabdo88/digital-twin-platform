@@ -15,11 +15,6 @@
 const std = @import("std");
 const sb = @import("storage/storage_backend.zig");
 
-/// Population mean/std-dev/count of every reading of one sensor_type. See
-/// World(T).statsForType's doc comment for why this is cached but the
-/// outlier-selection pass in query_anomalies is not.
-pub const TypeStats = struct { mean: f64, std_dev: f64, count: usize };
-
 pub fn World(comptime Backend: type) type {
     // Compile-time contract: Backend must implement the full interface.
     sb.assertImplements(Backend);
@@ -37,20 +32,12 @@ pub fn World(comptime Backend: type) type {
         /// in a loop), we just mark dirty and lazily rebuild on first
         /// access.
         cache_dirty: bool = false,
-        /// sensor_id -> indices into cached_all for that sensor's own
-        /// readings. Lazily built from cached_all on first
-        /// readingsForSensor() call, invalidated alongside cached_all on
-        /// insert(). Stores indices (u32), not copied readings, to avoid
-        /// doubling the already-large cached_all footprint. See
-        /// readingsForSensor's doc comment for why this exists.
-        sensor_index: ?std.AutoHashMap(u32, std.ArrayList(u32)) = null,
-        /// Per sensor_type mean/std-dev/count, lazily computed on first
-        /// statsForType() call, invalidated alongside the others on
-        /// insert(). See statsForType's doc comment.
-        type_stats: ?std.AutoHashMap(sb.SensorType, TypeStats) = null,
         /// sensor_type -> indices into cached_all for every reading of that
-        /// type. Same shape as sensor_index, keyed by type instead of
-        /// sensor_id. See readingsForType's doc comment.
+        /// type. Lazily built from cached_all on first readingsForType()
+        /// call, invalidated alongside cached_all on insert(). Stores
+        /// indices (u32), not copied readings, to avoid doubling the
+        /// already-large cached_all footprint. See readingsForType's doc
+        /// comment for why this exists.
         type_index: ?std.AutoHashMap(sb.SensorType, std.ArrayList(u32)) = null,
         const Self = @This();
 
@@ -59,22 +46,6 @@ pub fn World(comptime Backend: type) type {
                 .backend = try Backend.init(allocator),
                 .allocator = allocator,
             };
-        }
-
-        fn freeSensorIndex(self: *Self) void {
-            if (self.sensor_index) |*idx| {
-                var it = idx.valueIterator();
-                while (it.next()) |list| list.deinit(self.allocator);
-                idx.deinit();
-                self.sensor_index = null;
-            }
-        }
-
-        fn freeTypeStats(self: *Self) void {
-            if (self.type_stats) |*ts| {
-                ts.deinit();
-                self.type_stats = null;
-            }
         }
 
         fn freeTypeIndex(self: *Self) void {
@@ -88,8 +59,6 @@ pub fn World(comptime Backend: type) type {
 
         pub fn deinit(self: *Self) void {
             if (self.cached_all) |all| self.allocator.free(all);
-            self.freeSensorIndex();
-            self.freeTypeStats();
             self.freeTypeIndex();
             self.backend.deinit();
         }
@@ -130,8 +99,6 @@ pub fn World(comptime Backend: type) type {
             if (self.cache_dirty) {
                 if (self.cached_all) |all| self.allocator.free(all);
                 self.cached_all = null;
-                self.freeSensorIndex();
-                self.freeTypeStats();
                 self.freeTypeIndex();
                 self.cache_dirty = false;
             }
@@ -139,55 +106,6 @@ pub fn World(comptime Backend: type) type {
             const all = try self.backend.iterateAll(self.allocator);
             self.cached_all = all;
             return all;
-        }
-
-        fn ensureSensorIndex(self: *Self) !*std.AutoHashMap(u32, std.ArrayList(u32)) {
-            // iterateAll() handles the dirty flag: if cache_dirty, it
-            // frees cached_all + all indexes first, then rebuilds
-            // cached_all. So after this call, sensor_index is null if
-            // it was invalidated, and we can safely rebuild.
-            _ = try self.iterateAll();
-            if (self.sensor_index != null) return &self.sensor_index.?;
-            const all = self.cached_all.?;
-            var idx: std.AutoHashMap(u32, std.ArrayList(u32)) = .init(self.allocator);
-            errdefer {
-                var it = idx.valueIterator();
-                while (it.next()) |list| list.deinit(self.allocator);
-                idx.deinit();
-            }
-            for (all, 0..) |r, i| {
-                const gop = try idx.getOrPut(r.sensor_id);
-                if (!gop.found_existing) gop.value_ptr.* = .empty;
-                try gop.value_ptr.append(self.allocator, @intCast(i));
-            }
-            self.sensor_index = idx;
-            return &self.sensor_index.?;
-        }
-
-        /// Returns every reading for `sensor_id`, looked up directly via a
-        /// per-sensor index instead of scanning the whole dataset. Owned —
-        /// caller frees with `self.allocator`, same convention as
-        /// rangeByTime/sensorIdsByZone (unlike iterateAll, each call here
-        /// only touches one sensor's own readings, so the allocation is
-        /// proportional to that sensor's reading count, not the dataset).
-        ///
-        /// Why this exists: zone/floor-scoped queries (avg_zone_type,
-        /// floor_stats, daily_zone_rollup) used to materialize all 72M+
-        /// readings and test EVERY one for zone membership via a hash
-        /// lookup — hundreds of millions of probes per query, repeated
-        /// across hundreds of calls. A zone's membership (typically a
-        /// handful of sensors) is already known cheaply via
-        /// sensorIdsByZone; what was missing was a fast way to go from
-        /// "this sensor" to "this sensor's own readings" without
-        /// rescanning everything. This index makes that O(1) lookup +
-        /// O(that sensor's reading count) instead of O(whole dataset).
-        pub fn readingsForSensor(self: *Self, sensor_id: u32) ![]const sb.SensorReading {
-            const idx = try self.ensureSensorIndex();
-            const all = self.cached_all.?;
-            const indices = idx.get(sensor_id) orelse return &.{};
-            const result = try self.allocator.alloc(sb.SensorReading, indices.items.len);
-            for (indices.items, 0..) |i, j| result[j] = all[i];
-            return result;
         }
 
         /// Every distinct sensor_id present in the dataset, sorted ascending
@@ -203,60 +121,6 @@ pub fn World(comptime Backend: type) type {
         /// sensors), not O(total readings).
         pub fn allSensorIds(self: *Self) ![]u32 {
             return self.backend.allSensorIds(self.allocator);
-        }
-
-        /// Population mean/std-dev/count for every reading of `sensor_type`,
-        /// computed once and cached until the next insert(). count==0 means
-        /// no readings of this type exist yet.
-        ///
-        /// Why only this part is cached: query_anomalies needs mean/std-dev
-        /// twice — once to compute them (two full passes over the type's
-        /// data) and once to select which specific readings exceed the
-        /// z-score threshold (one more full pass). The first part is
-        /// genuinely redundant work — the data doesn't change between calls
-        /// within a benchmark run, so recomputing the identical mean/std-dev
-        /// on every one of 25+ calls was pure waste, same category as
-        /// iterateAll/readingsForSensor's caching. The selection pass is
-        /// NOT cached here and must keep running for real on every call —
-        /// it's where backends can genuinely differ (row vs. columnar
-        /// access patterns), and caching the full answer would make every
-        /// backend report the same trivial lookup time, telling you nothing
-        /// useful about which one is actually better at this query.
-        pub fn statsForType(self: *Self, sensor_type: sb.SensorType) !TypeStats {
-            // iterateAll() handles the dirty flag — frees stale type_stats
-            // if needed, then rebuilds cached_all.
-            _ = try self.iterateAll();
-            if (self.type_stats == null) {
-                self.type_stats = std.AutoHashMap(sb.SensorType, TypeStats).init(self.allocator);
-            }
-            if (self.type_stats.?.get(sensor_type)) |cached| return cached;
-
-            const type_readings = try self.readingsForType(sensor_type);
-            defer self.allocator.free(type_readings);
-
-            const n = type_readings.len;
-            if (n == 0) {
-                const stats = TypeStats{ .mean = 0, .std_dev = 0, .count = 0 };
-                try self.type_stats.?.put(sensor_type, stats);
-                return stats;
-            }
-
-            var sum: f64 = 0;
-            for (type_readings) |r| sum += @as(f64, r.value);
-
-            const mean: f64 = sum / @as(f64, @floatFromInt(n));
-
-            var sq_sum: f64 = 0;
-            for (type_readings) |r| {
-                const d = @as(f64, r.value) - mean;
-                sq_sum += d * d;
-            }
-            const variance: f64 = sq_sum / @as(f64, @floatFromInt(n));
-            const std_dev: f64 = @sqrt(variance);
-
-            const stats = TypeStats{ .mean = mean, .std_dev = std_dev, .count = n };
-            try self.type_stats.?.put(sensor_type, stats);
-            return stats;
         }
 
         fn ensureTypeIndex(self: *Self) !*std.AutoHashMap(sb.SensorType, std.ArrayList(u32)) {
@@ -280,8 +144,7 @@ pub fn World(comptime Backend: type) type {
 
         /// Returns every reading of `sensor_type`, looked up directly via
         /// a per-type index instead of scanning the whole dataset. Owned —
-        /// caller frees with `self.allocator`. Same shape as
-        /// readingsForSensor, keyed by type instead of sensor_id.
+        /// caller frees with `self.allocator`.
         ///
         /// Why this exists: query_anomalies used to scan the full
         /// materialized dataset checking `r.sensor_type == sensor_type` on
@@ -311,10 +174,10 @@ pub fn World(comptime Backend: type) type {
 
         /// Removes every reading of `sensor_type` older than
         /// `cutoff_timestamp` from the backend. Invalidates every
-        /// World-level cache (cached_all, sensor_index, type_stats,
-        /// type_index) exactly like insert() does — pruning
-        /// changes the underlying dataset just as much as adding to it, and
-        /// nothing here is safe to keep serving from a stale snapshot.
+        /// World-level cache (cached_all, type_index) exactly like
+        /// insert() does — pruning changes the underlying dataset just as
+        /// much as adding to it, and nothing here is safe to keep serving
+        /// from a stale snapshot.
         pub fn pruneOlderThan(self: *Self, sensor_type: sb.SensorType, cutoff_timestamp: i64) !void {
             self.cache_dirty = true;
             return self.backend.pruneOlderThan(sensor_type, cutoff_timestamp);
@@ -457,56 +320,9 @@ test "World(T).iterateAll invalidates its cache on the next insert" {
     try std.testing.expect(found);
 }
 
-// World(T).readingsForSensor() — the per-sensor index that replaces
-// zone/floor queries' old "scan everything, hash-probe every row"
-// pattern. Correctness (does it return the right rows) and invalidation
-// (does a new insert get picked up, not silently dropped or duplicated)
-// are the two properties that matter; a missed invalidation here would
-// silently corrupt every zone/floor-scoped query's results.
-test "World(T).readingsForSensor returns only that sensor's own readings" {
-    var world = try World(aos).init(std.testing.allocator);
-    defer world.deinit();
-    try insertTestData(&world);
-
-    const s1 = try world.readingsForSensor(1);
-    defer world.allocator.free(s1);
-    try std.testing.expectEqual(@as(usize, 3), s1.len);
-    for (s1) |r| try std.testing.expectEqual(@as(u32, 1), r.sensor_id);
-
-    const s2 = try world.readingsForSensor(2);
-    defer world.allocator.free(s2);
-    try std.testing.expectEqual(@as(usize, 2), s2.len);
-    for (s2) |r| try std.testing.expectEqual(@as(u32, 2), r.sensor_id);
-
-    const missing = try world.readingsForSensor(999);
-    defer world.allocator.free(missing);
-    try std.testing.expectEqual(@as(usize, 0), missing.len);
-}
-
-test "World(T).readingsForSensor picks up new readings after an insert invalidates the index" {
-    var world = try World(aos).init(std.testing.allocator);
-    defer world.deinit();
-    try insertTestData(&world);
-
-    const before = try world.readingsForSensor(1);
-    defer world.allocator.free(before);
-    try std.testing.expectEqual(@as(usize, 3), before.len);
-
-    try world.insert(.{ .sensor_id = 1, .timestamp = 400, .value = 40.0, .sensor_type = .temperature });
-
-    const after = try world.readingsForSensor(1);
-    defer world.allocator.free(after);
-    try std.testing.expectEqual(@as(usize, 4), after.len);
-
-    var found = false;
-    for (after) |r| {
-        if (r.timestamp == 400 and r.value == 40.0) found = true;
-    }
-    try std.testing.expect(found);
-}
-
-// World(T).readingsForType() — the per-type index query_anomalies now uses
-// instead of scanning the whole dataset checking sensor_type per row.
+// World(T).readingsForType() — the per-type index the steady-state
+// per-type volume report (simulation.zig) uses instead of scanning the
+// whole dataset checking sensor_type per row.
 test "World(T).readingsForType returns only that type's own readings" {
     var world = try World(aos).init(std.testing.allocator);
     defer world.deinit();
@@ -541,40 +357,6 @@ test "World(T).readingsForType picks up new readings after an insert invalidates
     const after = try world.readingsForType(.temperature);
     defer world.allocator.free(after);
     try std.testing.expectEqual(@as(usize, 4), after.len);
-}
-
-// World(T).statsForType() — cached mean/std-dev that query_anomalies reads
-// instead of recomputing on every call. Correctness here matters a lot: a
-// wrong mean/std-dev would silently corrupt every anomaly result, not just
-// slow something down.
-test "World(T).statsForType computes correct mean/std-dev/count for a type" {
-    var world = try World(aos).init(std.testing.allocator);
-    defer world.deinit();
-    try insertTestData(&world);
-
-    // sensor 1 (temperature): values 10, 30, 20 -> mean 20, population std-dev sqrt(200/3)
-    const stats = try world.statsForType(.temperature);
-    try std.testing.expectEqual(@as(usize, 3), stats.count);
-    try std.testing.expectApproxEqAbs(@as(f64, 20.0), stats.mean, 1e-9);
-    try std.testing.expectApproxEqAbs(@as(f64, 8.16496580927726), stats.std_dev, 1e-9);
-
-    const missing = try world.statsForType(.co2);
-    try std.testing.expectEqual(@as(usize, 0), missing.count);
-}
-
-test "World(T).statsForType invalidates its cache on the next insert" {
-    var world = try World(aos).init(std.testing.allocator);
-    defer world.deinit();
-    try insertTestData(&world);
-
-    const before = try world.statsForType(.temperature);
-    try std.testing.expectEqual(@as(usize, 3), before.count);
-
-    try world.insert(.{ .sensor_id = 1, .timestamp = 400, .value = 40.0, .sensor_type = .temperature });
-
-    const after = try world.statsForType(.temperature);
-    try std.testing.expectEqual(@as(usize, 4), after.count);
-    try std.testing.expectApproxEqAbs(@as(f64, 25.0), after.mean, 1e-9); // (10+30+20+40)/4
 }
 
 test "World(T) memoryUsed strictly grows after insert, for all seven backends" {

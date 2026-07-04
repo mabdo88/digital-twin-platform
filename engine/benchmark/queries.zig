@@ -183,8 +183,9 @@ pub fn query_avg_window(world: anytype, sensor_id: u32, hours: u32) !f32 {
 // (CLAUDE.md §3.5: zone assignment is data the caller registered, not a
 // property derivable from the id). Both queries below fetch member sensor
 // IDs via world.sensorIdsByZone/sensorIdsByFloor, then pull each member's
-// own readings directly via world.readingsForSensor — an index lookup, not
-// a scan of every reading in the world checking membership one by one.
+// own readings directly via world.rangeByTime (native per-sensor, windowed
+// lookup) — not a scan of every reading in the world checking membership
+// one by one.
 // ---------------------------------------------------------------------------
 
 /// Q5: Average value for all sensors of a given `sensor_type` in a `zone_id`
@@ -195,8 +196,8 @@ pub fn query_avg_window(world: anytype, sensor_id: u32, hours: u32) !f32 {
 /// sensor_id arithmetic — see zoneMembership's doc comment.
 /// Returns 0.0 when no matching readings exist.
 ///
-/// Pure: calls only world.iterateAll/sensorIdsByZone — no backend-specific
-/// code, no branching on backend type.
+/// Pure: calls only world.sensorIdsByZone/getLatestBySensor/rangeByTime —
+/// no backend-specific code, no branching on backend type.
 pub fn query_avg_zone_type(world: anytype, zone_id: u32, sensor_type: sb.SensorType, hours: u32) !f32 {
     const member_ids = try world.sensorIdsByZone(zone_id);
     defer world.allocator.free(member_ids);
@@ -251,8 +252,8 @@ pub fn query_avg_zone_type(world: anytype, zone_id: u32, sensor_type: sb.SensorT
 /// not sensor_id arithmetic — see floorMembership's doc comment.
 /// Returns Stats{ 0, 0, 0 } when no matching readings exist.
 ///
-/// Pure: calls only world.iterateAll/sensorIdsByFloor — no backend-specific
-/// code, no branching on backend type.
+/// Pure: calls only world.sensorIdsByFloor/getLatestBySensor/rangeByTime —
+/// no backend-specific code, no branching on backend type.
 pub fn query_floor_stats(world: anytype, floor_id: u32, sensor_type: sb.SensorType, hours: u32) !Stats {
     const member_ids = try world.sensorIdsByFloor(floor_id);
     defer world.allocator.free(member_ids);
@@ -610,55 +611,146 @@ pub fn query_zone_hierarchy(world: anytype, zone_id: u32, depth: u32) ![]EntityI
 // ---------------------------------------------------------------------------
 // Anomaly query family (Q11–Q12)
 //
-// Both queries scan the world for statistical outliers. Pure functions over
-// world.iterateAll() — backend-agnostic, deterministic given the same data.
+// Both queries scan for statistical/threshold outliers using only the
+// native per-backend primitives (allSensorIds/getLatestBySensor/
+// rangeByTime) — backend-agnostic, deterministic given the same data.
 // Tie-breaking and ordering rules are documented per-query so all backends
 // produce byte-identical output for the golden equivalence tests.
 // ---------------------------------------------------------------------------
 
-/// Q11: All readings of `sensor_type` whose value deviates from that type's
-/// mean by more than `std_dev_threshold` standard deviations (z-score).
-///
-/// Mean and std-dev are computed over the SAME pass — every reading of the
-/// requested type contributes, then a second pass selects outliers. Welford
-/// would be lower-allocation but a two-pass mean/variance is fine at scale
-/// here and easier to reason about.
-///
-/// Returns an empty slice when fewer than 2 matching readings exist (variance
-/// is undefined for n<2). Results are sorted by (sensor_id asc, timestamp asc).
-/// Caller owns the slice (free with world.allocator).
-///
-/// Pure: calls only world.statsForType/readingsForType — no backend-specific code.
-pub fn query_anomalies(world: anytype, sensor_type: sb.SensorType, std_dev_threshold: f32) ![]AnomalyResult {
-    // Mean/std-dev are cached at the World level (world.statsForType) — the
-    // data doesn't change within a benchmark run, so computing them is
-    // genuinely redundant work past the first call.
-    const stats = try world.statsForType(sensor_type);
-    if (stats.count < 2) return &.{};
+/// Default trailing baseline window for query_anomalies — 7 days. Long
+/// enough to give every sensor type a real sample (even vibration's
+/// hourly cadence yields ~168 points) without reaching back through a
+/// type's entire multi-year retention. One named constant so
+/// runner.zig/simulation.zig don't each hardcode their own copy.
+pub const ANOMALY_WINDOW_HOURS: u32 = 24 * 7;
 
-    // Only this type's own readings (world.readingsForType — an index
-    // lookup, not a scan of the whole dataset checking sensor_type per
-    // row). The selection pass below is NOT cached and still runs in full
-    // on every call — see statsForType's and readingsForType's doc
-    // comments for why that distinction matters.
-    const type_readings = try world.readingsForType(sensor_type);
-    defer world.allocator.free(type_readings);
+/// Default z-score threshold for query_anomalies's benchmark callers.
+/// 1.0 sigma (the old value, from before per-hour-of-day baselining
+/// existed) flags ~32% of pure Gaussian noise by construction — even with
+/// the diurnal cycle correctly factored out via hourOfDay bucketing, a
+/// flat 1.0 sigma cutoff still mostly returns ordinary noise, not outliers.
+/// 2.5 sigma is the conventional statistical-outlier cutoff (~1% of a
+/// normal distribution) — see the research cited in this query's redesign:
+/// real anomaly/fault detection uses a threshold selective enough that
+/// what it flags is actually worth a human's attention.
+pub const ANOMALY_STD_DEV_THRESHOLD: f32 = 2.5;
+
+const HOURS_PER_DAY: usize = 24;
+
+/// Hour-of-day (0-23) a timestamp falls in, ignoring which day — the
+/// bucket key query_anomalies baselines against. Pure epoch-ms arithmetic
+/// (no timezone/OS calendar API per CLAUDE.md's cross-platform rule); the
+/// synthetic generator's diurnal cycle and SIM_START_MS are themselves
+/// defined against raw epoch time, so this needs no calendar concept
+/// beyond "which of the 24 hourly buckets this ms value lands in."
+fn hourOfDay(timestamp_ms: i64) usize {
+    const ms_per_hour: i64 = 60 * 60 * 1000;
+    return @intCast(@mod(@divFloor(timestamp_ms, ms_per_hour), HOURS_PER_DAY));
+}
+
+/// Q11: Readings of `sensor_type`, across every sensor of that type, whose
+/// value deviates by more than `std_dev_threshold` standard deviations from
+/// THAT SENSOR'S OWN mean **for that same hour-of-day**, computed over its
+/// trailing `window_hours` (ending at its own latest reading) — the same
+/// "trailing window from this sensor's own latest timestamp" idiom as
+/// query_avg_window/query_avg_zone_type.
+///
+/// Baselining per-sensor, not blended across every sensor of the type
+/// building-wide, matches how real anomaly detection is actually scoped: a
+/// boiler-room temperature sensor and a patient-room one don't share one
+/// mean.
+///
+/// Baselining per-HOUR-OF-DAY, not one flat mean/std-dev over the whole
+/// window, matters because most sensor types (temperature, co2, energy,
+/// structural — see generator.zig's SensorProfile.daily_amplitude) have a
+/// real, deliberate daily cycle: a temperature sensor's ordinary 3pm peak
+/// sits ~3 units above its 24h mean, versus ~0.3 units of actual sensor
+/// noise. A flat window mean/std-dev conflates that expected swing with
+/// noise, so an ordinary daily peak reads as a spurious ~1.4 sigma "anomaly"
+/// every single day. This is the standard naive-z-score-on-seasonal-data
+/// failure (flagging "December" as an anomaly because sales are high, when
+/// December is exactly when they're supposed to be) — the fix is the
+/// standard one: baseline each reading against its own time-of-day cohort
+/// (here, same hour across the trailing window) instead of a flat average.
+/// Only vibration's bursty_impulsive shape (tiny daily_amplitude, real
+/// anomalies are the injected burst spikes) would have been fine either
+/// way; every diurnal_continuous/stepwise_discrete type needs this.
+///
+/// Mean and std-dev for an (sensor, hour-of-day) pair are computed over the
+/// SAME per-hour-bucket sample that is then scanned for outliers.
+///
+/// A reading contributes no result when its hour-of-day bucket has fewer
+/// than 2 samples in the window, or when every sample in that bucket is
+/// identical (std_dev == 0 — no reading in that bucket is anomalous at any
+/// threshold). Results are sorted by (sensor_id asc, timestamp asc). Caller
+/// owns the slice (free with world.allocator).
+///
+/// Pure: calls only world.allSensorIds/getLatestBySensor/rangeByTime — the
+/// same native, backend-agnostic primitives query_spatial_radius and
+/// query_avg_window already use, plus pure in-memory bucketing over the
+/// one window slice already fetched. No World-level shim: unlike the old
+/// statsForType/readingsForType path, nothing here materializes a copy of
+/// every reading of a type — each backend answers via its own real
+/// partition/tree/buffer lookup.
+pub fn query_anomalies(world: anytype, sensor_type: sb.SensorType, std_dev_threshold: f32, window_hours: u32) ![]AnomalyResult {
+    const sensor_ids = try world.allSensorIds();
+    defer world.allocator.free(sensor_ids);
+
+    const window_ms: i64 = @as(i64, window_hours) * 60 * 60 * 1000;
 
     var result: std.ArrayList(AnomalyResult) = .empty;
     defer result.deinit(world.allocator);
 
-    if (stats.std_dev == 0.0) {
-        // All values identical — no reading is anomalous at any threshold.
-        return try result.toOwnedSlice(world.allocator);
-    }
+    for (sensor_ids) |sid| {
+        const latest = world.getLatestBySensor(sid) orelse continue;
+        if (latest.sensor_type != sensor_type) continue;
 
-    for (type_readings) |r| {
-        const z: f64 = (@as(f64, r.value) - stats.mean) / stats.std_dev;
-        if (@abs(z) > @as(f64, std_dev_threshold)) {
-            try result.append(world.allocator, .{
-                .reading = r,
-                .z_score = @as(f32, @floatCast(z)),
-            });
+        const window = try world.rangeByTime(.{
+            .sensor_id = sid,
+            .start_time = latest.timestamp - window_ms,
+            .end_time = latest.timestamp,
+        });
+        defer world.allocator.free(window);
+
+        if (window.len < 2) continue;
+
+        var sums: [HOURS_PER_DAY]f64 = @splat(0);
+        var counts: [HOURS_PER_DAY]usize = @splat(0);
+        for (window) |r| {
+            const h = hourOfDay(r.timestamp);
+            sums[h] += r.value;
+            counts[h] += 1;
+        }
+
+        var means: [HOURS_PER_DAY]f64 = @splat(0);
+        for (0..HOURS_PER_DAY) |h| {
+            if (counts[h] > 0) means[h] = sums[h] / @as(f64, @floatFromInt(counts[h]));
+        }
+
+        var sum_sq_devs: [HOURS_PER_DAY]f64 = @splat(0);
+        for (window) |r| {
+            const h = hourOfDay(r.timestamp);
+            const d = @as(f64, r.value) - means[h];
+            sum_sq_devs[h] += d * d;
+        }
+
+        var std_devs: [HOURS_PER_DAY]f64 = @splat(0);
+        for (0..HOURS_PER_DAY) |h| {
+            if (counts[h] > 0) std_devs[h] = @sqrt(sum_sq_devs[h] / @as(f64, @floatFromInt(counts[h])));
+        }
+
+        for (window) |r| {
+            const h = hourOfDay(r.timestamp);
+            if (counts[h] < 2 or std_devs[h] == 0.0) continue;
+
+            const z: f64 = (@as(f64, r.value) - means[h]) / std_devs[h];
+            if (@abs(z) > @as(f64, std_dev_threshold)) {
+                try result.append(world.allocator, .{
+                    .reading = r,
+                    .z_score = @as(f32, @floatCast(z)),
+                });
+            }
         }
     }
 
@@ -674,27 +766,40 @@ pub fn query_anomalies(world: anytype, sensor_type: sb.SensorType, std_dev_thres
     return try result.toOwnedSlice(world.allocator);
 }
 
-/// Q12: First sustained run for `sensor_id` where every reading's value
-/// exceeds `threshold` for at least `min_duration_ms` (end_ts - start_ts).
+/// Default lookback window for query_threshold_breach — 48 hours. This
+/// query is declared `hot: true` in every profile that carries it
+/// (generator.zig's per-type query mixes) — it models a live BMS fault
+/// alert ("is there a sustained over-threshold run happening now/recently"),
+/// not a lifetime audit. A sensor's entire multi-year retained history
+/// would answer a different question ("has this sensor EVER breached"),
+/// which nothing in the query mix actually asks for.
+pub const THRESHOLD_BREACH_WINDOW_HOURS: u32 = 48;
+
+/// Q12: First sustained run for `sensor_id`, within its trailing
+/// `window_hours` (ending at its own latest reading — same idiom as
+/// query_avg_window/query_anomalies), where every reading's value exceeds
+/// `threshold` for at least `min_duration_ms` (end_ts - start_ts).
 ///
 /// A "run" is a maximal sequence of timestamp-adjacent readings whose value
-/// is above the threshold. The first run that meets the duration requirement
-/// is returned (earliest start_ts). Equal-timestamp readings break by value.
+/// is above the threshold. The first run within the window that meets the
+/// duration requirement is returned (earliest start_ts). Equal-timestamp
+/// readings break by value.
 ///
-/// Returns null when no qualifying run exists. Pure: calls only
-/// world.readingsForSensor — an index lookup bounded by this one sensor's
-/// own reading count, not world.rangeByTime(minInt, maxInt), which used to
-/// degrade to a full-dataset scan (the (minInt, maxInt) bounds don't narrow
-/// anything, so every backend's binary search collapsed to "the whole
-/// array" and the sensor_id filter ran against every reading in the world).
-pub fn query_threshold_breach(world: anytype, sensor_id: u32, threshold: f32, min_duration_ms: i64) !?BreachEvent {
+/// Returns null when no qualifying run exists in the window. Pure: calls
+/// only world.getLatestBySensor/rangeByTime, bounded to this one sensor's
+/// own readings in the recent window — not the unbounded
+/// world.rangeByTime(minInt, ...) this used to do, which made every
+/// backend's binary search collapse to "the whole array" for this sensor
+/// and grow without bound as that sensor's retained history grew.
+pub fn query_threshold_breach(world: anytype, sensor_id: u32, threshold: f32, min_duration_ms: i64, window_hours: u32) !?BreachEvent {
     // Use getLatestBySensor to bound the time range, then rangeByTime which
     // returns sorted results via the backend's index — no manual sort needed.
     const latest = world.getLatestBySensor(sensor_id) orelse return null;
 
+    const window_ms: i64 = @as(i64, window_hours) * 60 * 60 * 1000;
     const readings = try world.rangeByTime(.{
         .sensor_id = sensor_id,
-        .start_time = std.math.minInt(i64),
+        .start_time = latest.timestamp - window_ms,
         .end_time = latest.timestamp,
     });
     defer world.allocator.free(readings);
@@ -786,40 +891,30 @@ pub fn query_latest_zone(world: anytype, zone_id: u32) ![]const sb.SensorReading
 /// Q3: Latest reading per sensor of a given type.
 /// Returns one reading per sensor matching sensor_type, sorted by sensor_id
 /// ascending. Caller owns the returned slice (free with world.allocator).
-/// Pure: calls only world.readingsForType — no backend-specific code.
+///
+/// Pure: calls only world.allSensorIds/getLatestBySensor — the same native
+/// primitives query_spatial_radius/query_anomalies use. "Latest per sensor
+/// of a type" only ever needs ONE reading per sensor, so materializing
+/// every retained reading of that type first (the old
+/// world.readingsForType path) did (retained readings of that type) times
+/// more work than the answer needed — a real-time-family query (Q3 is
+/// tagged real_time, same as Q1/Q2) shouldn't cost more the longer a
+/// type's retention window is.
 pub fn query_latest_by_type(world: anytype, sensor_type: sb.SensorType) ![]const sb.SensorReading {
-    // world.readingsForType is an index lookup scoped to this type (not a
-    // full-dataset scan via iterateAll — see readingsForType's doc
-    // comment). Owned; must free.
-    const type_readings = try world.readingsForType(sensor_type);
-    defer world.allocator.free(type_readings);
-
-    // Track latest-per-sensor via a hash map, not a linear scan of the
-    // result list: at real per-sensor-type volume (hundreds of sensors,
-    // tens of thousands of readings each) a linear "already seen?" scan
-    // over the growing result list made this O(readings x distinct
-    // sensors) instead of O(readings).
-    var latest = std.AutoHashMap(u32, sb.SensorReading).init(world.allocator);
-    defer latest.deinit();
-
-    for (type_readings) |r| {
-        const gop = try latest.getOrPut(r.sensor_id);
-        if (!gop.found_existing or r.timestamp > gop.value_ptr.timestamp) {
-            gop.value_ptr.* = r;
-        }
-    }
+    const sensor_ids = try world.allSensorIds();
+    defer world.allocator.free(sensor_ids);
 
     var result: std.ArrayList(sb.SensorReading) = .empty;
     defer result.deinit(world.allocator);
 
-    var it = latest.valueIterator();
-    while (it.next()) |v| try result.append(world.allocator, v.*);
-
-    std.mem.sort(sb.SensorReading, result.items, {}, struct {
-        fn lt(_: void, lhs: sb.SensorReading, rhs: sb.SensorReading) bool {
-            return lhs.sensor_id < rhs.sensor_id;
-        }
-    }.lt);
+    // allSensorIds() is already sorted ascending (query_spatial_radius
+    // relies on the same guarantee without re-sorting), so filtering
+    // in-place preserves sensor_id-ascending order — no sort needed.
+    for (sensor_ids) |sid| {
+        const latest = world.getLatestBySensor(sid) orelse continue;
+        if (latest.sensor_type != sensor_type) continue;
+        try result.append(world.allocator, latest);
+    }
 
     return try result.toOwnedSlice(world.allocator);
 }
@@ -1741,18 +1836,23 @@ test "query_anomalies: all six backends agree on same seeded dataset" {
         .{ .st = .vibration, .sigma = 1.0 },
     };
 
+    // 72h comfortably covers the fixture's full 50h span (dataset.zig's
+    // READINGS_PER_SENSOR=50 hourly readings), so every backend's window
+    // includes the same readings the old whole-history version scanned.
+    const window_hours: u32 = 72;
+
     for (cases) |tc| {
-        const r_aos = try query_anomalies(&world_aos, tc.st, tc.sigma);
+        const r_aos = try query_anomalies(&world_aos, tc.st, tc.sigma, window_hours);
         defer world_aos.allocator.free(r_aos);
-        const r_soa = try query_anomalies(&world_soa, tc.st, tc.sigma);
+        const r_soa = try query_anomalies(&world_soa, tc.st, tc.sigma, window_hours);
         defer world_soa.allocator.free(r_soa);
-        const r_ts = try query_anomalies(&world_ts, tc.st, tc.sigma);
+        const r_ts = try query_anomalies(&world_ts, tc.st, tc.sigma, window_hours);
         defer world_ts.allocator.free(r_ts);
-        const r_col = try query_anomalies(&world_col, tc.st, tc.sigma);
+        const r_col = try query_anomalies(&world_col, tc.st, tc.sigma, window_hours);
         defer world_col.allocator.free(r_col);
-        const r_hier = try query_anomalies(&world_hier, tc.st, tc.sigma);
+        const r_hier = try query_anomalies(&world_hier, tc.st, tc.sigma, window_hours);
         defer world_hier.allocator.free(r_hier);
-        const r_rb = try query_anomalies(&world_rb, tc.st, tc.sigma);
+        const r_rb = try query_anomalies(&world_rb, tc.st, tc.sigma, window_hours);
         defer world_rb.allocator.free(r_rb);
 
         const ref = r_aos;
@@ -1773,7 +1873,7 @@ test "query_anomalies: returns empty when fewer than 2 readings of the type" {
     var world = try World(aos).init(std.testing.allocator);
     defer world.deinit();
     try world.insert(.{ .sensor_id = 0, .timestamp = 1, .value = 100.0, .sensor_type = .temperature });
-    const r = try query_anomalies(&world, .temperature, 1.0);
+    const r = try query_anomalies(&world, .temperature, 1.0, 24);
     defer world.allocator.free(r);
     try std.testing.expectEqual(@as(usize, 0), r.len);
 }
@@ -1784,7 +1884,7 @@ test "query_anomalies: returns empty when all values are identical" {
     try world.insert(.{ .sensor_id = 0, .timestamp = 1, .value = 42.0, .sensor_type = .temperature });
     try world.insert(.{ .sensor_id = 0, .timestamp = 2, .value = 42.0, .sensor_type = .temperature });
     try world.insert(.{ .sensor_id = 0, .timestamp = 3, .value = 42.0, .sensor_type = .temperature });
-    const r = try query_anomalies(&world, .temperature, 0.1);
+    const r = try query_anomalies(&world, .temperature, 0.1, 24);
     defer world.allocator.free(r);
     try std.testing.expectEqual(@as(usize, 0), r.len);
 }
@@ -1798,12 +1898,12 @@ test "query_anomalies: high-sigma threshold filters out modest deviations" {
     }
     try world.insert(.{ .sensor_id = 1, .timestamp = 100, .value = 1000.0, .sensor_type = .temperature });
 
-    const high = try query_anomalies(&world, .temperature, 2.0);
+    const high = try query_anomalies(&world, .temperature, 2.0, 24);
     defer world.allocator.free(high);
     try std.testing.expectEqual(@as(usize, 1), high.len);
     try std.testing.expectEqual(@as(f32, 1000.0), high[0].reading.value);
 
-    const huge = try query_anomalies(&world, .temperature, 1000.0);
+    const huge = try query_anomalies(&world, .temperature, 1000.0, 24);
     defer world.allocator.free(huge);
     try std.testing.expectEqual(@as(usize, 0), huge.len);
 }
@@ -1839,14 +1939,20 @@ test "query_threshold_breach: all six backends agree on same seeded dataset" {
         .{ .sensor = 9, .threshold = 100.0, .min_dur_hours = 1 },
     };
 
+    // 72h comfortably covers the fixture's full 50h span (dataset.zig's
+    // READINGS_PER_SENSOR=50 hourly readings) — same reasoning as
+    // query_anomalies' golden test, so every backend's window includes the
+    // same readings the old unbounded version scanned.
+    const window_hours: u32 = 72;
+
     for (cases) |tc| {
         const min_dur_ms = tc.min_dur_hours * 60 * 60 * 1000;
-        const r_aos = try query_threshold_breach(&world_aos, tc.sensor, tc.threshold, min_dur_ms);
-        const r_soa = try query_threshold_breach(&world_soa, tc.sensor, tc.threshold, min_dur_ms);
-        const r_ts = try query_threshold_breach(&world_ts, tc.sensor, tc.threshold, min_dur_ms);
-        const r_col = try query_threshold_breach(&world_col, tc.sensor, tc.threshold, min_dur_ms);
-        const r_hier = try query_threshold_breach(&world_hier, tc.sensor, tc.threshold, min_dur_ms);
-        const r_rb = try query_threshold_breach(&world_rb, tc.sensor, tc.threshold, min_dur_ms);
+        const r_aos = try query_threshold_breach(&world_aos, tc.sensor, tc.threshold, min_dur_ms, window_hours);
+        const r_soa = try query_threshold_breach(&world_soa, tc.sensor, tc.threshold, min_dur_ms, window_hours);
+        const r_ts = try query_threshold_breach(&world_ts, tc.sensor, tc.threshold, min_dur_ms, window_hours);
+        const r_col = try query_threshold_breach(&world_col, tc.sensor, tc.threshold, min_dur_ms, window_hours);
+        const r_hier = try query_threshold_breach(&world_hier, tc.sensor, tc.threshold, min_dur_ms, window_hours);
+        const r_rb = try query_threshold_breach(&world_rb, tc.sensor, tc.threshold, min_dur_ms, window_hours);
 
         const others = [_]?BreachEvent{ r_soa, r_ts, r_col, r_hier, r_rb };
         if (r_aos) |ref| {
@@ -1867,7 +1973,7 @@ test "query_threshold_breach: all six backends agree on same seeded dataset" {
 test "query_threshold_breach: returns null for sensor with no readings" {
     var world = try World(aos).init(std.testing.allocator);
     defer world.deinit();
-    const r = try query_threshold_breach(&world, 0, 0.0, 0);
+    const r = try query_threshold_breach(&world, 0, 0.0, 0, 24);
     try std.testing.expect(r == null);
 }
 
@@ -1884,7 +1990,7 @@ test "query_threshold_breach: returns the first sustained run, not later ones" {
     try world.insert(.{ .sensor_id = 7, .timestamp = 600, .value = 250.0, .sensor_type = .temperature });
     try world.insert(.{ .sensor_id = 7, .timestamp = 700, .value = 5.0, .sensor_type = .temperature });
 
-    const r = (try query_threshold_breach(&world, 7, 50.0, 150)).?;
+    const r = (try query_threshold_breach(&world, 7, 50.0, 150, 24)).?;
     try std.testing.expectEqual(@as(i64, 100), r.start_ts);
     try std.testing.expectEqual(@as(i64, 300), r.end_ts);
     try std.testing.expectEqual(@as(i64, 200), r.duration_ms);
@@ -1897,6 +2003,6 @@ test "query_threshold_breach: returns null when no run meets min_duration_ms" {
     try world.insert(.{ .sensor_id = 3, .timestamp = 0, .value = 99.0, .sensor_type = .temperature });
     try world.insert(.{ .sensor_id = 3, .timestamp = 10, .value = 99.0, .sensor_type = .temperature });
     try world.insert(.{ .sensor_id = 3, .timestamp = 20, .value = 1.0, .sensor_type = .temperature });
-    const r = try query_threshold_breach(&world, 3, 50.0, 1000);
+    const r = try query_threshold_breach(&world, 3, 50.0, 1000, 24);
     try std.testing.expect(r == null);
 }

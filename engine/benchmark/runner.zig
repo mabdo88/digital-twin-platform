@@ -134,13 +134,13 @@ pub fn q10_wrapper(world: anytype, zone_id: u32, depth: u32) !void {
     world.allocator.free(result);
 }
 
-pub fn q11_wrapper(world: anytype, sensor_type: sb.SensorType, std_dev_threshold: f32) !void {
-    const result = try queries.query_anomalies(world, sensor_type, std_dev_threshold);
+pub fn q11_wrapper(world: anytype, sensor_type: sb.SensorType, std_dev_threshold: f32, window_hours: u32) !void {
+    const result = try queries.query_anomalies(world, sensor_type, std_dev_threshold, window_hours);
     world.allocator.free(result);
 }
 
-pub fn q12_wrapper(world: anytype, sensor_id: u32, threshold: f32, min_duration_ms: i64) !void {
-    _ = try queries.query_threshold_breach(world, sensor_id, threshold, min_duration_ms);
+pub fn q12_wrapper(world: anytype, sensor_id: u32, threshold: f32, min_duration_ms: i64, window_hours: u32) !void {
+    _ = try queries.query_threshold_breach(world, sensor_id, threshold, min_duration_ms, window_hours);
 }
 
 // query_avg_window/latest_single/latest_zone/latest_by_type/avg_zone_type/
@@ -303,8 +303,8 @@ const query_specs = .{
     .{ .name = "query_floor_stats", .func = q6_wrapper, .args = .{ @as(u32, 0), sb.SensorType.temperature, @as(u32, 24) }, .historical = false },
     .{ .name = "query_spatial_radius", .func = q9_wrapper, .args = .{ queries.Vec3{ .x = 22.5, .y = 0.0, .z = 0.0 }, @as(f32, 25.0) }, .historical = false },
     .{ .name = "query_zone_hierarchy", .func = q10_wrapper, .args = .{ @as(u32, 0), @as(u32, 1) }, .historical = false },
-    .{ .name = "query_anomalies", .func = q11_wrapper, .args = .{ sb.SensorType.temperature, @as(f32, 1.0) }, .historical = false },
-    .{ .name = "query_threshold_breach", .func = q12_wrapper, .args = .{ @as(u32, 0), @as(f32, 9.5), @as(i64, 60 * 60 * 1000) }, .historical = false },
+    .{ .name = "query_anomalies", .func = q11_wrapper, .args = .{ sb.SensorType.temperature, queries.ANOMALY_STD_DEV_THRESHOLD, queries.ANOMALY_WINDOW_HOURS }, .historical = false },
+    .{ .name = "query_threshold_breach", .func = q12_wrapper, .args = .{ @as(u32, 0), @as(f32, 9.5), @as(i64, 60 * 60 * 1000), queries.THRESHOLD_BREACH_WINDOW_HOURS }, .historical = false },
     .{ .name = "query_hourly_rollup", .func = q7_wrapper, .args = .{ @as(u32, 0), @as(u32, 2) }, .historical = true },
     .{ .name = "query_daily_zone_rollup", .func = q8_wrapper, .args = .{ @as(u32, 0), sb.SensorType.temperature }, .historical = true },
 };

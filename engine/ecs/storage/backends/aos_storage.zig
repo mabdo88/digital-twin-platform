@@ -144,10 +144,6 @@ pub fn pruneOlderThan(self: *Self, sensor_type: SensorType, cutoff_timestamp: i6
 // Tests
 // ---------------------------------------------------------------------------
 
-test "AoS: assertImplements" {
-    sb.assertImplements(Self);
-}
-
 test "AoS: insert N readings and read them back" {
     const N: usize = 100;
     var backend = try Self.init(std.testing.allocator);
