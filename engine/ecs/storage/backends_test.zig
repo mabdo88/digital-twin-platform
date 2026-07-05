@@ -1,6 +1,6 @@
-// Test root for storage backend tests.
+// Test entry point for the storage backend family.
 // Placed at storage/ level so backends can import ../storage_backend.zig
-// without going outside the module path.
+// without leaving the module path.
 
 const aos = @import("backends/aos_storage.zig");
 const soa = @import("backends/soa_storage.zig");
@@ -10,7 +10,6 @@ const hier = @import("backends/hierarchical_storage.zig");
 const rb = @import("backends/ringbuffer_storage.zig");
 const lake = @import("backends/lake_storage.zig");
 
-// Re-export so all tests in those files are discovered.
 comptime {
     _ = aos;
     _ = soa;

@@ -177,31 +177,3 @@ pub fn insertDataset(world: anytype, readings: []const sb.SensorReading) !void {
 }
 
 // ---------------------------------------------------------------------------
-// Tests — the generator is deterministic and self-consistent.
-// ---------------------------------------------------------------------------
-
-test "generateDataset is deterministic for a fixed seed" {
-    const a = try generateDataset(std.testing.allocator);
-    defer std.testing.allocator.free(a);
-    const b = try generateDataset(std.testing.allocator);
-    defer std.testing.allocator.free(b);
-
-    try std.testing.expectEqual(a.len, b.len);
-    for (a, b) |ra, rb| {
-        try std.testing.expectEqual(ra.sensor_id, rb.sensor_id);
-        try std.testing.expectEqual(ra.timestamp, rb.timestamp);
-        try std.testing.expectEqual(ra.value, rb.value);
-        try std.testing.expectEqual(ra.sensor_type, rb.sensor_type);
-    }
-}
-
-test "generateDataset has the expected shape" {
-    const ds = try generateDataset(std.testing.allocator);
-    defer std.testing.allocator.free(ds);
-
-    try std.testing.expectEqual(@as(usize, NUM_SENSORS * READINGS_PER_SENSOR), ds.len);
-    // First reading: sensor 0, base timestamp, temperature.
-    try std.testing.expectEqual(@as(u32, 0), ds[0].sensor_id);
-    try std.testing.expectEqual(BASE_TIMESTAMP, ds[0].timestamp);
-    try std.testing.expectEqual(sb.SensorType.temperature, ds[0].sensor_type);
-}

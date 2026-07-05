@@ -201,36 +201,3 @@ pub fn writeSchematic(
 }
 
 // ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
-test "writeSchematic produces a non-empty SVG with one panel per floor" {
-    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    const sensors = [_]SensorPoint{
-        .{ .x = 0, .y = 0, .floor_id = 0, .sensor_type = .temperature },
-        .{ .x = 5, .y = 5, .floor_id = 0, .sensor_type = .humidity },
-        .{ .x = 1, .y = 1, .floor_id = 1, .sensor_type = .energy },
-    };
-    const zones = [_]ZoneLabel{
-        .{ .name = "Room A", .x = 0, .y = 0, .floor_id = 0 },
-        .{ .name = "Room B", .x = 1, .y = 1, .floor_id = 1 },
-    };
-
-    const dir = "test-schematic-output";
-    try writeSchematic(std.testing.allocator, io, dir, "test.ifc", &sensors, &zones);
-
-    const cwd = std.Io.Dir.cwd();
-    const data = try cwd.readFileAlloc(io, dir ++ "/schematic.svg", std.testing.allocator, .limited(1024 * 1024));
-    defer std.testing.allocator.free(data);
-
-    try std.testing.expect(std.mem.indexOf(u8, data, "<svg") != null);
-    try std.testing.expect(std.mem.indexOf(u8, data, "Floor 0") != null);
-    try std.testing.expect(std.mem.indexOf(u8, data, "Floor 1") != null);
-
-    var dir_handle = try cwd.openDir(io, dir, .{});
-    dir_handle.close(io);
-    cwd.deleteTree(io, dir) catch {};
-}

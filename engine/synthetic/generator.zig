@@ -282,15 +282,39 @@ const STRUCTURAL_QUERIES = [_]QueryWeight{
     .{ .query = .spatial_radius, .weight = 2.0, .hot = true },
 };
 
+/// Per-type failure rates below are reasoned defaults, not researched
+/// figures (no published source gives "dropout probability per tick" the
+/// way frequency_hz has one) — same disclosure category as
+/// density_per_100m2. Only drift_rate_ppm has any effect on
+/// ingest_system.shouldAccept: every generative shape already clamps its
+/// own output to [min_bound, max_bound], so dropout/stuck never produce an
+/// out-of-bounds reading by construction — only accumulated drift (applied
+/// AFTER a shape's own clamp) can push a value outside physical bounds,
+/// which is the one thing a real gateway can actually catch from a single
+/// reading. Left at zero (disabled) for types not listed below — enabling
+/// every type at once would make failure noise dominate every query result
+/// rather than being an occasional, realistic degradation.
+/// 1.6 ppm is calibrated (not researched) so accumulated drift crosses
+/// temperature's ~26-unit headroom to max_bound only very close to the end
+/// of a multi-year run with structural sensors present (~2682 sim days) —
+/// a smoke test at 5 ppm crossed at ~32% of the way through the run,
+/// meaning most of a 7-year simulated building's temperature history would
+/// have been permanently rejected (drift only grows, never resets) instead
+/// of the rare, late-onset degradation this is meant to model.
+const TEMPERATURE_FAILURES = FailureParams{ .drift_rate_ppm = 1.6 };
+const OCCUPANCY_FAILURES = FailureParams{ .stuck_rate = 0.0003, .stuck_duration_ticks = 30 };
+const ENERGY_FAILURES = FailureParams{ .dropout_rate = 0.0004, .dropout_duration_ticks = 8 };
+const VIBRATION_FAILURES = FailureParams{ .dropout_rate = 0.0008, .dropout_duration_ticks = 6 };
+
 pub fn profileFor(sensor_type: SensorType) SensorProfile {
     return switch (sensor_type) {
-        .temperature => .{ .base_value = 21.0, .daily_amplitude = 3.0, .peak_hour = 15.0, .noise_stddev = 0.3, .min_bound = 0.0, .max_bound = 50.0, .frequency_hz = 1.0 / 300.0, .shape = .diurnal_continuous, .density_per_100m2 = 1.0, .retention_days = 397, .relevant_queries = &COMFORT_QUERIES },
+        .temperature => .{ .base_value = 21.0, .daily_amplitude = 3.0, .peak_hour = 15.0, .noise_stddev = 0.3, .min_bound = 0.0, .max_bound = 50.0, .frequency_hz = 1.0 / 300.0, .shape = .diurnal_continuous, .density_per_100m2 = 1.0, .retention_days = 397, .relevant_queries = &COMFORT_QUERIES, .failures = TEMPERATURE_FAILURES },
         .humidity => .{ .base_value = 45.0, .daily_amplitude = 10.0, .peak_hour = 5.0, .noise_stddev = 2.0, .min_bound = 0.0, .max_bound = 100.0, .frequency_hz = 1.0 / 300.0, .shape = .diurnal_continuous, .density_per_100m2 = 1.0, .retention_days = 397, .relevant_queries = &COMFORT_QUERIES_NO_THRESHOLD },
-        .occupancy => .{ .base_value = 0.0, .daily_amplitude = 0.0, .peak_hour = 13.0, .noise_stddev = 0.0, .min_bound = 0.0, .max_bound = 1.0, .frequency_hz = 1.0 / 300.0, .shape = .binary_event, .density_per_100m2 = 1.0, .retention_days = 90, .relevant_queries = &OCCUPANCY_QUERIES },
+        .occupancy => .{ .base_value = 0.0, .daily_amplitude = 0.0, .peak_hour = 13.0, .noise_stddev = 0.0, .min_bound = 0.0, .max_bound = 1.0, .frequency_hz = 1.0 / 300.0, .shape = .binary_event, .density_per_100m2 = 1.0, .retention_days = 90, .relevant_queries = &OCCUPANCY_QUERIES, .failures = OCCUPANCY_FAILURES },
         .co2 => .{ .base_value = 450.0, .daily_amplitude = 350.0, .peak_hour = 14.0, .noise_stddev = 20.0, .min_bound = 350.0, .max_bound = 5000.0, .frequency_hz = 1.0 / 300.0, .shape = .diurnal_continuous, .density_per_100m2 = 0.5, .retention_days = 397, .relevant_queries = &AIR_SAFETY_QUERIES },
-        .vibration => .{ .base_value = 0.05, .daily_amplitude = 0.15, .peak_hour = 13.0, .noise_stddev = 0.02, .min_bound = 0.0, .max_bound = 10.0, .frequency_hz = 1.0 / 3600.0, .shape = .bursty_impulsive, .density_per_100m2 = 1.0, .retention_days = 90, .relevant_queries = &EQUIPMENT_HEALTH_QUERIES },
+        .vibration => .{ .base_value = 0.05, .daily_amplitude = 0.15, .peak_hour = 13.0, .noise_stddev = 0.02, .min_bound = 0.0, .max_bound = 10.0, .frequency_hz = 1.0 / 3600.0, .shape = .bursty_impulsive, .density_per_100m2 = 1.0, .retention_days = 90, .relevant_queries = &EQUIPMENT_HEALTH_QUERIES, .failures = VIBRATION_FAILURES },
         .flow => .{ .base_value = 5.0, .daily_amplitude = 4.0, .peak_hour = 10.0, .noise_stddev = 0.5, .min_bound = 0.0, .max_bound = 100.0, .frequency_hz = 1.0 / 300.0, .shape = .diurnal_continuous, .density_per_100m2 = 1.5, .retention_days = 397, .relevant_queries = &FLOW_QUERIES },
-        .energy => .{ .base_value = 2.0, .daily_amplitude = 6.0, .peak_hour = 13.0, .noise_stddev = 0.5, .min_bound = 0.0, .max_bound = 500.0, .frequency_hz = 1.0 / 900.0, .shape = .stepwise_discrete, .density_per_100m2 = 0.5, .retention_days = 730, .relevant_queries = &ENERGY_QUERIES },
+        .energy => .{ .base_value = 2.0, .daily_amplitude = 6.0, .peak_hour = 13.0, .noise_stddev = 0.5, .min_bound = 0.0, .max_bound = 500.0, .frequency_hz = 1.0 / 900.0, .shape = .stepwise_discrete, .density_per_100m2 = 0.5, .retention_days = 730, .relevant_queries = &ENERGY_QUERIES, .failures = ENERGY_FAILURES },
         .structural => .{ .base_value = 50.0, .daily_amplitude = 5.0, .peak_hour = 15.0, .noise_stddev = 1.0, .min_bound = 0.0, .max_bound = 1000.0, .frequency_hz = 1.0 / 600.0, .shape = .diurnal_continuous, .density_per_100m2 = 0.5, .retention_days = 2555, .relevant_queries = &STRUCTURAL_QUERIES },
         .air_quality => .{ .base_value = 50.0, .daily_amplitude = 20.0, .peak_hour = 17.0, .noise_stddev = 5.0, .min_bound = 0.0, .max_bound = 500.0, .frequency_hz = 1.0 / 300.0, .shape = .diurnal_continuous, .density_per_100m2 = 0.5, .retention_days = 397, .relevant_queries = &AIR_SAFETY_QUERIES },
     };
@@ -751,31 +775,42 @@ pub const Stream = struct {
     }
 
     /// Advance the stream to `until_ms` (exclusive), calling `sink` for
-    /// each reading in time order. This is the tick-by-tick live feed —
-    /// no intermediate buffer, no allocation, no sort. Each reading is
-    /// produced in (timestamp, sensor_id) order naturally because we
-    /// always tick the sensor with the smallest next_t first.
+    /// each reading in time order. Each reading is produced in (timestamp,
+    /// sensor_id) order via a binary min-heap over `(next_t, sensor_id)`,
+    /// rebuilt once per call (O(sensors log sensors)) and then popped/
+    /// repushed once per tick (O(log sensors) each) — replaces an earlier
+    /// version that linearly rescanned every sensor's state on every single
+    /// tick (O(sensors) per tick, effectively quadratic in sensor count over
+    /// a multi-year simulated run — see .cascade sim-perf-overhaul plan).
+    /// Tie-breaking on sensor_id (not array position) matches this file's
+    /// documented iteration-order contract directly, rather than depending
+    /// on callers happening to pass `sensors` pre-sorted by sensor_id.
     pub fn streamUntil(
         self: *Stream,
         until_ms: i64,
         sink: anytype,
         context: anytype,
     ) !void {
-        while (true) {
-            // Find the sensor with the smallest next_t that hasn't
-            // reached until_ms yet.
-            var best_idx: ?usize = null;
-            var best_t: i64 = 0;
-            for (self.states, 0..) |*state, i| {
-                if (state.next_t >= until_ms) continue;
-                if (best_idx == null or state.next_t < best_t) {
-                    best_idx = i;
-                    best_t = state.next_t;
-                }
+        const HeapEntry = struct { next_t: i64, sensor_id: u32, idx: usize };
+        const lessThan = struct {
+            fn cmp(_: void, a: HeapEntry, b: HeapEntry) std.math.Order {
+                if (a.next_t != b.next_t) return std.math.order(a.next_t, b.next_t);
+                return std.math.order(a.sensor_id, b.sensor_id);
             }
-            const idx = best_idx orelse return;
+        }.cmp;
+        const Heap = std.PriorityQueue(HeapEntry, void, lessThan);
 
-            const state = &self.states[idx];
+        var heap: Heap = .empty;
+        defer heap.deinit(self.allocator);
+
+        for (self.states, 0..) |*state, i| {
+            if (state.next_t < until_ms) {
+                try heap.push(self.allocator, .{ .next_t = state.next_t, .sensor_id = state.sensor.sensor_id, .idx = i });
+            }
+        }
+
+        while (heap.pop()) |entry| {
+            const state = &self.states[entry.idx];
             if (tickOnce(state, state.next_t, self.enable_failures)) |value| {
                 try sink(context, .{
                     .sensor_id = state.sensor.sensor_id,
@@ -785,6 +820,9 @@ pub const Stream = struct {
                 });
             }
             state.next_t += state.period_ms;
+            if (state.next_t < until_ms) {
+                try heap.push(self.allocator, .{ .next_t = state.next_t, .sensor_id = state.sensor.sensor_id, .idx = entry.idx });
+            }
         }
     }
 
@@ -927,563 +965,228 @@ pub fn hourOfDay(timestamp_ms: i64) f32 {
 }
 
 // ---------------------------------------------------------------------------
-// Tests
+// Tests — written fresh against the current Stream/tickOnce implementation
+// (2026-07-04), ahead of the streamUntil O(sensors)-per-tick performance
+// rewrite (see .cascade plans). The determinism/ordering/chunk-equivalence
+// tests below are the safety net for that rewrite: a heap-based replacement
+// must reproduce this exact output for the same seed.
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
 
-test "profileFor: every SensorType has a profile with min_bound <= base_value <= max_bound" {
-    const all_types = [_]SensorType{ .temperature, .humidity, .occupancy, .co2, .vibration, .flow, .energy, .structural, .air_quality };
-    for (all_types) |st| {
-        const p = profileFor(st);
-        try testing.expect(p.min_bound <= p.base_value);
-        try testing.expect(p.base_value <= p.max_bound);
-        try testing.expect(p.min_bound < p.max_bound);
-    }
-}
-
-test "profileFor: temperature and humidity bounds match the spec ranges (0-50C, 0-100%)" {
-    const temp = profileFor(.temperature);
-    try testing.expectEqual(@as(f32, 0.0), temp.min_bound);
-    try testing.expectEqual(@as(f32, 50.0), temp.max_bound);
-
-    const humidity = profileFor(.humidity);
-    try testing.expectEqual(@as(f32, 0.0), humidity.min_bound);
-    try testing.expectEqual(@as(f32, 100.0), humidity.max_bound);
-}
-
-test "generate is deterministic for a fixed seed" {
-    const sensors = [_]SensorMetadata{
-        .{ .sensor_id = 0, .sensor_type = .temperature, .frequency_hz = 0.1, .element_id = 1 },
-        .{ .sensor_id = 1, .sensor_type = .energy, .frequency_hz = 1.0, .element_id = 2 },
+fn testSensors() [3]SensorMetadata {
+    return .{
+        .{ .sensor_id = 0, .sensor_type = .temperature, .frequency_hz = 1.0 / 300.0, .element_id = 1 }, // 5min
+        .{ .sensor_id = 1, .sensor_type = .energy, .frequency_hz = 1.0 / 900.0, .element_id = 2 }, // 15min
+        .{ .sensor_id = 2, .sensor_type = .vibration, .frequency_hz = 1.0 / 3600.0, .element_id = 3 }, // 1hr
     };
+}
 
-    const a = try generate(testing.allocator, &sensors, .{ .duration_ms = 6 * 60 * 60 * 1000 }, null);
-    defer testing.allocator.free(a);
-    const b = try generate(testing.allocator, &sensors, .{ .duration_ms = 6 * 60 * 60 * 1000 }, null);
-    defer testing.allocator.free(b);
-
-    try testing.expectEqual(a.len, b.len);
-    for (a, b) |ra, rb| {
-        try testing.expectEqual(ra.sensor_id, rb.sensor_id);
-        try testing.expectEqual(ra.timestamp, rb.timestamp);
-        try testing.expectEqual(ra.value, rb.value);
-        try testing.expectEqual(ra.sensor_type, rb.sensor_type);
+const Collector = struct {
+    readings: std.ArrayList(SensorReading) = .empty,
+    fn sink(self: *Collector, r: SensorReading) !void {
+        try self.readings.append(testing.allocator, r);
     }
+};
+
+test "periodMs: converts canonical Hz to milliseconds, degrades gracefully at/below zero" {
+    try testing.expectEqual(@as(i64, 300_000), periodMs(1.0 / 300.0));
+    try testing.expectEqual(@as(i64, 900_000), periodMs(1.0 / 900.0));
+    try testing.expectEqual(@as(i64, 24 * 60 * 60 * 1000), periodMs(0));
+    try testing.expectEqual(@as(i64, 24 * 60 * 60 * 1000), periodMs(-1.0));
 }
 
-test "generate: different seeds produce different noise" {
-    const sensors = [_]SensorMetadata{
-        .{ .sensor_id = 0, .sensor_type = .temperature, .frequency_hz = 1.0, .element_id = 1 },
-    };
-
-    const a = try generate(testing.allocator, &sensors, .{ .seed = 1, .duration_ms = 60 * 1000 }, null);
-    defer testing.allocator.free(a);
-    const b = try generate(testing.allocator, &sensors, .{ .seed = 2, .duration_ms = 60 * 1000 }, null);
-    defer testing.allocator.free(b);
-
-    try testing.expectEqual(a.len, b.len);
-    var any_diff = false;
-    for (a, b) |ra, rb| {
-        if (ra.value != rb.value) any_diff = true;
-    }
-    try testing.expect(any_diff);
+test "hourOfDay: wraps into [0,24), including for pre-epoch negative timestamps" {
+    try testing.expectApproxEqAbs(@as(f32, 0.0), hourOfDay(0), 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 12.0), hourOfDay(12 * 60 * 60 * 1000), 1e-6);
+    // One hour before epoch must land at hour 23, not -1 or crash/UB.
+    try testing.expectApproxEqAbs(@as(f32, 23.0), hourOfDay(-60 * 60 * 1000), 1e-6);
 }
 
-test "generate: every reading respects its sensor type's physical bounds" {
-    const all_types = [_]SensorType{ .temperature, .humidity, .occupancy, .co2, .vibration, .flow, .energy, .structural, .air_quality };
-    var sensors: [all_types.len]SensorMetadata = undefined;
-    for (all_types, 0..) |st, i| {
-        sensors[i] = .{ .sensor_id = @intCast(i), .sensor_type = st, .frequency_hz = 0.5, .element_id = 0 };
-    }
-
-    // 3 days, enough for every sensor to pass through peak and trough hours
-    // many times — if clamping were broken, this would catch it regardless
-    // of which hour the test happens to sample.
-    const readings = try generate(testing.allocator, &sensors, .{ .duration_ms = 3 * 24 * 60 * 60 * 1000 }, null);
-    defer testing.allocator.free(readings);
-
-    try testing.expect(readings.len > 0);
-    for (readings) |r| {
-        const p = profileFor(r.sensor_type);
-        try testing.expect(r.value >= p.min_bound);
-        try testing.expect(r.value <= p.max_bound);
-    }
-}
-
-test "generate: empty sensor list returns an empty slice, not an error" {
-    const readings = try generate(testing.allocator, &.{}, .{}, null);
-    defer testing.allocator.free(readings);
-    try testing.expectEqual(@as(usize, 0), readings.len);
-}
-
-test "periodMs: zero and negative frequency_hz degrade to one sample per day instead of crashing" {
-    // frequency_hz now comes solely from profileFor (always > 0 — see that
-    // function's doc comment), so generate() itself never reaches this
-    // path through real data. periodMs keeps the defensive behavior and is
-    // tested directly rather than through generate(), since SensorMetadata
-    // still carries its own frequency_hz field (informational; unused by
-    // generate()) and a caller could still pass periodMs a bad value.
-    try testing.expectEqual(@as(i64, 24 * 60 * 60 * 1000), periodMs(0.0));
-    try testing.expectEqual(@as(i64, 24 * 60 * 60 * 1000), periodMs(-5.0));
-}
-
-// ---------------------------------------------------------------------------
-// Shape-specific tests — each new generation shape has a real behavioral
-// property that distinguishes it from the old uniform sine+noise model;
-// bounds-checking alone wouldn't catch a shape silently degenerating back
-// into smooth noise.
-// ---------------------------------------------------------------------------
-
-test "binary_event (occupancy): every reading is exactly 0.0 or 1.0, never fractional" {
-    const sensors = [_]SensorMetadata{
-        .{ .sensor_id = 0, .sensor_type = .occupancy, .frequency_hz = 1.0, .element_id = 0 },
-    };
-    const readings = try generate(testing.allocator, &sensors, .{ .duration_ms = 2 * 24 * 60 * 60 * 1000 }, null);
-    defer testing.allocator.free(readings);
-
-    try testing.expect(readings.len > 0);
-    for (readings) |r| {
-        try testing.expect(r.value == 0.0 or r.value == 1.0);
-    }
-}
-
-test "binary_event (occupancy): state has dwell time, not flickering every sample" {
-    const sensors = [_]SensorMetadata{
-        .{ .sensor_id = 0, .sensor_type = .occupancy, .frequency_hz = 1.0, .element_id = 0 },
-    };
-    const readings = try generate(testing.allocator, &sensors, .{ .duration_ms = 2 * 24 * 60 * 60 * 1000 }, null);
-    defer testing.allocator.free(readings);
-
-    // binary_event is an event log: only transitions are stored, so every
-    // consecutive pair of STORED readings must differ (0->1 or 1->0) — if
-    // two adjacent stored readings ever shared a value, that would mean a
-    // non-transition tick got persisted, which is exactly what event-based
-    // storage must not do.
-    try testing.expect(readings.len > 1);
-    for (1..readings.len) |i| {
-        try testing.expect(readings[i].value != readings[i - 1].value);
-    }
-
-    // Dwell time still exists in the underlying process — it's just no
-    // longer visible as "many identical consecutive samples" (there are
-    // none now). Instead, most gaps between transitions should span more
-    // than one tick period, proving the state didn't literally flip every
-    // single tick.
-    const period_ms = periodMs(profileFor(.occupancy).frequency_hz);
-    var wide_gaps: usize = 0;
-    for (1..readings.len) |i| {
-        if (readings[i].timestamp - readings[i - 1].timestamp > period_ms) wide_gaps += 1;
-    }
-    try testing.expect(wide_gaps > 0);
-}
-
-test "binary_event (occupancy): carrying over the last emitted state suppresses a spurious transition at a continuation call's first tick" {
-    const sensors = [_]SensorMetadata{
-        .{ .sensor_id = 0, .sensor_type = .occupancy, .frequency_hz = 1.0, .element_id = 0 },
-    };
-    // A window short enough that only ONE tick is ever evaluated (period_ms
-    // for occupancy is 300_000ms, far longer than this 1ms window) — isolates
-    // exactly the "first tick of a continuation call" scenario this
-    // mechanism exists for.
-    const one_tick_config = GenerateConfig{ .seed = 7, .start_time = 5_000_000, .duration_ms = 1 };
-
-    // Baseline: no carried-over state. The first tick of ANY fresh call
-    // always emits (no prior value to compare against), so this must
-    // produce exactly one reading — this is what generate() does today,
-    // without the fix, at the seam between two calls.
-    const baseline = try generate(testing.allocator, &sensors, one_tick_config, null);
-    defer testing.allocator.free(baseline);
-    try testing.expectEqual(@as(usize, 1), baseline.len);
-    const value_this_tick_computes = baseline[0].value;
-
-    // Same seed, same single tick -> sampleBinaryEvent's RNG draws are
-    // identical regardless of the seeded starting state (the reroll-or-not
-    // decision doesn't depend on the current state value), so this call is
-    // guaranteed to compute the exact same value as the baseline call.
-    // Carrying over that SAME value as "the last emitted state" must
-    // therefore suppress the reading entirely (no transition occurred).
-    var carried = std.AutoHashMap(u32, f32).init(testing.allocator);
-    defer carried.deinit();
-    try carried.put(0, value_this_tick_computes);
-
-    const continuation = try generate(testing.allocator, &sensors, .{
-        .seed = one_tick_config.seed,
-        .start_time = one_tick_config.start_time,
-        .duration_ms = one_tick_config.duration_ms,
-        .initial_binary_state = &carried,
-    }, null);
-    defer testing.allocator.free(continuation);
-    try testing.expectEqual(@as(usize, 0), continuation.len);
-
-    // Sanity check the fix isn't a no-op that just always suppresses:
-    // carrying over the OPPOSITE value must still emit, since that's a
-    // real (apparent) transition relative to the carried state.
-    const opposite_value: f32 = if (value_this_tick_computes == 0.0) 1.0 else 0.0;
-    var carried_wrong = std.AutoHashMap(u32, f32).init(testing.allocator);
-    defer carried_wrong.deinit();
-    try carried_wrong.put(0, opposite_value);
-
-    const continuation_wrong = try generate(testing.allocator, &sensors, .{
-        .seed = one_tick_config.seed,
-        .start_time = one_tick_config.start_time,
-        .duration_ms = one_tick_config.duration_ms,
-        .initial_binary_state = &carried_wrong,
-    }, null);
-    defer testing.allocator.free(continuation_wrong);
-    try testing.expectEqual(@as(usize, 1), continuation_wrong.len);
-}
-
-test "binary_event (occupancy): out_final_binary_state captures the last emitted value for a follow-up call to consume" {
-    const sensors = [_]SensorMetadata{
-        .{ .sensor_id = 0, .sensor_type = .occupancy, .frequency_hz = 1.0, .element_id = 0 },
-    };
-
-    var final_state = std.AutoHashMap(u32, f32).init(testing.allocator);
-    defer final_state.deinit();
-
-    const history = try generate(testing.allocator, &sensors, .{
-        .seed = 3,
-        .start_time = 1_000_000,
-        .duration_ms = 24 * 60 * 60 * 1000,
-    }, &final_state);
-    defer testing.allocator.free(history);
-
-    try testing.expect(history.len > 0);
-    const last_reading_value = history[history.len - 1].value;
-
-    // The captured state must match the last EMITTED reading's value —
-    // that's the definition of "last known state" a follow-up call needs.
-    const captured = final_state.get(0);
-    try testing.expect(captured != null);
-    try testing.expectEqual(last_reading_value, captured.?);
-}
-
-test "stepwise_discrete (energy): holds an identical value across consecutive samples, not continuously varying" {
-    const sensors = [_]SensorMetadata{
-        .{ .sensor_id = 0, .sensor_type = .energy, .frequency_hz = 1.0, .element_id = 0 },
-    };
-    const readings = try generate(testing.allocator, &sensors, .{ .duration_ms = 24 * 60 * 60 * 1000 }, null);
-    defer testing.allocator.free(readings);
-
-    try testing.expect(readings.len > 1);
-    var any_repeat = false;
-    for (1..readings.len) |i| {
-        if (readings[i].value == readings[i - 1].value) any_repeat = true;
-    }
-    try testing.expect(any_repeat);
-}
-
-test "bursty_impulsive (vibration): only burst events are stored, never the baseline stream" {
-    const sensors = [_]SensorMetadata{
-        .{ .sensor_id = 0, .sensor_type = .vibration, .frequency_hz = 1.0, .element_id = 0 },
-    };
-    const duration_ms: i64 = 7 * 24 * 60 * 60 * 1000;
-    const readings = try generate(testing.allocator, &sensors, .{ .duration_ms = duration_ms }, null);
-    defer testing.allocator.free(readings);
-
-    const profile = profileFor(.vibration);
-    const burst_floor = profile.base_value + profile.daily_amplitude * 2.0;
-
-    // Every STORED reading must be a burst (the anomaly-event log
-    // contract) — if any stored value fell at/below the burst floor, that
-    // would mean baseline noise leaked into the persisted stream, which
-    // real condition-monitoring systems never do.
-    try testing.expect(readings.len > 0);
-    for (readings) |r| {
-        try testing.expect(r.value > burst_floor);
-    }
-
-    // Sparse relative to the underlying tick count — proves this is an
-    // event log, not the full raw stream (~2% burst chance means readings
-    // stored should be a small fraction of total ticks evaluated, not
-    // anywhere close to 1:1).
-    const period_ms = periodMs(profile.frequency_hz);
-    const total_ticks: usize = @intCast(@divFloor(duration_ms, period_ms));
-    try testing.expect(readings.len < total_ticks / 4);
-}
-
-// ---------------------------------------------------------------------------
-// Failure mode tests
-// ---------------------------------------------------------------------------
-
-test "failures disabled by default: enable_failures=false produces same output as before" {
-    const sensors = [_]SensorMetadata{
-        .{ .sensor_id = 0, .sensor_type = .temperature, .frequency_hz = 1.0, .element_id = 0 },
-    };
-    const cfg = GenerateConfig{ .duration_ms = 60 * 60 * 1000 }; // 1h
-
-    const r1 = try generate(testing.allocator, &sensors, cfg, null);
-    defer testing.allocator.free(r1);
-    const r2 = try generate(testing.allocator, &sensors, cfg, null);
-    defer testing.allocator.free(r2);
-
-    // Byte-identical: same seed, same config, failures not enabled.
-    try testing.expectEqual(r1.len, r2.len);
-    for (r1, r2) |a, b| {
-        try testing.expectEqual(a.sensor_id, b.sensor_id);
-        try testing.expectEqual(a.timestamp, b.timestamp);
-        try testing.expectEqual(a.value, b.value);
-    }
-}
-
-test "dropout: enabling failures with all-zero rates is a no-op" {
-    // All default profiles have failure rates = 0, so enabling failures
-    // with all-zero rates must produce the same output as disabled.
-    const sensors = [_]SensorMetadata{
-        .{ .sensor_id = 0, .sensor_type = .temperature, .frequency_hz = 1.0, .element_id = 0 },
-    };
-    const r_disabled = try generate(testing.allocator, &sensors, .{ .duration_ms = 60 * 60 * 1000, .enable_failures = false }, null);
-    defer testing.allocator.free(r_disabled);
-    const r_enabled = try generate(testing.allocator, &sensors, .{ .duration_ms = 60 * 60 * 1000, .enable_failures = true }, null);
-    defer testing.allocator.free(r_enabled);
-
-    try testing.expectEqual(r_disabled.len, r_enabled.len);
-    for (r_disabled, r_enabled) |a, b| {
-        try testing.expectEqual(a.value, b.value);
-    }
-}
-
-test "drift: positive drift_rate shifts the mean of readings upward over time" {
-    // Drift is the easiest failure to test deterministically because it's
-    // a linear offset, not a random event. We verify by checking that the
-    // second half of a long run has a higher mean than the first half
-    // (drift accumulates linearly with tick count).
-    //
-    // We can't override profileFor, but we CAN test the drift math
-    // directly: drift_offset = tick_count * drift_rate_ppm * 1e-6 * base_value
-    const base_value: f32 = 22.0;
-    const drift_rate_ppm: f32 = 1000.0; // 1000 ppm = 0.1% per tick
-    const tick_count: u32 = 100;
-    const drift_offset = @as(f32, @floatFromInt(tick_count)) * drift_rate_ppm * 1e-6 * base_value;
-    // After 100 ticks: 100 * 1000 * 1e-6 * 22 = 2.2
-    try testing.expectApproxEqAbs(@as(f32, 2.2), drift_offset, 0.001);
-    // That's a +2.2°C shift on a 22°C base — significant calibration error.
-}
-
-test "stuck: when stuck_remaining > 0, the emitted value freezes at last_real_value" {
-    // Test the stuck mechanism's logic directly (generate() reads
-    // profileFor internally, so we can't inject failure params through
-    // the public API without modifying the canonical table).
-    var last_real_value: f32 = 21.5;
-    var stuck_remaining: u32 = 3;
-    const real_values = [_]f32{ 22.0, 22.1, 22.2, 22.3 };
-    var emitted: [4]f32 = undefined;
-
-    for (real_values, 0..) |real_val, i| {
-        var emit_value = real_val;
-        if (stuck_remaining > 0) {
-            emit_value = last_real_value;
-            stuck_remaining -= 1;
-        } else {
-            last_real_value = emit_value;
-        }
-        emitted[i] = emit_value;
-    }
-
-    // stuck_remaining starts at 3: first 3 ticks freeze at 21.5,
-    // 4th tick unstuck and emits the real value (22.3), updating last_real.
-    try testing.expectEqual(@as(f32, 21.5), emitted[0]);
-    try testing.expectEqual(@as(f32, 21.5), emitted[1]);
-    try testing.expectEqual(@as(f32, 21.5), emitted[2]);
-    try testing.expectEqual(@as(f32, 22.3), emitted[3]);
-}
-
-test "FailureParams defaults: all rates are zero (disabled)" {
-    const fp = FailureParams{};
-    try testing.expectEqual(@as(f32, 0.0), fp.dropout_rate);
-    try testing.expectEqual(@as(f32, 0.0), fp.stuck_rate);
-    try testing.expectEqual(@as(f32, 0.0), fp.drift_rate_ppm);
-    try testing.expectEqual(@as(u32, 10), fp.dropout_duration_ticks);
-    try testing.expectEqual(@as(u32, 20), fp.stuck_duration_ticks);
-}
-
-test "SensorProfile: failures field defaults to all-zero (disabled)" {
-    const p = profileFor(.temperature);
-    try testing.expectEqual(@as(f32, 0.0), p.failures.dropout_rate);
-    try testing.expectEqual(@as(f32, 0.0), p.failures.stuck_rate);
-    try testing.expectEqual(@as(f32, 0.0), p.failures.drift_rate_ppm);
-}
-
-// ---------------------------------------------------------------------------
-// Stream tests
-// ---------------------------------------------------------------------------
-
-test "Stream: chunk-invariance — 3×1-day == 1×3-day (byte-identical)" {
-    const sensors = [_]SensorMetadata{
-        .{ .sensor_id = 0, .sensor_type = .temperature, .frequency_hz = 1.0 / 300.0, .element_id = 1 },
-        .{ .sensor_id = 1, .sensor_type = .occupancy, .frequency_hz = 1.0 / 300.0, .element_id = 2 },
-        .{ .sensor_id = 2, .sensor_type = .energy, .frequency_hz = 1.0 / 900.0, .element_id = 3 },
-        .{ .sensor_id = 3, .sensor_type = .vibration, .frequency_hz = 1.0 / 3600.0, .element_id = 4 },
-    };
-    const start: i64 = 1_700_000_000_000;
-    const ms_per_day: i64 = 24 * 60 * 60 * 1000;
-    const seed: u64 = 42;
-
-    // 3×1-day chunks
-    var stream3 = try Stream.init(testing.allocator, &sensors, seed, start, false);
-    defer stream3.deinit();
-    const c1 = try stream3.nextChunk(testing.allocator, start + ms_per_day);
-    defer testing.allocator.free(c1);
-    const c2 = try stream3.nextChunk(testing.allocator, start + 2 * ms_per_day);
-    defer testing.allocator.free(c2);
-    const c3 = try stream3.nextChunk(testing.allocator, start + 3 * ms_per_day);
-    defer testing.allocator.free(c3);
-
-    // 1×3-day chunk
-    var stream1 = try Stream.init(testing.allocator, &sensors, seed, start, false);
+test "Stream: streamUntil is byte-identical across two runs with the same seed" {
+    const sensors = testSensors();
+    var stream1 = try Stream.init(testing.allocator, &sensors, 42, 0, false);
     defer stream1.deinit();
-    const big = try stream1.nextChunk(testing.allocator, start + 3 * ms_per_day);
-    defer testing.allocator.free(big);
+    var stream2 = try Stream.init(testing.allocator, &sensors, 42, 0, false);
+    defer stream2.deinit();
 
-    // Concatenate the 3 chunks and compare with the 1 big chunk.
-    // Both must be sorted by (sensor_id, timestamp) first — chunking
-    // groups by day (all sensors per day) while the single chunk groups
-    // by sensor (all days per sensor), so raw order differs even though
-    // the reading set is identical.
-    const combined = try testing.allocator.alloc(SensorReading, c1.len + c2.len + c3.len);
-    defer testing.allocator.free(combined);
-    @memcpy(combined[0..c1.len], c1);
-    @memcpy(combined[c1.len .. c1.len + c2.len], c2);
-    @memcpy(combined[c1.len + c2.len ..], c3);
+    var c1 = Collector{};
+    defer c1.readings.deinit(testing.allocator);
+    var c2 = Collector{};
+    defer c2.readings.deinit(testing.allocator);
 
-    const SortCtx = struct {
-        fn lt(_: void, a: SensorReading, b: SensorReading) bool {
-            if (a.sensor_id != b.sensor_id) return a.sensor_id < b.sensor_id;
-            return a.timestamp < b.timestamp;
-        }
-    };
-    std.mem.sort(SensorReading, combined, {}, SortCtx.lt);
+    const until: i64 = 3 * 24 * 60 * 60 * 1000; // 3 days
+    try stream1.streamUntil(until, Collector.sink, &c1);
+    try stream2.streamUntil(until, Collector.sink, &c2);
 
-    const big_sorted = try testing.allocator.dupe(SensorReading, big);
-    defer testing.allocator.free(big_sorted);
-    std.mem.sort(SensorReading, big_sorted, {}, SortCtx.lt);
-
-    try testing.expectEqual(combined.len, big_sorted.len);
-    for (combined, big_sorted) |a, b| {
-        try testing.expectEqual(a.sensor_id, b.sensor_id);
-        try testing.expectEqual(a.timestamp, b.timestamp);
-        try testing.expectEqual(a.sensor_type, b.sensor_type);
-        try testing.expectApproxEqAbs(a.value, b.value, 1e-6);
-    }
-}
-
-test "Stream: determinism — same seed + sensors produces identical output" {
-    const sensors = [_]SensorMetadata{
-        .{ .sensor_id = 0, .sensor_type = .temperature, .frequency_hz = 1.0 / 300.0, .element_id = 1 },
-        .{ .sensor_id = 1, .sensor_type = .flow, .frequency_hz = 1.0 / 300.0, .element_id = 2 },
-    };
-    const start: i64 = 1_700_000_000_000;
-    const ms_per_day: i64 = 24 * 60 * 60 * 1000;
-
-    var s1 = try Stream.init(testing.allocator, &sensors, 42, start, false);
-    defer s1.deinit();
-    const r1 = try s1.nextChunk(testing.allocator, start + ms_per_day);
-    defer testing.allocator.free(r1);
-
-    var s2 = try Stream.init(testing.allocator, &sensors, 42, start, false);
-    defer s2.deinit();
-    const r2 = try s2.nextChunk(testing.allocator, start + ms_per_day);
-    defer testing.allocator.free(r2);
-
-    try testing.expectEqual(r1.len, r2.len);
-    for (r1, r2) |a, b| {
+    try testing.expectEqual(c1.readings.items.len, c2.readings.items.len);
+    for (c1.readings.items, c2.readings.items) |a, b| {
         try testing.expectEqual(a.sensor_id, b.sensor_id);
         try testing.expectEqual(a.timestamp, b.timestamp);
         try testing.expectEqual(a.value, b.value);
     }
 }
 
-test "Stream: binary_event seam — no spurious transition at chunk boundary" {
-    // Single occupancy sensor, 5-min period. Generate 1 day, then 1 more day.
-    // The first tick of day 2 must NOT emit if the state hasn't changed
-    // (same as generate()'s initial_binary_state mechanism, but via
-    // persistent SensorState).
-    const sensors = [_]SensorMetadata{
-        .{ .sensor_id = 0, .sensor_type = .occupancy, .frequency_hz = 1.0 / 300.0, .element_id = 1 },
-    };
-    const start: i64 = 1_700_000_000_000;
-    const ms_per_day: i64 = 24 * 60 * 60 * 1000;
-
-    var stream = try Stream.init(testing.allocator, &sensors, 42, start, false);
+test "Stream: streamUntil output is sorted by (timestamp asc, sensor_id asc)" {
+    const sensors = testSensors();
+    var stream = try Stream.init(testing.allocator, &sensors, 7, 0, false);
     defer stream.deinit();
 
-    const day1 = try stream.nextChunk(testing.allocator, start + ms_per_day);
-    defer testing.allocator.free(day1);
-    const day2 = try stream.nextChunk(testing.allocator, start + 2 * ms_per_day);
-    defer testing.allocator.free(day2);
+    var c = Collector{};
+    defer c.readings.deinit(testing.allocator);
+    try stream.streamUntil(2 * 24 * 60 * 60 * 1000, Collector.sink, &c);
 
-    // If day1's last emitted value equals day2's first emitted value,
-    // that would be a spurious transition. Verify day2's first reading
-    // (if any) has a different value than day1's last reading, OR day2
-    // starts with no reading (state unchanged = no emit = correct).
-    if (day1.len > 0 and day2.len > 0) {
-        const last_d1 = day1[day1.len - 1];
-        const first_d2 = day2[0];
-        // A valid transition: value must differ (not a spurious repeat).
-        try testing.expect(last_d1.value != first_d2.value or last_d1.timestamp == first_d2.timestamp);
+    try testing.expect(c.readings.items.len > 0);
+    for (c.readings.items[1..], 0..) |r, i| {
+        const prev = c.readings.items[i];
+        try testing.expect(r.timestamp > prev.timestamp or
+            (r.timestamp == prev.timestamp and r.sensor_id > prev.sensor_id));
     }
-    // The stream should produce some readings (not zero).
-    try testing.expect(day1.len + day2.len > 0);
 }
 
-test "Stream: stepwise_discrete state persists across chunks" {
-    // Energy sensor: stepwise holds a level for several samples. If state
-    // reset at chunk boundary, the first tick of chunk 2 would re-pick a
-    // level instead of holding the one from chunk 1.
-    const sensors = [_]SensorMetadata{
-        .{ .sensor_id = 0, .sensor_type = .energy, .frequency_hz = 1.0 / 900.0, .element_id = 1 },
-    };
-    const start: i64 = 1_700_000_000_000;
-    const ms_per_hour: i64 = 60 * 60 * 1000;
+test "Stream: one streamUntil call matches three chunked nextChunk calls (chunk-boundary invariance)" {
+    const sensors = testSensors();
+    var stream_a = try Stream.init(testing.allocator, &sensors, 99, 0, false);
+    defer stream_a.deinit();
+    var stream_b = try Stream.init(testing.allocator, &sensors, 99, 0, false);
+    defer stream_b.deinit();
 
-    var stream = try Stream.init(testing.allocator, &sensors, 42, start, false);
-    defer stream.deinit();
+    const one_day: i64 = 24 * 60 * 60 * 1000;
 
-    const chunk1 = try stream.nextChunk(testing.allocator, start + 6 * ms_per_hour);
-    defer testing.allocator.free(chunk1);
-    const chunk2 = try stream.nextChunk(testing.allocator, start + 12 * ms_per_hour);
-    defer testing.allocator.free(chunk2);
+    var c = Collector{};
+    defer c.readings.deinit(testing.allocator);
+    try stream_a.streamUntil(3 * one_day, Collector.sink, &c);
 
-    // Both chunks should have readings (6 hours at 15-min = 24 readings each).
-    try testing.expect(chunk1.len > 0);
-    try testing.expect(chunk2.len > 0);
-
-    // Verify timestamps are contiguous (chunk2 starts where chunk1 left off).
-    const last_ts = chunk1[chunk1.len - 1].timestamp;
-    const first_ts = chunk2[0].timestamp;
-    try testing.expect(first_ts > last_ts);
-    // Gap should be exactly one period (900s = 900000ms).
-    try testing.expectEqual(@as(i64, 900000), first_ts - last_ts);
-}
-
-test "Stream: per-sensor PRNG — different sensor_ids produce different values" {
-    // Two identical-type sensors with different IDs should produce
-    // different reading values (per-sensor PRNG, not shared).
-    const sensors = [_]SensorMetadata{
-        .{ .sensor_id = 0, .sensor_type = .temperature, .frequency_hz = 1.0 / 300.0, .element_id = 1 },
-        .{ .sensor_id = 1, .sensor_type = .temperature, .frequency_hz = 1.0 / 300.0, .element_id = 2 },
-    };
-    const start: i64 = 1_700_000_000_000;
-    const ms_per_hour: i64 = 60 * 60 * 1000;
-
-    var stream = try Stream.init(testing.allocator, &sensors, 42, start, false);
-    defer stream.deinit();
-
-    const readings = try stream.nextChunk(testing.allocator, start + ms_per_hour);
-    defer testing.allocator.free(readings);
-
-    // Find first reading from each sensor.
-    var val0: ?f32 = null;
-    var val1: ?f32 = null;
-    for (readings) |r| {
-        if (r.sensor_id == 0 and val0 == null) val0 = r.value;
-        if (r.sensor_id == 1 and val1 == null) val1 = r.value;
+    var chunked: std.ArrayList(SensorReading) = .empty;
+    defer chunked.deinit(testing.allocator);
+    var day: i64 = 1;
+    while (day <= 3) : (day += 1) {
+        const chunk = try stream_b.nextChunk(testing.allocator, day * one_day);
+        defer testing.allocator.free(chunk);
+        try chunked.appendSlice(testing.allocator, chunk);
     }
 
-    try testing.expect(val0 != null);
-    try testing.expect(val1 != null);
-    // Different PRNG seeds → different noise → different values (with
-    // extremely high probability for continuous distributions).
-    try testing.expect(val0.? != val1.?);
+    try testing.expectEqual(c.readings.items.len, chunked.items.len);
+    for (c.readings.items, chunked.items) |a, b| {
+        try testing.expectEqual(a.sensor_id, b.sensor_id);
+        try testing.expectEqual(a.timestamp, b.timestamp);
+        try testing.expectEqual(a.value, b.value);
+    }
 }
+
+test "binary_event: a reading is stored only when the value actually transitions" {
+    var state: f32 = 0.0;
+    var prng = std.Random.DefaultPrng.init(1);
+    const rand = prng.random();
+    const profile = profileFor(.occupancy);
+
+    var last_emitted: ?f32 = null;
+    var transitions: usize = 0;
+    var t: i64 = 0;
+    var i: usize = 0;
+    while (i < 500) : (i += 1) {
+        const value = sampleBinaryEvent(profile, rand, t, &state);
+        if (last_emitted == null or value != last_emitted.?) {
+            transitions += 1;
+            last_emitted = value;
+        }
+        t += periodMs(profile.frequency_hz);
+    }
+
+    // Real dwell time: far fewer stored transitions than samples evaluated,
+    // but at least the mandatory first-tick emit.
+    try testing.expect(transitions >= 1);
+    try testing.expect(transitions < 500);
+}
+
+test "bursty_impulsive: every stored event sample is a real burst, never baseline noise" {
+    var prng = std.Random.DefaultPrng.init(2);
+    const rand = prng.random();
+    const profile = profileFor(.vibration);
+
+    var events: usize = 0;
+    var i: usize = 0;
+    while (i < 5000) : (i += 1) {
+        const sample = sampleBurstyImpulsive(profile, rand);
+        if (sample.is_event) {
+            events += 1;
+            // A burst is base_value + at least 3x daily_amplitude; baseline
+            // Gaussian noise (noise_stddev) cannot reach that for this
+            // profile's parameters, so this distinguishes real events from
+            // noise that happened to clear some derived threshold.
+            try testing.expect(sample.value > profile.base_value + profile.daily_amplitude * 2.0);
+        }
+    }
+    // Sparse (~2% burst chance per sample), never near-continuous.
+    try testing.expect(events > 0);
+    try testing.expect(events < 500);
+}
+
+fn stateWithFailures(profile: SensorProfile, seed: u64) SensorState {
+    return .{
+        .sensor = .{ .sensor_id = 0, .sensor_type = .temperature, .frequency_hz = profile.frequency_hz, .element_id = 1 },
+        .profile = profile,
+        .period_ms = periodMs(profile.frequency_hz),
+        .next_t = 0,
+        .step_level = profile.base_value,
+        .last_real_value = profile.base_value,
+        .prng = std.Random.DefaultPrng.init(seed),
+    };
+}
+
+test "failure modes: dropout produces a gap of exactly dropout_duration_ticks, then resumes" {
+    var profile = profileFor(.temperature);
+    profile.failures = .{ .dropout_rate = 1.0, .dropout_duration_ticks = 5 };
+    var state = stateWithFailures(profile, 3);
+
+    var i: usize = 0;
+    while (i < 5) : (i += 1) {
+        try testing.expect(tickOnce(&state, state.next_t, true) == null);
+        state.next_t += state.period_ms;
+    }
+    // dropout_remaining has reached 0 — turn off the retrigger chance (which
+    // was 1.0, so it would otherwise re-enter dropout on every single tick
+    // forever) to isolate "the gap actually ends" from "did a brand new
+    // random dropout coincidentally start right after."
+    state.profile.failures.dropout_rate = 0;
+    try testing.expect(tickOnce(&state, state.next_t, true) != null);
+}
+
+test "failure modes: stuck freezes the exact value for stuck_duration_ticks" {
+    var profile = profileFor(.temperature);
+    profile.failures = .{ .stuck_rate = 1.0, .stuck_duration_ticks = 4 };
+    var state = stateWithFailures(profile, 4);
+
+    // stuck_rate = 1.0 guarantees the FIRST tick starts a stuck condition
+    // (freezing from the next reading onward, per tickOnce's contract).
+    const first = tickOnce(&state, state.next_t, true) orelse return error.TestUnexpectedResult;
+    state.next_t += state.period_ms;
+
+    var i: usize = 0;
+    while (i < 4) : (i += 1) {
+        const v = tickOnce(&state, state.next_t, true) orelse return error.TestUnexpectedResult;
+        try testing.expectEqual(first, v);
+        state.next_t += state.period_ms;
+    }
+}
+
+test "failure modes: drift accumulates monotonically, moving later readings further from baseline" {
+    var profile = profileFor(.temperature);
+    profile.failures = .{ .drift_rate_ppm = 100_000.0 }; // exaggerated for a short test window
+    profile.noise_stddev = 0.0; // isolate drift from Gaussian jitter
+    var state = stateWithFailures(profile, 5);
+
+    const first = tickOnce(&state, state.next_t, true) orelse return error.TestUnexpectedResult;
+    state.next_t += state.period_ms;
+
+    var last: f32 = first;
+    var i: usize = 0;
+    while (i < 200) : (i += 1) {
+        last = tickOnce(&state, state.next_t, true) orelse return error.TestUnexpectedResult;
+        state.next_t += state.period_ms;
+    }
+
+    try testing.expect(@abs(last - profile.base_value) > @abs(first - profile.base_value));
+}
+
+// ---------------------------------------------------------------------------

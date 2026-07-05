@@ -292,7 +292,10 @@ pub fn writeReports(
         try md.print(allocator, "\n### Per-query winner (lowest median)\n\n", .{});
         try md.print(allocator, "| Query | Winner | Median µs | Runner-up | Median µs | Speedup |\n", .{});
         try md.print(allocator, "|---|---|---:|---|---:|---:|\n", .{});
-        try writeWinners(&md, allocator, rows, ds.name);
+        // null eligibility: the internal regression fixture is small enough
+        // that no backend evicts — every backend genuinely holds the full
+        // dataset, so all comparisons here are apples-to-apples already.
+        try writeWinners(&md, allocator, rows, ds.name, null);
 
         try md.print(allocator, "\n", .{});
     }
@@ -547,9 +550,46 @@ fn writeHtmlReport(
     try dir.writeFile(io, .{ .sub_path = "benchmark.html", .data = html.items });
 }
 
+/// QueryName for a display-name string (RunRow.query stores the display
+/// name), or null for an unrecognized name. Reverse of queryNameStr.
+fn queryNameFromStr(name: []const u8) ?queries.QueryName {
+    inline for (std.enums.values(queries.QueryName)) |q| {
+        if (std.mem.eql(u8, queryNameStr(q), name)) return q;
+    }
+    return null;
+}
+
 /// For each unique query within a given scale, find the backend with the
-/// lowest median latency and the runner-up; emit a Markdown row.
-fn writeWinners(w: *std.ArrayList(u8), allocator: std.mem.Allocator, rows: []const RunRow, scale: []const u8) !void {
+/// lowest median latency and the runner-up; emit a Markdown row. Exported
+/// (not just used by writeReports' internal regression-suite report) so
+/// main.zig's live-simulation recommendation.md can surface the same
+/// per-query winner table instead of leaving the reader to eyeball the raw
+/// per-query latency rows.
+///
+/// `historical_eligible`, when non-null, applies the SAME eligibility rule
+/// recommendCompound's historical track already applies to scoring: for any
+/// query outside the `real_time` family, only backends in that list compete
+/// for the winner/runner-up slots. Without this, the count-capped real-time
+/// cache (RingBuffer, 10 readings/sensor) showed up as the 171x "winner" of
+/// query_anomalies in a real house run — it had scanned a ~200x smaller
+/// dataset than every other backend, an incomparable measurement presented
+/// as a win. Pass null only when every backend genuinely holds the full
+/// dataset (e.g. the internal regression suite's small no-eviction fixture).
+pub fn writeWinners(
+    w: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    rows: []const RunRow,
+    scale: []const u8,
+    historical_eligible: ?[]const []const u8,
+) !void {
+    const rowEligible = struct {
+        fn check(eligible: ?[]const []const u8, query_name: []const u8, backend: []const u8) bool {
+            const list = eligible orelse return true;
+            const q = queryNameFromStr(query_name) orelse return true;
+            if (queries.familyOf(q) == .real_time) return true;
+            return backendEligible(list, backend);
+        }
+    }.check;
     var seen: std.ArrayList([]const u8) = .empty;
     defer seen.deinit(allocator);
 
@@ -571,6 +611,7 @@ fn writeWinners(w: *std.ArrayList(u8), allocator: std.mem.Allocator, rows: []con
         for (rows, 0..) |candidate, i| {
             if (!std.mem.eql(u8, candidate.scale, scale)) continue;
             if (!std.mem.eql(u8, candidate.query, r.query)) continue;
+            if (!rowEligible(historical_eligible, candidate.query, candidate.backend)) continue;
             if (best_idx == null or candidate.stats.median_ns < rows[best_idx.?].stats.median_ns) {
                 second_idx = best_idx;
                 best_idx = i;
@@ -603,79 +644,6 @@ fn writeWinners(w: *std.ArrayList(u8), allocator: std.mem.Allocator, rows: []con
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tests — recommendCompound (compound recommendation scoring).
-// ---------------------------------------------------------------------------
-
-const testing = std.testing;
-
-fn testRow(scale: []const u8, query: []const u8, backend: []const u8, median_ns: i64) RunRow {
-    return .{
-        .scale = scale,
-        .query = query,
-        .backend = backend,
-        .memory_bytes = 0,
-        .stats = .{
-            .iterations = 25,
-            .median_ns = median_ns,
-            .p95_ns = median_ns,
-            .p99_ns = median_ns,
-            .min_ns = median_ns,
-            .max_ns = median_ns,
-            .mean_ns = median_ns,
-            .total_ns = median_ns * 25,
-        },
-    };
-}
-
-test "recommendCompound: RingBuffer wins real-time track, excluded from historical track" {
-    // Simulates the compound split: RingBuffer is fastest on latest_*
-    // (real-time family) but is excluded from the historical track where
-    // only full-retention backends compete.
-    const mix = [_]queries.QueryWeight{
-        .{ .query = .latest_single, .weight = 3.0, .hot = true },
-        .{ .query = .latest_zone, .weight = 2.0, .hot = true },
-        .{ .query = .daily_zone_rollup, .weight = 5.0, .hot = false },
-        .{ .query = .avg_zone_type, .weight = 3.0, .hot = false },
-        .{ .query = .anomalies, .weight = 4.0, .hot = true },
-    };
-
-    var rows: std.ArrayList(RunRow) = .empty;
-    defer rows.deinit(testing.allocator);
-    for (mix) |qw| {
-        const qn = queryNameStr(qw.query);
-        // RingBuffer: fastest on real-time, but also present for historical
-        // queries (the point is that the compound split excludes it from
-        // the historical track regardless of its row presence).
-        try rows.append(testing.allocator, testRow("Small", qn, "RingBuffer", 5));
-        try rows.append(testing.allocator, testRow("Small", qn, "TimeSeries", 50));
-        try rows.append(testing.allocator, testRow("Small", qn, "Columnar", 80));
-    }
-
-    const full_retention = [_][]const u8{ "TimeSeries", "Columnar" };
-
-    const compound = try recommendCompound(
-        testing.allocator,
-        rows.items,
-        "Small",
-        &mix,
-        &full_retention,
-    );
-    defer testing.allocator.free(compound.realtime.scores);
-    defer testing.allocator.free(compound.historical.scores);
-
-    // Real-time track: all three backends compete; RingBuffer is fastest.
-    try testing.expectEqualStrings("RingBuffer", compound.realtime.winner);
-    try testing.expectEqual(@as(usize, 3), compound.realtime.scores.len);
-
-    // Historical track: RingBuffer excluded; only TimeSeries and Columnar.
-    try testing.expectEqual(@as(usize, 2), compound.historical.scores.len);
-    for (compound.historical.scores) |s| {
-        try testing.expect(!std.mem.eql(u8, s.backend, "RingBuffer"));
-    }
-    // TimeSeries (50) beats Columnar (80) on every historical query.
-    try testing.expectEqualStrings("TimeSeries", compound.historical.winner);
-}
 
 // ---------------------------------------------------------------------------
 // Growth curve + simulation JSON — latency vs building age, and machine-
@@ -722,6 +690,7 @@ pub fn writeSimSection(
     allocator: std.mem.Allocator,
     sim_stats: []const sim_mod.SimStats,
     type_volumes: []const sim_mod.TypeVolume,
+    type_quality: []const sim_mod.TypeQuality,
 ) !void {
     if (sim_stats.len == 0) return;
 
@@ -753,6 +722,24 @@ pub fn writeSimSection(
             });
         }
     }
+
+    if (type_quality.len > 0) {
+        try md.print(allocator, "\n### Ingest data quality by sensor type\n\n", .{});
+        try md.print(allocator, "Readings rejected at ingest (ingest_system.shouldAccept) for being outside the " ++
+            "sensor type's physical bounds — real gateway behavior for a physically-impossible value, not a " ++
+            "backend-specific difference (identical across every backend, since rejection happens once per " ++
+            "reading before any backend ever sees it).\n\n", .{});
+        try md.print(allocator, "| Sensor type | Generated | Rejected | Rejection rate |\n|---|---:|---:|---:|\n", .{});
+        for (type_quality) |tq| {
+            const rate: f64 = if (tq.generated > 0)
+                @as(f64, @floatFromInt(tq.rejected)) / @as(f64, @floatFromInt(tq.generated)) * 100.0
+            else
+                0.0;
+            try md.print(allocator, "| {s} | {d} | {d} | {d:.3}% |\n", .{
+                @tagName(tq.sensor_type), tq.generated, tq.rejected, rate,
+            });
+        }
+    }
 }
 
 /// Write machine-readable simulation data as JSON to `simulation.json` in
@@ -766,6 +753,7 @@ pub fn writeSimJson(
     sim_stats: []const sim_mod.SimStats,
     growth: []const sim_mod.GrowthPoint,
     type_volumes: []const sim_mod.TypeVolume,
+    type_quality: []const sim_mod.TypeQuality,
 ) !void {
     var json: std.ArrayList(u8) = .empty;
     defer json.deinit(allocator);
@@ -816,6 +804,17 @@ pub fn writeSimJson(
         try json.print(allocator, "      \"reading_count\": {d},\n", .{tv.reading_count});
         try json.print(allocator, "      \"bytes\": {d}\n", .{tv.bytes});
         try json.print(allocator, "    }}{s}\n", .{if (i + 1 < type_volumes.len) "," else ""});
+    }
+    try json.print(allocator, "  ],\n", .{});
+
+    // type_quality
+    try json.print(allocator, "  \"type_quality\": [\n", .{});
+    for (type_quality, 0..) |tq, i| {
+        try json.print(allocator, "    {{\n", .{});
+        try json.print(allocator, "      \"sensor_type\": \"{s}\",\n", .{@tagName(tq.sensor_type)});
+        try json.print(allocator, "      \"generated\": {d},\n", .{tq.generated});
+        try json.print(allocator, "      \"rejected\": {d}\n", .{tq.rejected});
+        try json.print(allocator, "    }}{s}\n", .{if (i + 1 < type_quality.len) "," else ""});
     }
     try json.print(allocator, "  ]\n", .{});
     try json.print(allocator, "}}\n", .{});

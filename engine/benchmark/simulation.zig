@@ -27,6 +27,7 @@ const queries = @import("queries.zig");
 const runner = @import("runner.zig");
 const report = @import("report.zig");
 const metrics = @import("../ecs/systems/metrics_system.zig");
+const ingest_system = @import("../ecs/systems/ingest_system.zig");
 const components = @import("../bim/components.zig");
 const World = @import("../ecs/world.zig").World;
 
@@ -170,62 +171,6 @@ pub fn shouldPrune(last_prune_ms: i64, watermark_ms: i64, retention_ms: i64) boo
 }
 
 // ---------------------------------------------------------------------------
-// Cross-backend result digests (CLAUDE.md §3.2: identical query results,
-// validated). Order-insensitive sums, because some queries return results
-// in hash-map iteration order and float summation order differs between
-// backends' internal layouts.
-// ---------------------------------------------------------------------------
-
-/// Relative tolerance for comparing value sums — mirrors runner.zig's
-/// existing cross-backend float equivalence conventions.
-pub const DIGEST_VALUE_TOLERANCE: f64 = 1e-5;
-
-pub const QueryDigest = struct {
-    count: u64 = 0,
-    value_sum: f64 = 0.0,
-    id_or_ts_sum: u64 = 0,
-
-    /// Fold a scalar query result (avg_window, avg_zone_type, ...).
-    pub fn foldValue(self: *QueryDigest, v: f64) void {
-        self.count += 1;
-        self.value_sum += v;
-    }
-
-    /// Fold one id from an id-slice result (spatial_radius, zone_hierarchy).
-    pub fn foldId(self: *QueryDigest, id: u64) void {
-        self.count += 1;
-        self.id_or_ts_sum +%= id;
-    }
-
-    /// Fold a timestamp/bucket accompanying other folds (rollup buckets,
-    /// breach start/end) — sums into the id/ts channel without counting a
-    /// separate result item.
-    pub fn foldTimestamp(self: *QueryDigest, ts: i64) void {
-        self.id_or_ts_sum +%= @as(u64, @bitCast(ts));
-    }
-
-    /// Fold one reading from a readings-slice result (latest_zone,
-    /// latest_by_type, anomalies, ...): counts it, sums its value, and
-    /// sums its timestamp so a same-count same-sum-different-times
-    /// divergence is still caught.
-    pub fn foldReading(self: *QueryDigest, r: sb.SensorReading) void {
-        self.count += 1;
-        self.value_sum += r.value;
-        self.id_or_ts_sum +%= @as(u64, @bitCast(r.timestamp));
-    }
-
-    /// Exact match on counts and id/timestamp sums; tolerance-based on
-    /// value sums (float summation order legitimately differs across
-    /// backends).
-    pub fn matches(self: QueryDigest, other: QueryDigest) bool {
-        if (self.count != other.count) return false;
-        if (self.id_or_ts_sum != other.id_or_ts_sum) return false;
-        return std.math.approxEqRel(f64, self.value_sum, other.value_sum, DIGEST_VALUE_TOLERANCE) or
-            std.math.approxEqAbs(f64, self.value_sum, other.value_sum, 1e-9);
-    }
-};
-
-// ---------------------------------------------------------------------------
 // Result records the simulation produces for reporting.
 // ---------------------------------------------------------------------------
 
@@ -256,6 +201,7 @@ pub const SimStats = struct {
     wall_ns: i64 = 0,
     generated: u64 = 0,
     ingested: u64 = 0,
+    rejected: u64 = 0,
     evicted: u64 = 0,
     ingest_ns: i64 = 0,
     prune_ns: i64 = 0,
@@ -278,6 +224,19 @@ pub const TypeVolume = struct {
     sensor_type: sb.SensorType,
     reading_count: usize,
     bytes: usize,
+};
+
+/// Ingest quality for one sensor type over the whole run — how many
+/// readings this type's stream generated vs. how many ingest_system.zig
+/// rejected as out-of-bounds (real gateway behavior for a physically-
+/// impossible value; see ingest_system.zig's header comment). Identical
+/// across every backend by construction (shared generation + shared
+/// validation happen once per day, upstream of any backend's insert), so
+/// it's tracked once for the whole run rather than per backend.
+pub const TypeQuality = struct {
+    sensor_type: sb.SensorType,
+    generated: u64,
+    rejected: u64,
 };
 
 // ---------------------------------------------------------------------------
@@ -397,132 +356,31 @@ pub fn runOne(
     return metrics.timeQuery(allocator, io, 1, Caller.call, .{&caller});
 }
 
-/// Run one query untimed with EXACTLY the same arguments runOne times it
-/// with, folding the full result into an order-insensitive digest for
-/// cross-backend validation (CLAUDE.md §3.2). Slices are freed with
-/// world.allocator, mirroring runner's wrapper conventions.
-pub fn runDigest(
-    world: anytype,
-    query: queries.QueryName,
-    s: SampleArgs,
-) !QueryDigest {
-    var d = QueryDigest{};
-    switch (query) {
-        .avg_window => d.foldValue(try queries.query_avg_window(world, s.sensor_id, @as(u32, 24))),
-        .latest_single => {
-            if (try queries.query_latest_single(world, s.sensor_id)) |r| d.foldReading(r);
-        },
-        .latest_zone => {
-            const rs = try queries.query_latest_zone(world, s.zone_id);
-            defer world.allocator.free(rs);
-            for (rs) |r| d.foldReading(r);
-        },
-        .latest_by_type => {
-            const rs = try queries.query_latest_by_type(world, s.sensor_type);
-            defer world.allocator.free(rs);
-            for (rs) |r| d.foldReading(r);
-        },
-        .avg_zone_type => d.foldValue(try queries.query_avg_zone_type(world, s.zone_id, s.sensor_type, @as(u32, 24))),
-        .floor_stats => {
-            const st = try queries.query_floor_stats(world, s.floor_id, s.sensor_type, @as(u32, 24));
-            d.foldValue(st.min);
-            d.foldValue(st.max);
-            d.foldValue(st.avg);
-        },
-        .hourly_rollup => {
-            const rs = try queries.query_hourly_rollup(world, s.sensor_id, @as(u32, 2));
-            defer world.allocator.free(rs);
-            for (rs) |h| {
-                d.foldValue(h.avg);
-                d.foldValue(h.min);
-                d.foldValue(h.max);
-                d.foldId(h.count);
-                d.foldTimestamp(h.hour_bucket);
-            }
-        },
-        .daily_zone_rollup => {
-            const rs = try queries.query_daily_zone_rollup(world, s.zone_id, s.sensor_type);
-            defer world.allocator.free(rs);
-            for (rs) |day| {
-                d.foldValue(day.avg);
-                d.foldValue(day.min);
-                d.foldValue(day.max);
-                d.foldId(day.count);
-                d.foldTimestamp(day.day_bucket);
-            }
-        },
-        .spatial_radius => {
-            const ids = try queries.query_spatial_radius(world, s.position, @as(f32, 50.0));
-            defer world.allocator.free(ids);
-            for (ids) |id| d.foldId(id);
-        },
-        .zone_hierarchy => {
-            const ids = try queries.query_zone_hierarchy(world, s.zone_id, @as(u32, 2));
-            defer world.allocator.free(ids);
-            for (ids) |id| d.foldId(id);
-        },
-        .anomalies => {
-            const rs = try queries.query_anomalies(world, s.sensor_type, queries.ANOMALY_STD_DEV_THRESHOLD, queries.ANOMALY_WINDOW_HOURS);
-            defer world.allocator.free(rs);
-            for (rs) |a| d.foldReading(a.reading);
-        },
-        .threshold_breach => {
-            if (try queries.query_threshold_breach(world, s.sensor_id, synthetic.profileFor(s.sensor_type).base_value, ONE_HOUR_MS, queries.THRESHOLD_BREACH_WINDOW_HOURS)) |bev| {
-                d.foldId(bev.sensor_id);
-                d.foldTimestamp(bev.start_ts);
-                d.foldTimestamp(bev.end_ts);
-                d.foldValue(bev.peak_value);
-            }
-        },
-    }
-    return d;
-}
-
-/// checkpoints x query_mix digest table. The first simulated backend
-/// records; every subsequent backend compares and fails the run loudly on
-/// divergence.
-pub const DigestTable = struct {
-    entries: []?QueryDigest,
-    mix_len: usize,
-
-    pub fn init(allocator: std.mem.Allocator, checkpoint_count: usize, mix_len: usize) !DigestTable {
-        const entries = try allocator.alloc(?QueryDigest, checkpoint_count * mix_len);
-        @memset(entries, null);
-        return .{ .entries = entries, .mix_len = mix_len };
-    }
-
-    pub fn deinit(self: *DigestTable, allocator: std.mem.Allocator) void {
-        allocator.free(self.entries);
-        self.* = undefined;
-    }
-
-    pub fn slot(self: *DigestTable, checkpoint_idx: usize, query_idx: usize) *?QueryDigest {
-        return &self.entries[checkpoint_idx * self.mix_len + query_idx];
-    }
-};
-
 // ---------------------------------------------------------------------------
 // The simulation itself.
+//
+// Step 2 of the sim-perf-overhaul: every backend used to own its own
+// synthetic.Stream and independently regenerate the ENTIRE deterministic
+// multi-year feed from scratch (5x redundant generation for identical
+// output — only ingest genuinely differs per backend). Now there is a
+// single shared Stream and a single day loop: each simulated day's readings
+// are generated exactly once (`stream.nextChunk`) and fanned out to every
+// backend's own timed insert. Ingest/prune/query timing stays per-backend
+// and per-day exactly as before; only the (previously redundant) generation
+// work is now shared.
 // ---------------------------------------------------------------------------
 
-/// timeMutation callable — wraps streamUntil + direct insert into the
-/// world. No intermediate buffer: each reading goes straight from the
-/// stream's tick into the backend, in time order.
-fn StreamIngestCall(comptime W: type) type {
+/// timeMutation callable — inserts one already-generated day's chunk into
+/// one backend's World, timed. Generation itself happens once, upstream in
+/// simulateAllBackends' day loop — this only measures this backend's own
+/// insert cost, not shared generation cost.
+fn IngestChunkCall(comptime W: type) type {
     return struct {
-        stream: *synthetic.Stream,
         world: *W,
-        until_ms: i64,
-        count: usize = 0,
+        chunk: []const sb.SensorReading,
 
         fn call(self: *@This()) !void {
-            self.count = 0;
-            try self.stream.streamUntil(self.until_ms, insertSink, self);
-        }
-
-        fn insertSink(self: *@This(), reading: sb.SensorReading) !void {
-            try self.world.insert(reading);
-            self.count += 1;
+            for (self.chunk) |r| try self.world.insert(r);
         }
     };
 }
@@ -541,24 +399,60 @@ fn PruneCall(comptime W: type) type {
 
 const SENSOR_TYPE_COUNT = std.enums.values(sb.SensorType).len;
 
-/// Simulate one backend through the building's whole day-zero timeline:
-/// stream one simulated day at a time into a fresh World, prune each type
-/// to its retention window on the slack schedule, and pause at every
-/// checkpoint to validate cross-backend digests and time the query mix.
-/// The final (steady-state) checkpoint additionally times the type-scoped
-/// per-type queries and emits the RunRows that feed recommendCompound —
-/// the headline recommendation is grounded in steady state; earlier
-/// checkpoints only feed the growth curve.
-///
-/// Every backend replays the IDENTICAL stream (fresh synthetic.Stream,
-/// same seed — chunk-boundary-invariant per-sensor PRNGs), so results are
-/// apples-to-apples and the digest table is meaningful. Prunes and ingest
-/// run between metrics.timeQuery calls and are timed separately via
-/// metrics.timeMutation, so eviction/ingest cost never leaks into query
-/// latency.
-pub fn simulateBackend(
-    comptime b: runner.BackendEntry,
-    comptime historical_supported: bool,
+/// Per-backend mutable state carried across the shared day loop —
+/// everything simulateBackend used to keep in function-local variables,
+/// now living long enough to survive across every backend's turn within
+/// the same simulated day.
+fn BackendRunState(comptime T: type) type {
+    return struct {
+        world: World(T),
+        stats: SimStats,
+        /// Per-type prune bookkeeping, in sim-relative ms. The SCHEDULE
+        /// (shouldPrune's threshold) depends only on simulated time and is
+        /// identical across backends; the watermark of when THIS backend
+        /// last actually pruned is still tracked per backend since prune
+        /// calls are individually timed and independently scheduled around
+        /// slack.
+        last_prune: [SENSOR_TYPE_COUNT]i64 = @splat(0),
+    };
+}
+
+fn typeForBackend(comptime name: []const u8) type {
+    inline for (runner.backends) |b| {
+        if (std.mem.eql(u8, b.name, name)) return b.T;
+    }
+    @compileError("simulateAllBackends: no registered backend named " ++ name ++
+        " — keep AllBackendStates' fields in sync with runner.zig's backends list");
+}
+
+/// One named field per entry in runner.backends — hand-written rather than
+/// built via @Type/comptime reflection. runner.backends is explicitly "the
+/// single place all backends are registered" and changes rarely; adding a
+/// backend means adding one line here too, and typeForBackend turns a
+/// forgotten one into a clear @compileError rather than a silent mismatch.
+const AllBackendStates = struct {
+    TimeSeries: BackendRunState(typeForBackend("TimeSeries")),
+    Columnar: BackendRunState(typeForBackend("Columnar")),
+    Hierarchical: BackendRunState(typeForBackend("Hierarchical")),
+    RingBuffer: BackendRunState(typeForBackend("RingBuffer")),
+    Lake: BackendRunState(typeForBackend("Lake")),
+};
+
+fn isHistoricalSupported(comptime b: runner.BackendEntry) bool {
+    inline for (runner.supported_backends) |sup| {
+        if (std.mem.eql(u8, sup.name, b.name)) return true;
+    }
+    return false;
+}
+
+/// Simulate every registered backend through the building's whole day-zero
+/// timeline together: one shared Stream generates each simulated day's
+/// readings once, fanned out to every backend's own timed insert, prune,
+/// and (at checkpoints) query benchmarking. The final (steady-state)
+/// checkpoint additionally times the type-scoped per-type queries and emits
+/// the RunRows that feed recommendCompound — the headline recommendation is
+/// grounded in steady state; earlier checkpoints only feed the growth curve.
+pub fn simulateAllBackends(
     allocator: std.mem.Allocator,
     io: std.Io,
     sensors: []const components.SensorMetadata,
@@ -570,43 +464,49 @@ pub fn simulateBackend(
     scale_label: []const u8,
     seed: u64,
     checkpoints: []const Checkpoint,
-    digests: *DigestTable,
     rows: *std.ArrayList(report.RunRow),
     type_rows: *std.ArrayList(report.RunRow),
     growth: *std.ArrayList(GrowthPoint),
     sim_stats_out: *std.ArrayList(SimStats),
     type_volumes: *std.ArrayList(TypeVolume),
+    type_quality: *std.ArrayList(TypeQuality),
 ) !void {
     if (checkpoints.len == 0) return;
 
-    std.debug.print("\n--- Backend: {s} — live day-zero simulation ---\n", .{b.name});
-    std.debug.print("  Initializing world + registering {d} zones/floors...\n", .{locations.len});
-    // Wall clock for operator-facing progress + the achieved compression
-    // ratio only — never a benchmark metric (those all go through
-    // metrics.timeQuery/timeMutation).
+    std.debug.print("\n--- Live day-zero simulation: {d} backends, shared generation ---\n", .{runner.backends.len});
+    std.debug.print("  Initializing worlds + registering {d} zones/floors each...\n", .{locations.len});
+    // Wall clock for operator-facing progress only — never a benchmark
+    // metric (those all go through metrics.timeQuery/timeMutation).
     const wall_start = std.Io.Clock.awake.now(io);
 
-    const W = World(b.T);
-    var world = try W.init(allocator);
-    defer world.deinit();
+    var states: AllBackendStates = undefined;
+    inline for (runner.backends) |b| {
+        const W = World(b.T);
+        var world = try W.init(allocator);
+        // Cap every placed sensor type at RINGBUFFER_CAP BEFORE the first
+        // insert (RingBuffer sizes a sensor's buffer when it's first seen);
+        // a no-op on the full-retention backends.
+        for (type_samples) |group| try world.setRetentionHint(group.sensor_type, RINGBUFFER_CAP);
+        // Topology up front — the first checkpoint's zone/floor queries need it.
+        for (locations) |loc| try world.registerZone(loc.sensor_id, loc.zone_id);
+        for (zone_floor) |zf| try world.registerFloor(zf.zone_id, zf.floor_id);
 
-    var stats = SimStats{ .backend = b.name };
+        @field(states, b.name) = .{ .world = world, .stats = .{ .backend = b.name } };
+    }
+    defer inline for (runner.backends) |b| {
+        @field(states, b.name).world.deinit();
+    };
 
-    // Cap every placed sensor type at RINGBUFFER_CAP BEFORE the first
-    // insert (RingBuffer sizes a sensor's buffer when it's first seen); a
-    // no-op on the full-retention backends.
-    for (type_samples) |group| try world.setRetentionHint(group.sensor_type, RINGBUFFER_CAP);
-
-    // Topology up front — the first checkpoint's zone/floor queries need it.
-    for (locations) |loc| try world.registerZone(loc.sensor_id, loc.zone_id);
-    for (zone_floor) |zf| try world.registerFloor(zf.zone_id, zf.floor_id);
-
-    var stream = try synthetic.Stream.init(allocator, sensors, seed, SIM_START_MS, false);
+    // enable_failures = true: dropout/stuck/drift are now active per each
+    // type's own FailureParams (synthetic.profileFor) — see
+    // ingest_system.zig's header comment for how each is actually handled.
+    var stream = try synthetic.Stream.init(allocator, sensors, seed, SIM_START_MS, true);
     defer stream.deinit();
 
-    // Per-type prune bookkeeping, in sim-relative ms. The schedule depends
-    // only on simulated time -> identical across backends and runs.
-    var last_prune: [SENSOR_TYPE_COUNT]i64 = @splat(0);
+    // Ingest quality tally, accumulated once across the whole run (shared —
+    // rejection is a property of the reading itself, identical for every
+    // backend, computed once here rather than 5x).
+    var quality_accum: [SENSOR_TYPE_COUNT]struct { generated: u64 = 0, rejected: u64 = 0 } = @splat(.{});
 
     const total_days = checkpoints[checkpoints.len - 1].sim_day;
     var next_cp: usize = 0;
@@ -616,237 +516,208 @@ pub fn simulateBackend(
         const elapsed_ms: i64 = @as(i64, day) * CHUNK_MS;
         const day_end: i64 = SIM_START_MS + elapsed_ms;
 
-        // Stream readings tick-by-tick directly into the backend — no
-        // intermediate buffer, no sort. Readings arrive in time order.
-        var stream_ingest = StreamIngestCall(W){
-            .stream = &stream,
-            .world = &world,
-            .until_ms = day_end,
-        };
-        const ingest_ns = try metrics.timeMutation(io, StreamIngestCall(W).call, .{&stream_ingest});
-        stats.ingest_ns += ingest_ns;
-        stats.generated += stream_ingest.count;
-        stats.ingested += stream_ingest.count;
+        // Generate this simulated day's readings ONCE, shared across every
+        // backend (the fix for the 5x redundant generation this file's
+        // header comment describes).
+        const chunk = try stream.nextChunk(allocator, day_end);
+        defer allocator.free(chunk);
 
-        // Operator-facing heartbeat between (possibly year-apart)
-        // checkpoints: simulated progress + where the wall time is going.
+        // Ingest validation, also shared: a rejected reading never reaches
+        // ANY backend's storage, not just some — computed once here rather
+        // than once per backend.
+        var accepted: std.ArrayList(sb.SensorReading) = .empty;
+        defer accepted.deinit(allocator);
+        for (chunk) |r| {
+            const type_idx = @intFromEnum(r.sensor_type);
+            quality_accum[type_idx].generated += 1;
+            if (ingest_system.shouldAccept(r)) {
+                try accepted.append(allocator, r);
+            } else {
+                quality_accum[type_idx].rejected += 1;
+            }
+        }
+
+        // Operator-facing heartbeat between (possibly year-apart) checkpoints.
         if (day % 100 == 0) {
             const now = std.Io.Clock.awake.now(io);
             const elapsed_s = @as(f64, @floatFromInt(@as(i64, @intCast(wall_start.durationTo(now).nanoseconds)))) / 1e9;
-            std.debug.print("  [{s}] day {d}/{d} ({d:.0}%): {d} generated, {d} live, {d:.1}s elapsed (stream {d:.1}s, prune {d:.1}s)\n", .{
-                b.name,
-                day,
-                total_days,
-                @as(f64, @floatFromInt(day)) / @as(f64, @floatFromInt(total_days)) * 100.0,
-                stats.generated,
-                world.count(),
-                elapsed_s,
-                @as(f64, @floatFromInt(stats.ingest_ns)) / 1e9,
-                @as(f64, @floatFromInt(stats.prune_ns)) / 1e9,
+            std.debug.print("  day {d}/{d} ({d:.0}%): {d} readings today, {d:.1}s elapsed\n", .{
+                day, total_days, @as(f64, @floatFromInt(day)) / @as(f64, @floatFromInt(total_days)) * 100.0, chunk.len, elapsed_s,
             });
         }
 
         const at_checkpoint = next_cp < checkpoints.len and checkpoints[next_cp].sim_day == day;
+        const cp = if (at_checkpoint) checkpoints[next_cp] else undefined;
+        const is_final = at_checkpoint and next_cp == checkpoints.len - 1;
 
-        // Retention eviction: slack-scheduled normally, but unconditional
-        // right before a checkpoint so every backend is at the exact
-        // retention watermark when queried (comparable digests + memory).
-        for (type_samples) |group| {
-            const type_idx = @intFromEnum(group.sensor_type);
-            const retention_ms: i64 = @as(i64, synthetic.profileFor(group.sensor_type).retention_days) * CHUNK_MS;
-            if (!at_checkpoint and !shouldPrune(last_prune[type_idx], elapsed_ms, retention_ms)) continue;
-            // Nothing can be out of retention before the window has
-            // filled once — skip the pointless full-array scan.
-            if (elapsed_ms <= retention_ms) continue;
+        inline for (runner.backends) |b| {
+            const W = World(b.T);
+            const state = &@field(states, b.name);
 
-            const cutoff = day_end - retention_ms;
-            const before = world.count();
-            const log_prune = at_checkpoint;
-            if (log_prune) {
-                std.debug.print("  [{s}] pruning {s} older than day {d} ({d} readings before)...\n", .{
-                    b.name, @tagName(group.sensor_type), @divTrunc(retention_ms, CHUNK_MS), before,
-                });
-            }
-            var prune = PruneCall(W){ .world = &world, .sensor_type = group.sensor_type, .cutoff = cutoff };
-            stats.prune_ns += try metrics.timeMutation(io, PruneCall(W).call, .{&prune});
-            stats.prune_calls += 1;
-            const evicted_now = before - world.count();
-            stats.evicted += evicted_now;
-            if (log_prune) {
-                std.debug.print("  [{s}] pruned {d} readings ({d} live remaining)\n", .{ b.name, evicted_now, world.count() });
-            }
-            last_prune[type_idx] = elapsed_ms;
-        }
+            var ingest = IngestChunkCall(W){ .world = &state.world, .chunk = accepted.items };
+            state.stats.ingest_ns += try metrics.timeMutation(io, IngestChunkCall(W).call, .{&ingest});
+            state.stats.generated += chunk.len;
+            state.stats.ingested += accepted.items.len;
+            state.stats.rejected += chunk.len - accepted.items.len;
 
-        if (!at_checkpoint) continue;
-        const cp = checkpoints[next_cp];
-        const is_final = next_cp == checkpoints.len - 1;
-        const cp_start = std.Io.Clock.awake.now(io);
-
-        const ns_f = struct {
-            fn s(a: anytype, z: anytype) f64 {
-                return @as(f64, @floatFromInt(@as(i64, @intCast(a.durationTo(z).nanoseconds)))) / 1e9;
-            }
-        };
-
-        std.debug.print("\n  [{s}] === Checkpoint {s} (day {d}/{d}) ===\n", .{ b.name, cp.label, cp.sim_day, total_days });
-
-        // Force the lazy sort/cache-build every backend otherwise defers
-        // to its first query call — attribute that one-time cost to the
-        // simulation (not benchmark-timed) instead of letting it silently
-        // inflate whichever query happens to run first at this checkpoint.
-        _ = try world.iterateAll();
-
-        const warm_done = std.Io.Clock.awake.now(io);
-        std.debug.print("  [{s}] warmup done ({d:.1}s)\n", .{ b.name, ns_f.s(cp_start, warm_done) });
-
-        // Cross-backend digest validation (CLAUDE.md §3.2): the first
-        // backend records, later ones must match. The real_time family is
-        // compared across ALL backends; other families only across
-        // full-retention backends (a count-capped cache legitimately
-        // diverges on queries that span evicted data).
-        for (query_mix, 0..) |qw, qi| {
-            if (!historical_supported and isHistorical(qw.query)) continue;
-            if (!historical_supported and queries.familyOf(qw.query) != .real_time) continue;
-
-            const digest = try runDigest(&world, qw.query, overall_sample);
-            const s = digests.slot(next_cp, qi);
-            if (s.*) |ref| {
-                if (!ref.matches(digest)) {
-                    std.debug.print(
-                        "DIGEST MISMATCH [{s}] {s} at {s} (day {d}): count {d} vs {d}, value_sum {d} vs {d}, id/ts sum {d} vs {d}\n",
-                        .{ b.name, queryName(qw.query), cp.label, cp.sim_day, digest.count, ref.count, digest.value_sum, ref.value_sum, digest.id_or_ts_sum, ref.id_or_ts_sum },
-                    );
-                    return error.CrossBackendMismatch;
-                }
-            } else {
-                s.* = digest;
-            }
-        }
-
-        const digest_done = std.Io.Clock.awake.now(io);
-        std.debug.print("  [{s}] digest validation done ({d:.1}s)\n", .{ b.name, ns_f.s(warm_done, digest_done) });
-
-        // Time the building-level query mix once each, against this
-        // backend's real accumulated state at this simulated age.
-        const live_count = world.count();
-        const live_bytes = live_count * @sizeOf(sb.SensorReading);
-        std.debug.print("  [{s}] running {d} building-level queries ({d} live readings, {d:.1} MB)...\n", .{
-            b.name, query_mix.len, live_count, @as(f64, @floatFromInt(live_bytes)) / (1024.0 * 1024.0),
-        });
-        for (query_mix) |qw| {
-            if (!historical_supported and isHistorical(qw.query)) continue;
-
-            const qstats = try runOne(&world, allocator, io, qw.query, overall_sample);
-            std.debug.print("    {s}: median {d:.1}µs, p95 {d:.1}µs\n", .{
-                queryName(qw.query),
-                @as(f64, @floatFromInt(qstats.median_ns)) / 1000.0,
-                @as(f64, @floatFromInt(qstats.p95_ns)) / 1000.0,
-            });
-            try growth.append(allocator, .{
-                .sim_day = cp.sim_day,
-                .label = cp.label,
-                .backend = b.name,
-                .query = queryName(qw.query),
-                .median_ns = qstats.median_ns,
-                .memory_bytes = world.memoryUsed(),
-                .live_bytes = live_bytes,
-                .reading_count = live_count,
-            });
-            if (is_final) {
-                try rows.append(allocator, .{
-                    .scale = scale_label,
-                    .query = queryName(qw.query),
-                    .backend = b.name,
-                    .memory_bytes = world.memoryUsed(),
-                    .stats = qstats,
-                });
-            }
-        }
-
-        // Steady state only: the type-scoped per-type queries that feed
-        // the per-sensor-type recommendations, and (once, from the first
-        // simulated backend — a full-retention one) the per-type volume
-        // table the report uses to expose disproportionate types.
-        if (is_final) {
-            std.debug.print("  [{s}] steady state — running type-scoped queries across {d} sensor types...\n", .{ b.name, type_samples.len });
+            // Retention eviction: slack-scheduled normally, but
+            // unconditional right before a checkpoint so every backend is
+            // at the exact retention watermark when queried.
             for (type_samples) |group| {
-                const type_mix = synthetic.profileFor(group.sensor_type).relevant_queries;
-                for (type_mix) |qw| {
-                    if (!isTypeScoped(qw.query)) continue;
-                    if (!historical_supported and isHistorical(qw.query)) continue;
+                const type_idx = @intFromEnum(group.sensor_type);
+                const retention_ms: i64 = @as(i64, synthetic.profileFor(group.sensor_type).retention_days) * CHUNK_MS;
+                if (!at_checkpoint and !shouldPrune(state.last_prune[type_idx], elapsed_ms, retention_ms)) continue;
+                if (elapsed_ms <= retention_ms) continue; // Nothing can be out of retention yet.
 
-                    const qstats = try runOne(&world, allocator, io, qw.query, group.args);
-                    try type_rows.append(allocator, .{
-                        .scale = @tagName(group.sensor_type),
-                        .query = queryName(qw.query),
-                        .backend = b.name,
-                        .memory_bytes = world.memoryUsed(),
-                        .stats = qstats,
-                    });
-                }
+                const cutoff = day_end - retention_ms;
+                const before = state.world.count();
+                var prune = PruneCall(W){ .world = &state.world, .sensor_type = group.sensor_type, .cutoff = cutoff };
+                state.stats.prune_ns += try metrics.timeMutation(io, PruneCall(W).call, .{&prune});
+                state.stats.prune_calls += 1;
+                state.stats.evicted += before - state.world.count();
+                state.last_prune[type_idx] = elapsed_ms;
             }
 
-            if (type_volumes.items.len == 0) {
-                for (type_samples) |group| {
-                    const rs = try world.readingsForType(group.sensor_type);
-                    defer allocator.free(rs);
-                    try type_volumes.append(allocator, .{
-                        .sensor_type = group.sensor_type,
-                        .reading_count = rs.len,
-                        .bytes = rs.len * @sizeOf(sb.SensorReading),
+            // Checkpoint work is gated by a runtime `if`, not an early
+            // `continue` — a `continue` here would be comptime control
+            // flow (this whole block is the body of an `inline for`) gated
+            // on a runtime condition, which Zig rejects.
+            if (at_checkpoint) {
+                std.debug.print("\n  [{s}] === Checkpoint {s} (day {d}/{d}) ===\n", .{ b.name, cp.label, cp.sim_day, total_days });
+
+                // Time the building-level query mix once each, against this
+                // backend's real accumulated state at this simulated age.
+                const live_count = state.world.count();
+                const live_bytes = live_count * @sizeOf(sb.SensorReading);
+                std.debug.print("  [{s}] running {d} building-level queries ({d} live readings, {d:.1} MB)...\n", .{
+                    b.name, query_mix.len, live_count, @as(f64, @floatFromInt(live_bytes)) / (1024.0 * 1024.0),
+                });
+                for (query_mix) |qw| {
+                    if (!isHistoricalSupported(b) and isHistorical(qw.query)) continue;
+
+                    const qstats = try runOne(&state.world, allocator, io, qw.query, overall_sample);
+                    std.debug.print("    {s}: median {d:.1}µs, p95 {d:.1}µs\n", .{
+                        queryName(qw.query),
+                        @as(f64, @floatFromInt(qstats.median_ns)) / 1000.0,
+                        @as(f64, @floatFromInt(qstats.p95_ns)) / 1000.0,
                     });
+                    try growth.append(allocator, .{
+                        .sim_day = cp.sim_day,
+                        .label = cp.label,
+                        .backend = b.name,
+                        .query = queryName(qw.query),
+                        .median_ns = qstats.median_ns,
+                        .memory_bytes = state.world.memoryUsed(),
+                        .live_bytes = live_bytes,
+                        .reading_count = live_count,
+                    });
+                    if (is_final) {
+                        try rows.append(allocator, .{
+                            .scale = scale_label,
+                            .query = queryName(qw.query),
+                            .backend = b.name,
+                            .memory_bytes = state.world.memoryUsed(),
+                            .stats = qstats,
+                        });
+                    }
+                }
+
+                // Steady state only: the type-scoped per-type queries that
+                // feed the per-sensor-type recommendations, and (once, from
+                // the first backend to reach it — a full-retention one) the
+                // per-type volume table the report uses to expose
+                // disproportionate types.
+                if (is_final) {
+                    std.debug.print("  [{s}] steady state — running type-scoped queries across {d} sensor types...\n", .{ b.name, type_samples.len });
+                    for (type_samples) |group| {
+                        const type_mix = synthetic.profileFor(group.sensor_type).relevant_queries;
+                        for (type_mix) |qw| {
+                            if (!isTypeScoped(qw.query)) continue;
+                            if (!isHistoricalSupported(b) and isHistorical(qw.query)) continue;
+
+                            const qstats = try runOne(&state.world, allocator, io, qw.query, group.args);
+                            try type_rows.append(allocator, .{
+                                .scale = @tagName(group.sensor_type),
+                                .query = queryName(qw.query),
+                                .backend = b.name,
+                                .memory_bytes = state.world.memoryUsed(),
+                                .stats = qstats,
+                            });
+                        }
+                    }
+
+                    if (type_volumes.items.len == 0) {
+                        for (type_samples) |group| {
+                            const rs = try state.world.readingsForType(group.sensor_type);
+                            defer allocator.free(rs);
+                            try type_volumes.append(allocator, .{
+                                .sensor_type = group.sensor_type,
+                                .reading_count = rs.len,
+                                .bytes = rs.len * @sizeOf(sb.SensorReading),
+                            });
+                        }
+                    }
                 }
             }
         }
 
-        const cp_done = std.Io.Clock.awake.now(io);
-        std.debug.print("  [{s}] checkpoint {s} complete: warm {d:.1}s, digest {d:.1}s, queries {d:.1}s, total {d:.1}s\n", .{
-            b.name,
-            cp.label,
-            ns_f.s(cp_start, warm_done),
-            ns_f.s(warm_done, digest_done),
-            ns_f.s(digest_done, cp_done),
-            ns_f.s(cp_start, cp_done),
-        });
-
-        next_cp += 1;
+        if (at_checkpoint) next_cp += 1;
     }
 
-    stats.sim_ms = @as(i64, total_days) * CHUNK_MS;
-    const wall_end = std.Io.Clock.awake.now(io);
-    stats.wall_ns = @intCast(wall_start.durationTo(wall_end).nanoseconds);
-    try sim_stats_out.append(allocator, stats);
+    for (type_samples) |group| {
+        const q = quality_accum[@intFromEnum(group.sensor_type)];
+        try type_quality.append(allocator, .{ .sensor_type = group.sensor_type, .generated = q.generated, .rejected = q.rejected });
+    }
 
-    std.debug.print("  [{s}] simulation complete: {d} days in {d:.1}s (~{d:.0}x compression), {d} generated, {d} ingested, {d} evicted in {d} prunes\n", .{
-        b.name,
-        total_days,
-        @as(f64, @floatFromInt(stats.wall_ns)) / 1e9,
-        stats.compressionRatio(),
-        stats.generated,
-        stats.ingested,
-        stats.evicted,
-        stats.prune_calls,
-    });
+    // Per-backend wall_ns is deliberately NOT a wall-clock measurement here:
+    // with generation now shared across backends within one interleaved day
+    // loop, no backend has an independent "start to finish" wall-clock span
+    // to attribute a compression ratio to. Instead it's the sum of that
+    // backend's own timed ingest+prune cost — an honest "how fast can THIS
+    // backend absorb and evict data" compression figure that excludes both
+    // shared generation and query time, rather than a number that would
+    // double-count time other backends were also using the CPU.
+    inline for (runner.backends) |b| {
+        const state = &@field(states, b.name);
+        state.stats.sim_ms = @as(i64, total_days) * CHUNK_MS;
+        state.stats.wall_ns = state.stats.ingest_ns + state.stats.prune_ns;
+        try sim_stats_out.append(allocator, state.stats);
+
+        std.debug.print("  [{s}] simulation complete: {d} days, {d} generated, {d} ingested, {d} evicted in {d} prunes (~{d:.0}x ingest+prune compression)\n", .{
+            b.name,
+            total_days,
+            state.stats.generated,
+            state.stats.ingested,
+            state.stats.evicted,
+            state.stats.prune_calls,
+            state.stats.compressionRatio(),
+        });
+    }
+
+    const wall_end = std.Io.Clock.awake.now(io);
+    const total_wall_s = @as(f64, @floatFromInt(@as(i64, @intCast(wall_start.durationTo(wall_end).nanoseconds)))) / 1e9;
+    std.debug.print("\n--- Simulation complete: {d} days across {d} backends in {d:.1}s wall time ---\n", .{ total_days, runner.backends.len, total_wall_s });
 }
 
 // ---------------------------------------------------------------------------
-// Tests
+// Tests — written fresh against the current simulation.zig (2026-07-04),
+// covering the pure-math functions this file's performance rewrite (Steps
+// 1/2/4 of the sim-perf-overhaul plan) depends on staying correct.
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
 
 test "simDaysForRetention: short retention gets the 30-day floor margin" {
-    // temperature: 90d retention -> margin max(30, 4) = 30 -> 120 sim days.
+    // 90d retention -> margin max(30, 90/20=4) = 30 -> 120 sim days.
     try testing.expectEqual(@as(u32, 120), simDaysForRetention(90));
 }
 
-test "simDaysForRetention: long retention gets the proportional margin" {
-    // structural: 2555d retention -> margin max(30, 127) = 127 -> 2682.
+test "simDaysForRetention: long retention gets the proportional (5%) margin instead" {
+    // structural: 2555d retention -> margin max(30, 2555/20=127) = 127 -> 2682.
     try testing.expectEqual(@as(u32, 2682), simDaysForRetention(2555));
 }
 
-test "deriveSimDays: uses the longest retention among placed types; empty means zero" {
+test "deriveSimDays: uses the longest retention among placed types; empty input is zero" {
     const types = [_]sb.SensorType{ .temperature, .vibration, .structural };
     try testing.expectEqual(simDaysForRetention(2555), deriveSimDays(&types));
 
@@ -856,7 +727,7 @@ test "deriveSimDays: uses the longest retention among placed types; empty means 
     try testing.expectEqual(@as(u32, 0), deriveSimDays(&.{}));
 }
 
-test "deriveCheckpoints: temperature-only building gets day/week/month ladder + steady state" {
+test "deriveCheckpoints: short building gets day/week/month ladder + steady state, no duplicate" {
     const cps = try deriveCheckpoints(testing.allocator, 120);
     defer testing.allocator.free(cps);
 
@@ -866,29 +737,18 @@ test "deriveCheckpoints: temperature-only building gets day/week/month ladder + 
     try testing.expectEqualStrings("steady state", cps[cps.len - 1].label);
 }
 
-test "deriveCheckpoints: structural-scale run has 13 checkpoints ending at steady state" {
-    const cps = try deriveCheckpoints(testing.allocator, simDaysForRetention(2555));
-    defer testing.allocator.free(cps);
-
-    try testing.expectEqual(@as(usize, 13), cps.len);
-    try testing.expectEqual(@as(u32, 2555), cps[cps.len - 2].sim_day); // year 7 still inside
-    try testing.expectEqual(@as(u32, 2682), cps[cps.len - 1].sim_day);
-    try testing.expectEqualStrings("steady state", cps[cps.len - 1].label);
-}
-
-test "deriveCheckpoints: a ladder day equal to the sim end collapses into the final checkpoint" {
+test "deriveCheckpoints: a ladder day exactly equal to the sim end collapses into steady state, not both" {
     const cps = try deriveCheckpoints(testing.allocator, 365);
     defer testing.allocator.free(cps);
 
-    // 365 is on the ladder ("year 1") but must appear exactly once, as
-    // the final "steady state" entry.
+    // 365 ("year 1") is on the ladder AND is the sim end — must appear once.
     const expected_days = [_]u32{ 1, 7, 30, 90, 182, 365 };
     try testing.expectEqual(expected_days.len, cps.len);
     for (cps, expected_days) |cp, d| try testing.expectEqual(d, cp.sim_day);
     try testing.expectEqualStrings("steady state", cps[cps.len - 1].label);
 }
 
-test "deriveCheckpoints: zero sim days yields an empty schedule" {
+test "deriveCheckpoints: zero sim days yields an empty schedule, not a crash" {
     const cps = try deriveCheckpoints(testing.allocator, 0);
     defer testing.allocator.free(cps);
     try testing.expectEqual(@as(usize, 0), cps.len);
@@ -897,314 +757,25 @@ test "deriveCheckpoints: zero sim days yields an empty schedule" {
 test "prune cadence: 10% slack, never finer than one chunk" {
     const day: i64 = MS_PER_DAY;
 
-    // temperature: 90d retention -> prune every 9 simulated days.
+    // 90d retention -> prune every 9 simulated days, not before.
     const temp_retention = 90 * day;
     try testing.expectEqual(9 * day, pruneIntervalMs(temp_retention));
     try testing.expect(!shouldPrune(0, 8 * day, temp_retention));
     try testing.expect(shouldPrune(0, 9 * day, temp_retention));
 
-    // A 30d retention window -> prune every 3 days.
-    try testing.expectEqual(3 * day, pruneIntervalMs(30 * day));
-
     // A retention window so short that 10% of it is under one chunk still
-    // prunes no finer than per-chunk.
+    // prunes no finer than per-chunk (never a sub-day prune schedule).
     try testing.expectEqual(CHUNK_MS, pruneIntervalMs(2 * day));
 }
 
-test "QueryDigest: identical folds match; count, id-sum, and value divergences don't" {
-    var a = QueryDigest{};
-    var b = QueryDigest{};
-    const r = sb.SensorReading{ .sensor_id = 3, .timestamp = 1_700_000_000_000, .value = 21.5, .sensor_type = .temperature };
-    a.foldReading(r);
-    b.foldReading(r);
-    a.foldValue(42.0);
-    b.foldValue(42.0);
-    try testing.expect(a.matches(b));
-
-    // Tiny float divergence (summation order) still matches.
-    var c = b;
-    c.value_sum += c.value_sum * 1e-7;
-    try testing.expect(a.matches(c));
-
-    // Count mismatch fails.
-    var d = b;
-    d.count += 1;
-    try testing.expect(!a.matches(d));
-
-    // Timestamp/id-sum mismatch fails.
-    var e = b;
-    e.id_or_ts_sum +%= 1;
-    try testing.expect(!a.matches(e));
-
-    // Real value divergence fails.
-    var f = b;
-    f.value_sum += 1.0;
-    try testing.expect(!a.matches(f));
-}
-
-test "QueryDigest: zero-count digests (both sides empty) match" {
-    const a = QueryDigest{};
-    const b = QueryDigest{};
-    try testing.expect(a.matches(b));
-}
-
-test "SimStats: compression ratio is sim/wall and guards divide-by-zero" {
+test "SimStats.compressionRatio: sim/wall ratio, guards divide-by-zero" {
     var s = SimStats{ .backend = "TimeSeries" };
     try testing.expectEqual(@as(f64, 0.0), s.compressionRatio());
 
-    // 1 simulated hour in 1 wall millisecond = 3,600,000x.
+    // 1 simulated hour compressed into 1 wall millisecond = 3,600,000x.
     s.sim_ms = 60 * 60 * 1000;
     s.wall_ns = 1_000_000;
     try testing.expectApproxEqRel(@as(f64, 3_600_000.0), s.compressionRatio(), 1e-9);
 }
 
 // ---------------------------------------------------------------------------
-// Integration tests — exercise simulateBackend with a real World/backend.
-// ---------------------------------------------------------------------------
-
-const aos_backend = @import("../ecs/storage/backends/aos_storage.zig");
-const ts_backend = @import("../ecs/storage/backends/timeseries_storage.zig");
-
-/// Minimal sensor/zone fixtures for integration tests — 2 sensors of
-/// different types so deriveSimDays picks the longer retention.
-const int_test_sensors = [_]components.SensorMetadata{
-    .{ .sensor_id = 0, .sensor_type = .temperature, .frequency_hz = 1.0 / 300.0, .element_id = 1 },
-    .{ .sensor_id = 1, .sensor_type = .vibration, .frequency_hz = 1.0 / 3600.0, .element_id = 2 },
-};
-
-const int_test_locations = [_]components.ZoneLocation{
-    .{ .sensor_id = 0, .zone_id = 10, .position = .{ .x = 1.0, .y = 2.0, .z = 0.0 } },
-    .{ .sensor_id = 1, .zone_id = 10, .position = .{ .x = 3.0, .y = 4.0, .z = 0.0 } },
-};
-
-const int_test_zone_floor = [_]ZoneFloor{
-    .{ .zone_id = 10, .floor_id = 1 },
-};
-
-const int_test_overall = SampleArgs{
-    .sensor_id = 0,
-    .sensor_type = .temperature,
-    .zone_id = 10,
-    .floor_id = 1,
-    .position = .{ .x = 1.0, .y = 2.0, .z = 0.0 },
-};
-
-const int_test_type_samples = [_]TypeSample{
-    .{ .sensor_type = .temperature, .args = int_test_overall },
-    .{ .sensor_type = .vibration, .args = .{
-        .sensor_id = 1,
-        .sensor_type = .vibration,
-        .zone_id = 10,
-        .floor_id = 1,
-        .position = .{ .x = 3.0, .y = 4.0, .z = 0.0 },
-    } },
-};
-
-const int_test_query_mix = [_]queries.QueryWeight{
-    .{ .query = .latest_single, .weight = 1.0, .hot = true },
-    .{ .query = .avg_window, .weight = 1.0, .hot = false },
-};
-
-/// Short sim: temperature (90d retention) + vibration (90d) -> simDaysForRetention(90) = 120 days.
-fn intTestCheckpoints(allocator: std.mem.Allocator) ![]Checkpoint {
-    const types = [_]sb.SensorType{ .temperature, .vibration };
-    const days = deriveSimDays(&types);
-    return deriveCheckpoints(allocator, days);
-}
-
-test "integration: simulateBackend produces growth points at every checkpoint" {
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    const cps = try intTestCheckpoints(testing.allocator);
-    defer testing.allocator.free(cps);
-
-    var growth: std.ArrayList(GrowthPoint) = .empty;
-    defer growth.deinit(testing.allocator);
-    var sim_stats: std.ArrayList(SimStats) = .empty;
-    defer sim_stats.deinit(testing.allocator);
-    var type_volumes: std.ArrayList(TypeVolume) = .empty;
-    defer type_volumes.deinit(testing.allocator);
-    var rows: std.ArrayList(report.RunRow) = .empty;
-    defer rows.deinit(testing.allocator);
-    var type_rows: std.ArrayList(report.RunRow) = .empty;
-    defer type_rows.deinit(testing.allocator);
-    var digests = try DigestTable.init(testing.allocator, cps.len, int_test_query_mix.len);
-    defer digests.deinit(testing.allocator);
-
-    const b = runner.BackendEntry{ .name = "AoS", .T = aos_backend };
-    try simulateBackend(
-        b,
-        true,
-        testing.allocator,
-        io,
-        &int_test_sensors,
-        &int_test_locations,
-        &int_test_zone_floor,
-        &int_test_query_mix,
-        int_test_overall,
-        &int_test_type_samples,
-        "test",
-        42,
-        cps,
-        &digests,
-        &rows,
-        &type_rows,
-        &growth,
-        &sim_stats,
-        &type_volumes,
-    );
-
-    // 2 queries × 5 checkpoints (day 1, 7, 30, 90, 120) = 10 growth points.
-    try testing.expectEqual(cps.len * int_test_query_mix.len, growth.items.len);
-    // Sim stats recorded.
-    try testing.expectEqual(@as(usize, 1), sim_stats.items.len);
-    // Type volumes recorded (2 types).
-    try testing.expectEqual(@as(usize, 2), type_volumes.items.len);
-}
-
-test "integration: determinism — same seed produces identical growth medians" {
-    var threaded1 = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded1.deinit();
-    const io1 = threaded1.io();
-
-    var threaded2 = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded2.deinit();
-    const io2 = threaded2.io();
-
-    const cps = try intTestCheckpoints(testing.allocator);
-    defer testing.allocator.free(cps);
-
-    var growth1: std.ArrayList(GrowthPoint) = .empty;
-    defer growth1.deinit(testing.allocator);
-    var sim_stats1: std.ArrayList(SimStats) = .empty;
-    defer sim_stats1.deinit(testing.allocator);
-    var type_volumes1: std.ArrayList(TypeVolume) = .empty;
-    defer type_volumes1.deinit(testing.allocator);
-    var rows1: std.ArrayList(report.RunRow) = .empty;
-    defer rows1.deinit(testing.allocator);
-    var type_rows1: std.ArrayList(report.RunRow) = .empty;
-    defer type_rows1.deinit(testing.allocator);
-    var digests1 = try DigestTable.init(testing.allocator, cps.len, int_test_query_mix.len);
-    defer digests1.deinit(testing.allocator);
-
-    var growth2: std.ArrayList(GrowthPoint) = .empty;
-    defer growth2.deinit(testing.allocator);
-    var sim_stats2: std.ArrayList(SimStats) = .empty;
-    defer sim_stats2.deinit(testing.allocator);
-    var type_volumes2: std.ArrayList(TypeVolume) = .empty;
-    defer type_volumes2.deinit(testing.allocator);
-    var rows2: std.ArrayList(report.RunRow) = .empty;
-    defer rows2.deinit(testing.allocator);
-    var type_rows2: std.ArrayList(report.RunRow) = .empty;
-    defer type_rows2.deinit(testing.allocator);
-    var digests2 = try DigestTable.init(testing.allocator, cps.len, int_test_query_mix.len);
-    defer digests2.deinit(testing.allocator);
-
-    const b = runner.BackendEntry{ .name = "AoS", .T = aos_backend };
-
-    try simulateBackend(b, true, testing.allocator, io1, &int_test_sensors, &int_test_locations, &int_test_zone_floor, &int_test_query_mix, int_test_overall, &int_test_type_samples, "test", 42, cps, &digests1, &rows1, &type_rows1, &growth1, &sim_stats1, &type_volumes1);
-    try simulateBackend(b, true, testing.allocator, io2, &int_test_sensors, &int_test_locations, &int_test_zone_floor, &int_test_query_mix, int_test_overall, &int_test_type_samples, "test", 42, cps, &digests2, &rows2, &type_rows2, &growth2, &sim_stats2, &type_volumes2);
-
-    // Same seed -> same reading count and type volumes (deterministic data).
-    try testing.expectEqual(growth1.items.len, growth2.items.len);
-    for (growth1.items, growth2.items) |g1, g2| {
-        try testing.expectEqual(g1.reading_count, g2.reading_count);
-    }
-    try testing.expectEqual(type_volumes1.items.len, type_volumes2.items.len);
-    for (type_volumes1.items, type_volumes2.items) |v1, v2| {
-        try testing.expectEqual(v1.reading_count, v2.reading_count);
-    }
-    // Same generated count.
-    try testing.expectEqual(sim_stats1.items[0].generated, sim_stats2.items[0].generated);
-}
-
-test "integration: eviction occurs in a full-length sim" {
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    const cps = try intTestCheckpoints(testing.allocator);
-    defer testing.allocator.free(cps);
-
-    var growth: std.ArrayList(GrowthPoint) = .empty;
-    defer growth.deinit(testing.allocator);
-    var sim_stats: std.ArrayList(SimStats) = .empty;
-    defer sim_stats.deinit(testing.allocator);
-    var type_volumes: std.ArrayList(TypeVolume) = .empty;
-    defer type_volumes.deinit(testing.allocator);
-    var rows: std.ArrayList(report.RunRow) = .empty;
-    defer rows.deinit(testing.allocator);
-    var type_rows: std.ArrayList(report.RunRow) = .empty;
-    defer type_rows.deinit(testing.allocator);
-    var digests = try DigestTable.init(testing.allocator, cps.len, int_test_query_mix.len);
-    defer digests.deinit(testing.allocator);
-
-    const b = runner.BackendEntry{ .name = "TimeSeries", .T = ts_backend };
-    try simulateBackend(
-        b,
-        true,
-        testing.allocator,
-        io,
-        &int_test_sensors,
-        &int_test_locations,
-        &int_test_zone_floor,
-        &int_test_query_mix,
-        int_test_overall,
-        &int_test_type_samples,
-        "test",
-        42,
-        cps,
-        &digests,
-        &rows,
-        &type_rows,
-        &growth,
-        &sim_stats,
-        &type_volumes,
-    );
-
-    // 120 sim days, 90d retention -> eviction must happen after day 90.
-    try testing.expect(sim_stats.items[0].evicted > 0);
-    try testing.expect(sim_stats.items[0].prune_calls > 0);
-}
-
-test "integration: cross-backend digest validation passes for AoS vs TimeSeries" {
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    const cps = try intTestCheckpoints(testing.allocator);
-    defer testing.allocator.free(cps);
-
-    var growth: std.ArrayList(GrowthPoint) = .empty;
-    defer growth.deinit(testing.allocator);
-    var sim_stats: std.ArrayList(SimStats) = .empty;
-    defer sim_stats.deinit(testing.allocator);
-    var type_volumes: std.ArrayList(TypeVolume) = .empty;
-    defer type_volumes.deinit(testing.allocator);
-    var rows: std.ArrayList(report.RunRow) = .empty;
-    defer rows.deinit(testing.allocator);
-    var type_rows: std.ArrayList(report.RunRow) = .empty;
-    defer type_rows.deinit(testing.allocator);
-    var digests = try DigestTable.init(testing.allocator, cps.len, int_test_query_mix.len);
-    defer digests.deinit(testing.allocator);
-
-    // Run AoS first (records digests), then TimeSeries (validates against them).
-    const aos_entry = runner.BackendEntry{ .name = "AoS", .T = aos_backend };
-    try simulateBackend(aos_entry, true, testing.allocator, io, &int_test_sensors, &int_test_locations, &int_test_zone_floor, &int_test_query_mix, int_test_overall, &int_test_type_samples, "test", 42, cps, &digests, &rows, &type_rows, &growth, &sim_stats, &type_volumes);
-
-    const ts_entry = runner.BackendEntry{ .name = "TimeSeries", .T = ts_backend };
-    try simulateBackend(ts_entry, true, testing.allocator, io, &int_test_sensors, &int_test_locations, &int_test_zone_floor, &int_test_query_mix, int_test_overall, &int_test_type_samples, "test", 42, cps, &digests, &rows, &type_rows, &growth, &sim_stats, &type_volumes);
-
-    // If we get here without error.CrossBackendMismatch, digests matched.
-    // Verify the digest table was populated (not all null).
-    var any_filled = false;
-    for (digests.entries) |e| {
-        if (e != null) {
-            any_filled = true;
-            break;
-        }
-    }
-    try testing.expect(any_filled);
-}

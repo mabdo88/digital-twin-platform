@@ -409,8 +409,23 @@ pub fn query_hourly_rollup(world: anytype, sensor_id: u32, days: u32) ![]HourlyA
 ///
 /// Returns an empty slice when no matching readings exist.
 ///
-/// Pure: calls only world.iterateAll — no backend-specific code, no branching
-/// on backend type.
+/// Fetched PER ZONE MEMBER (rangeByTime with a sensor filter), like
+/// query_avg_zone_type/query_floor_stats — deliberately NOT one unfiltered
+/// window fetch. This query is zone-scoped: a zone holds ~10-15 sensors out
+/// of the whole building, so the realistic engine plan is per-series index
+/// probes for exactly those members, the same way a real TSDB executes
+/// `WHERE zone_id = X AND type = Y` via its series index. A one-shot
+/// unfiltered fetch was tried (2026-07-04) and measured WORSE at scale on
+/// every backend: it materialized the entire building's 365-day window
+/// (~57M readings, ~1.3GB, plus a full sort inside rangeByTime) to keep one
+/// zone's ~1% of it — 13.5-16.4s/call at hospital-scale month 6 vs ~1.8s
+/// for the per-member form, and it spiked peak memory. The one-fetch form
+/// is right for FLEET-WIDE queries (see query_anomalies — type-scoped,
+/// ~200 sensors, most of the data volume); sensor scope, not time-window
+/// width, is what determines the realistic execution shape.
+///
+/// Pure: calls only world.sensorIdsByZone/getLatestBySensor/rangeByTime —
+/// no backend-specific code, no branching on backend type.
 pub fn query_daily_zone_rollup(world: anytype, zone_id: u32, sensor_type: sb.SensorType) ![]DailyAggregate {
     const ms_per_hour: i64 = 60 * 60 * 1000;
     const ms_per_day: i64 = 24 * ms_per_hour;
@@ -438,8 +453,6 @@ pub fn query_daily_zone_rollup(world: anytype, zone_id: u32, sensor_type: sb.Sen
     const end_time = latest_ts.?;
     const start_time: i64 = end_time - year_days * ms_per_day;
 
-    // Use rangeByTime per sensor — pushes the time filter into the backend's
-    // index instead of materializing all readings.
     var buckets = std.AutoHashMap(i64, BucketAcc).init(world.allocator);
     defer buckets.deinit();
 
@@ -651,10 +664,10 @@ fn hourOfDay(timestamp_ms: i64) usize {
 
 /// Q11: Readings of `sensor_type`, across every sensor of that type, whose
 /// value deviates by more than `std_dev_threshold` standard deviations from
-/// THAT SENSOR'S OWN mean **for that same hour-of-day**, computed over its
-/// trailing `window_hours` (ending at its own latest reading) — the same
-/// "trailing window from this sensor's own latest timestamp" idiom as
-/// query_avg_window/query_avg_zone_type.
+/// THAT SENSOR'S OWN mean **for that same hour-of-day**, computed over the
+/// shared trailing `window_hours` ending at the newest reading among sensors
+/// of the type — one fleet-wide "last N hours" window, the way a real
+/// anomaly dashboard scopes it, rather than a separate window per sensor.
 ///
 /// Baselining per-sensor, not blended across every sensor of the type
 /// building-wide, matches how real anomaly detection is actually scoped: a
@@ -688,11 +701,10 @@ fn hourOfDay(timestamp_ms: i64) usize {
 ///
 /// Pure: calls only world.allSensorIds/getLatestBySensor/rangeByTime — the
 /// same native, backend-agnostic primitives query_spatial_radius and
-/// query_avg_window already use, plus pure in-memory bucketing over the
-/// one window slice already fetched. No World-level shim: unlike the old
-/// statsForType/readingsForType path, nothing here materializes a copy of
-/// every reading of a type — each backend answers via its own real
-/// partition/tree/buffer lookup.
+/// query_avg_window already use, plus pure in-memory grouping/bucketing
+/// over the one window slice fetched. No backend branches anywhere: every
+/// backend serves the identical one-window fetch through its own layout,
+/// and layouts win or lose on their own merits.
 pub fn query_anomalies(world: anytype, sensor_type: sb.SensorType, std_dev_threshold: f32, window_hours: u32) ![]AnomalyResult {
     const sensor_ids = try world.allSensorIds();
     defer world.allocator.free(sensor_ids);
@@ -702,22 +714,63 @@ pub fn query_anomalies(world: anytype, sensor_type: sb.SensorType, std_dev_thres
     var result: std.ArrayList(AnomalyResult) = .empty;
     defer result.deinit(world.allocator);
 
+    // Window end = the newest reading among sensors of this type — the
+    // shared "now" a real anomaly dashboard queries against ("last 7 days",
+    // one wall-clock window for the whole fleet), not one window per
+    // sensor. getLatestBySensor is O(1) per sensor on every backend.
+    var end_ts: ?i64 = null;
     for (sensor_ids) |sid| {
-        const latest = world.getLatestBySensor(sid) orelse continue;
-        if (latest.sensor_type != sensor_type) continue;
+        if (world.getLatestBySensor(sid)) |r| {
+            if (r.sensor_type != sensor_type) continue;
+            if (end_ts == null or r.timestamp > end_ts.?) end_ts = r.timestamp;
+        }
+    }
+    const end_time = end_ts orelse return try result.toOwnedSlice(world.allocator);
 
-        const window = try world.rangeByTime(.{
-            .sensor_id = sid,
-            .start_time = latest.timestamp - window_ms,
-            .end_time = latest.timestamp,
-        });
-        defer world.allocator.free(window);
+    // ONE fetch of the whole trailing window, then group rows by sensor in
+    // this layer — how a real application issues a fleet-wide anomaly query
+    // (one `WHERE type = X AND time > now()-7d` query, one pass over the
+    // window, GROUP BY sensor), and how a real engine executes one. The
+    // previous formulation called rangeByTime once per sensor of the type —
+    // the classic N+1 query anti-pattern no real application would write,
+    // and on time-partitioned backends each of those N calls re-scanned the
+    // entire multi-sensor window to keep one sensor's rows (~200 full-window
+    // scans ≈ 440M row visits ≈ 1.5-2.9s per call at hospital scale).
+    const window = try world.rangeByTime(.{
+        .sensor_id = null,
+        .start_time = end_time - window_ms,
+        .end_time = end_time,
+    });
+    defer world.allocator.free(window);
 
-        if (window.len < 2) continue;
+    // Group by sensor: indices into `window`, per sensor_id. rangeByTime
+    // returns (timestamp asc, sensor_id asc), so each group's indices stay
+    // in timestamp order — same per-sensor iteration order the per-sensor
+    // fetches produced.
+    var groups = std.AutoHashMap(u32, std.ArrayList(u32)).init(world.allocator);
+    defer {
+        var git = groups.valueIterator();
+        while (git.next()) |list| list.deinit(world.allocator);
+        groups.deinit();
+    }
+    for (window, 0..) |r, i| {
+        if (r.sensor_type != sensor_type) continue;
+        const gop = try groups.getOrPut(r.sensor_id);
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        try gop.value_ptr.append(world.allocator, @intCast(i));
+    }
+
+    // Per sensor: identical per-hour-of-day baselining math as before, just
+    // over the grouped rows instead of a per-sensor fetch.
+    var it = groups.iterator();
+    while (it.next()) |entry| {
+        const indices = entry.value_ptr.items;
+        if (indices.len < 2) continue;
 
         var sums: [HOURS_PER_DAY]f64 = @splat(0);
         var counts: [HOURS_PER_DAY]usize = @splat(0);
-        for (window) |r| {
+        for (indices) |i| {
+            const r = window[i];
             const h = hourOfDay(r.timestamp);
             sums[h] += r.value;
             counts[h] += 1;
@@ -729,7 +782,8 @@ pub fn query_anomalies(world: anytype, sensor_type: sb.SensorType, std_dev_thres
         }
 
         var sum_sq_devs: [HOURS_PER_DAY]f64 = @splat(0);
-        for (window) |r| {
+        for (indices) |i| {
+            const r = window[i];
             const h = hourOfDay(r.timestamp);
             const d = @as(f64, r.value) - means[h];
             sum_sq_devs[h] += d * d;
@@ -740,7 +794,8 @@ pub fn query_anomalies(world: anytype, sensor_type: sb.SensorType, std_dev_thres
             if (counts[h] > 0) std_devs[h] = @sqrt(sum_sq_devs[h] / @as(f64, @floatFromInt(counts[h])));
         }
 
-        for (window) |r| {
+        for (indices) |i| {
+            const r = window[i];
             const h = hourOfDay(r.timestamp);
             if (counts[h] < 2 or std_devs[h] == 0.0) continue;
 
@@ -957,1052 +1012,3 @@ const SENSORS_PER_ZONE = fixtures.SENSORS_PER_ZONE;
 const ZONES_PER_FLOOR = fixtures.ZONES_PER_FLOOR;
 const SENSORS_PER_FLOOR = fixtures.SENSORS_PER_FLOOR;
 
-test "query_avg_window: AoS, SoA, TimeSeries, Columnar, and Hierarchical agree on same seeded dataset" {
-    const dataset = try generateDataset(std.testing.allocator);
-    defer std.testing.allocator.free(dataset);
-
-    var world_aos = try World(aos).init(std.testing.allocator);
-    defer world_aos.deinit();
-    var world_soa = try World(soa).init(std.testing.allocator);
-    defer world_soa.deinit();
-    var world_ts = try World(timeseries).init(std.testing.allocator);
-    defer world_ts.deinit();
-    var world_col = try World(columnar).init(std.testing.allocator);
-    defer world_col.deinit();
-    var world_hier = try World(hierarchical).init(std.testing.allocator);
-    defer world_hier.deinit();
-    var world_rb = try World(ringbuffer).init(std.testing.allocator);
-    defer world_rb.deinit();
-
-    try insertDataset(&world_aos, dataset);
-    try insertDataset(&world_soa, dataset);
-    try insertDataset(&world_ts, dataset);
-    try insertDataset(&world_col, dataset);
-    try insertDataset(&world_hier, dataset);
-    try insertDataset(&world_rb, dataset);
-
-    // Test several sensors and window sizes
-    const test_cases = [_]struct { sensor: u32, hours: u32 }{
-        .{ .sensor = 0, .hours = 1 },
-        .{ .sensor = 0, .hours = 6 },
-        .{ .sensor = 0, .hours = 24 },
-        .{ .sensor = 0, .hours = 50 },
-        .{ .sensor = 3, .hours = 1 },
-        .{ .sensor = 3, .hours = 12 },
-        .{ .sensor = 3, .hours = 50 },
-        .{ .sensor = 9, .hours = 1 },
-        .{ .sensor = 9, .hours = 24 },
-        .{ .sensor = 9, .hours = 50 },
-    };
-
-    // Tolerance: 1e-5 absolute. All backends iterate the same sorted
-    // result set and sum f32s in the same order, so they should agree
-    // to within float rounding noise. 1e-5 is generous for ~50 values.
-    const tolerance: f32 = 1e-5;
-
-    for (test_cases) |tc| {
-        const avg_aos = try query_avg_window(&world_aos, tc.sensor, tc.hours);
-        const avg_soa = try query_avg_window(&world_soa, tc.sensor, tc.hours);
-        const avg_ts = try query_avg_window(&world_ts, tc.sensor, tc.hours);
-        const avg_col = try query_avg_window(&world_col, tc.sensor, tc.hours);
-        const avg_hier = try query_avg_window(&world_hier, tc.sensor, tc.hours);
-        const avg_rb = try query_avg_window(&world_rb, tc.sensor, tc.hours);
-
-        try std.testing.expectApproxEqAbs(avg_aos, avg_soa, tolerance);
-        try std.testing.expectApproxEqAbs(avg_aos, avg_ts, tolerance);
-        try std.testing.expectApproxEqAbs(avg_aos, avg_col, tolerance);
-        try std.testing.expectApproxEqAbs(avg_aos, avg_hier, tolerance);
-        try std.testing.expectApproxEqAbs(avg_aos, avg_rb, tolerance);
-    }
-}
-
-test "query_avg_window: returns 0.0 for nonexistent sensor" {
-    var world = try World(aos).init(std.testing.allocator);
-    defer world.deinit();
-
-    const dataset = try generateDataset(std.testing.allocator);
-    defer std.testing.allocator.free(dataset);
-    try insertDataset(&world, dataset);
-
-    const result = try query_avg_window(&world, 999, 24);
-    try std.testing.expectEqual(@as(f32, 0.0), result);
-}
-
-test "query_avg_window: single reading returns that reading's value" {
-    var world = try World(soa).init(std.testing.allocator);
-    defer world.deinit();
-
-    try world.insert(.{
-        .sensor_id = 5,
-        .timestamp = 1_000_000,
-        .value = 42.0,
-        .sensor_type = .temperature,
-    });
-
-    const result = try query_avg_window(&world, 5, 24);
-    try std.testing.expectApproxEqAbs(@as(f32, 42.0), result, 1e-5);
-}
-
-test "query_latest_single: all six backends agree on same seeded dataset" {
-    const dataset = try generateDataset(std.testing.allocator);
-    defer std.testing.allocator.free(dataset);
-
-    var world_aos = try World(aos).init(std.testing.allocator);
-    defer world_aos.deinit();
-    var world_soa = try World(soa).init(std.testing.allocator);
-    defer world_soa.deinit();
-    var world_ts = try World(timeseries).init(std.testing.allocator);
-    defer world_ts.deinit();
-    var world_col = try World(columnar).init(std.testing.allocator);
-    defer world_col.deinit();
-    var world_hier = try World(hierarchical).init(std.testing.allocator);
-    defer world_hier.deinit();
-    var world_rb = try World(ringbuffer).init(std.testing.allocator);
-    defer world_rb.deinit();
-
-    try insertDataset(&world_aos, dataset);
-    try insertDataset(&world_soa, dataset);
-    try insertDataset(&world_ts, dataset);
-    try insertDataset(&world_col, dataset);
-    try insertDataset(&world_hier, dataset);
-    try insertDataset(&world_rb, dataset);
-
-    for (0..NUM_SENSORS) |s| {
-        const sensor: u32 = @intCast(s);
-        const r_aos = try query_latest_single(&world_aos, sensor);
-        const r_soa = try query_latest_single(&world_soa, sensor);
-        const r_ts = try query_latest_single(&world_ts, sensor);
-        const r_col = try query_latest_single(&world_col, sensor);
-        const r_hier = try query_latest_single(&world_hier, sensor);
-        const r_rb = try query_latest_single(&world_rb, sensor);
-
-        const ref = r_aos;
-        const others = [_]?sb.SensorReading{ r_soa, r_ts, r_col, r_hier, r_rb };
-        for (others) |o| {
-            if (ref) |r| {
-                try std.testing.expect(o != null);
-                try std.testing.expectEqual(r.sensor_id, o.?.sensor_id);
-                try std.testing.expectEqual(r.timestamp, o.?.timestamp);
-                try std.testing.expectApproxEqAbs(r.value, o.?.value, 1e-5);
-            } else {
-                try std.testing.expect(o == null);
-            }
-        }
-    }
-}
-
-test "query_latest_single: returns null for nonexistent sensor" {
-    var world = try World(aos).init(std.testing.allocator);
-    defer world.deinit();
-
-    const dataset = try generateDataset(std.testing.allocator);
-    defer std.testing.allocator.free(dataset);
-    try insertDataset(&world, dataset);
-
-    const result = try query_latest_single(&world, 999);
-    try std.testing.expect(result == null);
-}
-
-test "query_latest_zone: all six backends agree on same seeded dataset" {
-    const dataset = try generateDataset(std.testing.allocator);
-    defer std.testing.allocator.free(dataset);
-
-    var world_aos = try World(aos).init(std.testing.allocator);
-    defer world_aos.deinit();
-    var world_soa = try World(soa).init(std.testing.allocator);
-    defer world_soa.deinit();
-    var world_ts = try World(timeseries).init(std.testing.allocator);
-    defer world_ts.deinit();
-    var world_col = try World(columnar).init(std.testing.allocator);
-    defer world_col.deinit();
-    var world_hier = try World(hierarchical).init(std.testing.allocator);
-    defer world_hier.deinit();
-    var world_rb = try World(ringbuffer).init(std.testing.allocator);
-    defer world_rb.deinit();
-
-    try insertDataset(&world_aos, dataset);
-    try insertDataset(&world_soa, dataset);
-    try insertDataset(&world_ts, dataset);
-    try insertDataset(&world_col, dataset);
-    try insertDataset(&world_hier, dataset);
-    try insertDataset(&world_rb, dataset);
-
-    const zone_cases = [_]u32{ 0, 1 };
-
-    for (zone_cases) |zone_id| {
-        const r_aos = try query_latest_zone(&world_aos, zone_id);
-        defer world_aos.allocator.free(r_aos);
-        const r_soa = try query_latest_zone(&world_soa, zone_id);
-        defer world_soa.allocator.free(r_soa);
-        const r_ts = try query_latest_zone(&world_ts, zone_id);
-        defer world_ts.allocator.free(r_ts);
-        const r_col = try query_latest_zone(&world_col, zone_id);
-        defer world_col.allocator.free(r_col);
-        const r_hier = try query_latest_zone(&world_hier, zone_id);
-        defer world_hier.allocator.free(r_hier);
-        const r_rb = try query_latest_zone(&world_rb, zone_id);
-        defer world_rb.allocator.free(r_rb);
-
-        const ref = r_aos;
-        const others = [_][]const sb.SensorReading{ r_soa, r_ts, r_col, r_hier, r_rb };
-        for (others) |o| {
-            try std.testing.expectEqual(ref.len, o.len);
-            for (0..ref.len) |i| {
-                try std.testing.expectEqual(ref[i].sensor_id, o[i].sensor_id);
-                try std.testing.expectEqual(ref[i].timestamp, o[i].timestamp);
-                try std.testing.expectApproxEqAbs(ref[i].value, o[i].value, 1e-5);
-            }
-        }
-    }
-}
-
-test "query_latest_zone: returns empty for nonexistent zone" {
-    var world = try World(aos).init(std.testing.allocator);
-    defer world.deinit();
-
-    const dataset = try generateDataset(std.testing.allocator);
-    defer std.testing.allocator.free(dataset);
-    try insertDataset(&world, dataset);
-
-    const result = try query_latest_zone(&world, 999);
-    defer world.allocator.free(result);
-    try std.testing.expectEqual(@as(usize, 0), result.len);
-}
-
-test "query_latest_by_type: all six backends agree on same seeded dataset" {
-    const dataset = try generateDataset(std.testing.allocator);
-    defer std.testing.allocator.free(dataset);
-
-    var world_aos = try World(aos).init(std.testing.allocator);
-    defer world_aos.deinit();
-    var world_soa = try World(soa).init(std.testing.allocator);
-    defer world_soa.deinit();
-    var world_ts = try World(timeseries).init(std.testing.allocator);
-    defer world_ts.deinit();
-    var world_col = try World(columnar).init(std.testing.allocator);
-    defer world_col.deinit();
-    var world_hier = try World(hierarchical).init(std.testing.allocator);
-    defer world_hier.deinit();
-    var world_rb = try World(ringbuffer).init(std.testing.allocator);
-    defer world_rb.deinit();
-
-    try insertDataset(&world_aos, dataset);
-    try insertDataset(&world_soa, dataset);
-    try insertDataset(&world_ts, dataset);
-    try insertDataset(&world_col, dataset);
-    try insertDataset(&world_hier, dataset);
-    try insertDataset(&world_rb, dataset);
-
-    const type_cases = [_]sb.SensorType{ .temperature, .humidity, .co2, .occupancy, .energy };
-
-    for (type_cases) |st| {
-        const r_aos = try query_latest_by_type(&world_aos, st);
-        defer world_aos.allocator.free(r_aos);
-        const r_soa = try query_latest_by_type(&world_soa, st);
-        defer world_soa.allocator.free(r_soa);
-        const r_ts = try query_latest_by_type(&world_ts, st);
-        defer world_ts.allocator.free(r_ts);
-        const r_col = try query_latest_by_type(&world_col, st);
-        defer world_col.allocator.free(r_col);
-        const r_hier = try query_latest_by_type(&world_hier, st);
-        defer world_hier.allocator.free(r_hier);
-        const r_rb = try query_latest_by_type(&world_rb, st);
-        defer world_rb.allocator.free(r_rb);
-
-        const ref = r_aos;
-        const others = [_][]const sb.SensorReading{ r_soa, r_ts, r_col, r_hier, r_rb };
-        for (others) |o| {
-            try std.testing.expectEqual(ref.len, o.len);
-            for (0..ref.len) |i| {
-                try std.testing.expectEqual(ref[i].sensor_id, o[i].sensor_id);
-                try std.testing.expectEqual(ref[i].timestamp, o[i].timestamp);
-                try std.testing.expectApproxEqAbs(ref[i].value, o[i].value, 1e-5);
-            }
-        }
-    }
-}
-
-test "query_latest_by_type: returns empty for type with no sensors" {
-    var world = try World(aos).init(std.testing.allocator);
-    defer world.deinit();
-
-    const dataset = try generateDataset(std.testing.allocator);
-    defer std.testing.allocator.free(dataset);
-    try insertDataset(&world, dataset);
-
-    const result = try query_latest_by_type(&world, .vibration);
-    defer world.allocator.free(result);
-    try std.testing.expectEqual(@as(usize, 0), result.len);
-}
-
-// Golden-result equivalence tests for Q5 (query_avg_zone_type)
-// ---------------------------------------------------------------------------
-
-test "query_avg_zone_type: all six backends agree on same seeded dataset" {
-    const dataset = try generateDataset(std.testing.allocator);
-    defer std.testing.allocator.free(dataset);
-
-    var world_aos = try World(aos).init(std.testing.allocator);
-    defer world_aos.deinit();
-    var world_soa = try World(soa).init(std.testing.allocator);
-    defer world_soa.deinit();
-    var world_ts = try World(timeseries).init(std.testing.allocator);
-    defer world_ts.deinit();
-    var world_col = try World(columnar).init(std.testing.allocator);
-    defer world_col.deinit();
-    var world_hier = try World(hierarchical).init(std.testing.allocator);
-    defer world_hier.deinit();
-    var world_rb = try World(ringbuffer).init(std.testing.allocator);
-    defer world_rb.deinit();
-
-    try insertDataset(&world_aos, dataset);
-    try insertDataset(&world_soa, dataset);
-    try insertDataset(&world_ts, dataset);
-    try insertDataset(&world_col, dataset);
-    try insertDataset(&world_hier, dataset);
-    try insertDataset(&world_rb, dataset);
-
-    // Zone 0 = sensors 0–4, Zone 1 = sensors 5–9
-    // Zone 0 has temperature (0,1,2) and humidity (3,4)
-    // Zone 1 has co2 (5,6), occupancy (7,8), energy (9)
-    const test_cases = [_]struct { zone: u32, st: sb.SensorType, hours: u32 }{
-        .{ .zone = 0, .st = .temperature, .hours = 1 },
-        .{ .zone = 0, .st = .temperature, .hours = 24 },
-        .{ .zone = 0, .st = .temperature, .hours = 50 },
-        .{ .zone = 0, .st = .humidity, .hours = 1 },
-        .{ .zone = 0, .st = .humidity, .hours = 50 },
-        .{ .zone = 1, .st = .co2, .hours = 12 },
-        .{ .zone = 1, .st = .co2, .hours = 50 },
-        .{ .zone = 1, .st = .occupancy, .hours = 24 },
-        .{ .zone = 1, .st = .energy, .hours = 1 },
-        .{ .zone = 1, .st = .energy, .hours = 50 },
-    };
-
-    const tolerance: f32 = 1e-5;
-
-    for (test_cases) |tc| {
-        const avg_aos = try query_avg_zone_type(&world_aos, tc.zone, tc.st, tc.hours);
-        const avg_soa = try query_avg_zone_type(&world_soa, tc.zone, tc.st, tc.hours);
-        const avg_ts = try query_avg_zone_type(&world_ts, tc.zone, tc.st, tc.hours);
-        const avg_col = try query_avg_zone_type(&world_col, tc.zone, tc.st, tc.hours);
-        const avg_hier = try query_avg_zone_type(&world_hier, tc.zone, tc.st, tc.hours);
-        const avg_rb = try query_avg_zone_type(&world_rb, tc.zone, tc.st, tc.hours);
-
-        try std.testing.expectApproxEqAbs(avg_aos, avg_soa, tolerance);
-        try std.testing.expectApproxEqAbs(avg_aos, avg_ts, tolerance);
-        try std.testing.expectApproxEqAbs(avg_aos, avg_col, tolerance);
-        try std.testing.expectApproxEqAbs(avg_aos, avg_hier, tolerance);
-        try std.testing.expectApproxEqAbs(avg_aos, avg_rb, tolerance);
-    }
-}
-
-test "query_avg_zone_type: returns 0.0 for nonexistent zone" {
-    var world = try World(aos).init(std.testing.allocator);
-    defer world.deinit();
-
-    const dataset = try generateDataset(std.testing.allocator);
-    defer std.testing.allocator.free(dataset);
-    try insertDataset(&world, dataset);
-
-    const result = try query_avg_zone_type(&world, 999, .temperature, 24);
-    try std.testing.expectEqual(@as(f32, 0.0), result);
-}
-
-test "query_avg_zone_type: returns 0.0 for type with no sensors in zone" {
-    var world = try World(soa).init(std.testing.allocator);
-    defer world.deinit();
-
-    const dataset = try generateDataset(std.testing.allocator);
-    defer std.testing.allocator.free(dataset);
-    try insertDataset(&world, dataset);
-
-    // Zone 0 has temperature and humidity, not co2
-    const result = try query_avg_zone_type(&world, 0, .co2, 24);
-    try std.testing.expectEqual(@as(f32, 0.0), result);
-}
-
-// ---------------------------------------------------------------------------
-// Golden-result equivalence tests for Q6 (query_floor_stats)
-// ---------------------------------------------------------------------------
-
-test "query_floor_stats: all six backends agree on same seeded dataset" {
-    const dataset = try generateDataset(std.testing.allocator);
-    defer std.testing.allocator.free(dataset);
-
-    var world_aos = try World(aos).init(std.testing.allocator);
-    defer world_aos.deinit();
-    var world_soa = try World(soa).init(std.testing.allocator);
-    defer world_soa.deinit();
-    var world_ts = try World(timeseries).init(std.testing.allocator);
-    defer world_ts.deinit();
-    var world_col = try World(columnar).init(std.testing.allocator);
-    defer world_col.deinit();
-    var world_hier = try World(hierarchical).init(std.testing.allocator);
-    defer world_hier.deinit();
-    var world_rb = try World(ringbuffer).init(std.testing.allocator);
-    defer world_rb.deinit();
-
-    try insertDataset(&world_aos, dataset);
-    try insertDataset(&world_soa, dataset);
-    try insertDataset(&world_ts, dataset);
-    try insertDataset(&world_col, dataset);
-    try insertDataset(&world_hier, dataset);
-    try insertDataset(&world_rb, dataset);
-
-    // Floor 0 = sensors 0–9 (all 10 sensors with SENSORS_PER_FLOOR=10)
-    // Floor 1 = no sensors (only 10 sensors total)
-    const test_cases = [_]struct { floor: u32, st: sb.SensorType, hours: u32 }{
-        .{ .floor = 0, .st = .temperature, .hours = 1 },
-        .{ .floor = 0, .st = .temperature, .hours = 24 },
-        .{ .floor = 0, .st = .temperature, .hours = 50 },
-        .{ .floor = 0, .st = .humidity, .hours = 12 },
-        .{ .floor = 0, .st = .co2, .hours = 50 },
-        .{ .floor = 0, .st = .occupancy, .hours = 1 },
-        .{ .floor = 0, .st = .energy, .hours = 50 },
-    };
-
-    const tolerance: f32 = 1e-5;
-
-    for (test_cases) |tc| {
-        const s_aos = try query_floor_stats(&world_aos, tc.floor, tc.st, tc.hours);
-        const s_soa = try query_floor_stats(&world_soa, tc.floor, tc.st, tc.hours);
-        const s_ts = try query_floor_stats(&world_ts, tc.floor, tc.st, tc.hours);
-        const s_col = try query_floor_stats(&world_col, tc.floor, tc.st, tc.hours);
-        const s_hier = try query_floor_stats(&world_hier, tc.floor, tc.st, tc.hours);
-        const s_rb = try query_floor_stats(&world_rb, tc.floor, tc.st, tc.hours);
-
-        const others = [_]Stats{ s_soa, s_ts, s_col, s_hier, s_rb };
-        for (others) |o| {
-            try std.testing.expectApproxEqAbs(s_aos.min, o.min, tolerance);
-            try std.testing.expectApproxEqAbs(s_aos.max, o.max, tolerance);
-            try std.testing.expectApproxEqAbs(s_aos.avg, o.avg, tolerance);
-        }
-    }
-}
-
-test "query_floor_stats: returns zeros for nonexistent floor" {
-    var world = try World(aos).init(std.testing.allocator);
-    defer world.deinit();
-
-    const dataset = try generateDataset(std.testing.allocator);
-    defer std.testing.allocator.free(dataset);
-    try insertDataset(&world, dataset);
-
-    const result = try query_floor_stats(&world, 999, .temperature, 24);
-    try std.testing.expectEqual(@as(f32, 0.0), result.min);
-    try std.testing.expectEqual(@as(f32, 0.0), result.max);
-    try std.testing.expectEqual(@as(f32, 0.0), result.avg);
-}
-
-test "query_floor_stats: returns zeros for type with no sensors on floor" {
-    var world = try World(soa).init(std.testing.allocator);
-    defer world.deinit();
-
-    const dataset = try generateDataset(std.testing.allocator);
-    defer std.testing.allocator.free(dataset);
-    try insertDataset(&world, dataset);
-
-    // Floor 0 has temperature, humidity, co2, occupancy, energy — but not vibration
-    const result = try query_floor_stats(&world, 0, .vibration, 24);
-    try std.testing.expectEqual(@as(f32, 0.0), result.min);
-    try std.testing.expectEqual(@as(f32, 0.0), result.max);
-    try std.testing.expectEqual(@as(f32, 0.0), result.avg);
-}
-
-// ---------------------------------------------------------------------------
-// Golden-result equivalence tests for Q7 (query_hourly_rollup)
-//
-// RingBuffer is excluded: historical rollup queries span evicted data.
-// Only the five full-retention backends are compared.
-// ---------------------------------------------------------------------------
-
-test "query_hourly_rollup: five supported backends agree on same seeded dataset" {
-    const dataset = try generateDataset(std.testing.allocator);
-    defer std.testing.allocator.free(dataset);
-
-    var world_aos = try World(aos).init(std.testing.allocator);
-    defer world_aos.deinit();
-    var world_soa = try World(soa).init(std.testing.allocator);
-    defer world_soa.deinit();
-    var world_ts = try World(timeseries).init(std.testing.allocator);
-    defer world_ts.deinit();
-    var world_col = try World(columnar).init(std.testing.allocator);
-    defer world_col.deinit();
-    var world_hier = try World(hierarchical).init(std.testing.allocator);
-    defer world_hier.deinit();
-
-    try insertDataset(&world_aos, dataset);
-    try insertDataset(&world_soa, dataset);
-    try insertDataset(&world_ts, dataset);
-    try insertDataset(&world_col, dataset);
-    try insertDataset(&world_hier, dataset);
-
-    // 50 readings/sensor at 1-hour intervals → up to 50 hour buckets.
-    // days=1 → 24h window, days=2 → 48h window.
-    const test_cases = [_]struct { sensor: u32, days: u32 }{
-        .{ .sensor = 0, .days = 1 },
-        .{ .sensor = 0, .days = 2 },
-        .{ .sensor = 3, .days = 1 },
-        .{ .sensor = 9, .days = 2 },
-    };
-
-    for (test_cases) |tc| {
-        const r_aos = try query_hourly_rollup(&world_aos, tc.sensor, tc.days);
-        defer world_aos.allocator.free(r_aos);
-        const r_soa = try query_hourly_rollup(&world_soa, tc.sensor, tc.days);
-        defer world_soa.allocator.free(r_soa);
-        const r_ts = try query_hourly_rollup(&world_ts, tc.sensor, tc.days);
-        defer world_ts.allocator.free(r_ts);
-        const r_col = try query_hourly_rollup(&world_col, tc.sensor, tc.days);
-        defer world_col.allocator.free(r_col);
-        const r_hier = try query_hourly_rollup(&world_hier, tc.sensor, tc.days);
-        defer world_hier.allocator.free(r_hier);
-
-        const ref = r_aos;
-        const others = [_][]HourlyAggregate{ r_soa, r_ts, r_col, r_hier };
-        for (others) |o| {
-            try std.testing.expectEqual(ref.len, o.len);
-            for (0..ref.len) |i| {
-                try std.testing.expectEqual(ref[i].hour_bucket, o[i].hour_bucket);
-                try std.testing.expectApproxEqAbs(ref[i].avg, o[i].avg, 1e-5);
-                try std.testing.expectApproxEqAbs(ref[i].min, o[i].min, 1e-5);
-                try std.testing.expectApproxEqAbs(ref[i].max, o[i].max, 1e-5);
-                try std.testing.expectEqual(ref[i].count, o[i].count);
-            }
-        }
-    }
-}
-
-test "query_hourly_rollup: returns empty for nonexistent sensor" {
-    var world = try World(aos).init(std.testing.allocator);
-    defer world.deinit();
-
-    const dataset = try generateDataset(std.testing.allocator);
-    defer std.testing.allocator.free(dataset);
-    try insertDataset(&world, dataset);
-
-    const result = try query_hourly_rollup(&world, 999, 1);
-    defer world.allocator.free(result);
-    try std.testing.expectEqual(@as(usize, 0), result.len);
-}
-
-// ---------------------------------------------------------------------------
-// Golden-result equivalence tests for Q8 (query_daily_zone_rollup)
-// ---------------------------------------------------------------------------
-
-test "query_daily_zone_rollup: five supported backends agree on same seeded dataset" {
-    const dataset = try generateDataset(std.testing.allocator);
-    defer std.testing.allocator.free(dataset);
-
-    var world_aos = try World(aos).init(std.testing.allocator);
-    defer world_aos.deinit();
-    var world_soa = try World(soa).init(std.testing.allocator);
-    defer world_soa.deinit();
-    var world_ts = try World(timeseries).init(std.testing.allocator);
-    defer world_ts.deinit();
-    var world_col = try World(columnar).init(std.testing.allocator);
-    defer world_col.deinit();
-    var world_hier = try World(hierarchical).init(std.testing.allocator);
-    defer world_hier.deinit();
-
-    try insertDataset(&world_aos, dataset);
-    try insertDataset(&world_soa, dataset);
-    try insertDataset(&world_ts, dataset);
-    try insertDataset(&world_col, dataset);
-    try insertDataset(&world_hier, dataset);
-
-    // Zone 0 = sensors 0–4, Zone 1 = sensors 5–9
-    // 50 readings/sensor at 1-hour intervals → ~2 day buckets per sensor
-    const test_cases = [_]struct { zone: u32, st: sb.SensorType }{
-        .{ .zone = 0, .st = .temperature },
-        .{ .zone = 0, .st = .humidity },
-        .{ .zone = 1, .st = .co2 },
-        .{ .zone = 1, .st = .energy },
-    };
-
-    for (test_cases) |tc| {
-        const r_aos = try query_daily_zone_rollup(&world_aos, tc.zone, tc.st);
-        defer world_aos.allocator.free(r_aos);
-        const r_soa = try query_daily_zone_rollup(&world_soa, tc.zone, tc.st);
-        defer world_soa.allocator.free(r_soa);
-        const r_ts = try query_daily_zone_rollup(&world_ts, tc.zone, tc.st);
-        defer world_ts.allocator.free(r_ts);
-        const r_col = try query_daily_zone_rollup(&world_col, tc.zone, tc.st);
-        defer world_col.allocator.free(r_col);
-        const r_hier = try query_daily_zone_rollup(&world_hier, tc.zone, tc.st);
-        defer world_hier.allocator.free(r_hier);
-
-        const ref = r_aos;
-        const others = [_][]DailyAggregate{ r_soa, r_ts, r_col, r_hier };
-        for (others) |o| {
-            try std.testing.expectEqual(ref.len, o.len);
-            for (0..ref.len) |i| {
-                try std.testing.expectEqual(ref[i].day_bucket, o[i].day_bucket);
-                try std.testing.expectApproxEqAbs(ref[i].avg, o[i].avg, 1e-5);
-                try std.testing.expectApproxEqAbs(ref[i].min, o[i].min, 1e-5);
-                try std.testing.expectApproxEqAbs(ref[i].max, o[i].max, 1e-5);
-                try std.testing.expectEqual(ref[i].count, o[i].count);
-            }
-        }
-    }
-}
-
-test "query_daily_zone_rollup: returns empty for nonexistent zone" {
-    var world = try World(aos).init(std.testing.allocator);
-    defer world.deinit();
-
-    const dataset = try generateDataset(std.testing.allocator);
-    defer std.testing.allocator.free(dataset);
-    try insertDataset(&world, dataset);
-
-    const result = try query_daily_zone_rollup(&world, 999, .temperature);
-    defer world.allocator.free(result);
-    try std.testing.expectEqual(@as(usize, 0), result.len);
-}
-
-test "query_daily_zone_rollup: returns empty for type with no sensors in zone" {
-    var world = try World(soa).init(std.testing.allocator);
-    defer world.deinit();
-
-    const dataset = try generateDataset(std.testing.allocator);
-    defer std.testing.allocator.free(dataset);
-    try insertDataset(&world, dataset);
-
-    // Zone 0 has temperature and humidity, not co2
-    const result = try query_daily_zone_rollup(&world, 0, .co2);
-    defer world.allocator.free(result);
-    try std.testing.expectEqual(@as(usize, 0), result.len);
-}
-
-// ---------------------------------------------------------------------------
-// Golden-result equivalence tests for Q9 (query_spatial_radius)
-//
-// All six backends must return identical sensor ID sets for the same center
-// and radius. The derived sensorPosition() is a pure function of sensor_id,
-// so results are backend-independent.
-// ---------------------------------------------------------------------------
-
-test "query_spatial_radius: all six backends agree on same seeded dataset" {
-    const dataset = try generateDataset(std.testing.allocator);
-    defer std.testing.allocator.free(dataset);
-
-    var world_aos = try World(aos).init(std.testing.allocator);
-    defer world_aos.deinit();
-    var world_soa = try World(soa).init(std.testing.allocator);
-    defer world_soa.deinit();
-    var world_ts = try World(timeseries).init(std.testing.allocator);
-    defer world_ts.deinit();
-    var world_col = try World(columnar).init(std.testing.allocator);
-    defer world_col.deinit();
-    var world_hier = try World(hierarchical).init(std.testing.allocator);
-    defer world_hier.deinit();
-    var world_rb = try World(ringbuffer).init(std.testing.allocator);
-    defer world_rb.deinit();
-
-    try insertDataset(&world_aos, dataset);
-    try insertDataset(&world_soa, dataset);
-    try insertDataset(&world_ts, dataset);
-    try insertDataset(&world_col, dataset);
-    try insertDataset(&world_hier, dataset);
-    try insertDataset(&world_rb, dataset);
-
-    // Test several (center, radius) pairs across the synthetic sensor grid.
-    // Sensors 0–9: x = (id%10)*5, y = (id/10)*3, z = 0.
-    // All 10 sensors sit at y=0 (ids 0–9 → id/10 = 0), x = 0,5,10,15,20,25,30,35,40,45.
-    const test_cases = [_]struct { center: Vec3, radius: f32 }{
-        .{ .center = .{ .x = 0.0, .y = 0.0, .z = 0.0 }, .radius = 1.0 }, // only sensor 0
-        .{ .center = .{ .x = 0.0, .y = 0.0, .z = 0.0 }, .radius = 6.0 }, // sensors 0 and 1
-        .{ .center = .{ .x = 22.5, .y = 0.0, .z = 0.0 }, .radius = 5.0 }, // sensors 4 (x=20) and 5 (x=25)
-        .{ .center = .{ .x = 22.5, .y = 0.0, .z = 0.0 }, .radius = 100.0 }, // all sensors
-        .{ .center = .{ .x = 999.0, .y = 999.0, .z = 0.0 }, .radius = 1.0 }, // no sensors
-    };
-
-    for (test_cases) |tc| {
-        const r_aos = try query_spatial_radius(&world_aos, tc.center, tc.radius);
-        defer world_aos.allocator.free(r_aos);
-        const r_soa = try query_spatial_radius(&world_soa, tc.center, tc.radius);
-        defer world_soa.allocator.free(r_soa);
-        const r_ts = try query_spatial_radius(&world_ts, tc.center, tc.radius);
-        defer world_ts.allocator.free(r_ts);
-        const r_col = try query_spatial_radius(&world_col, tc.center, tc.radius);
-        defer world_col.allocator.free(r_col);
-        const r_hier = try query_spatial_radius(&world_hier, tc.center, tc.radius);
-        defer world_hier.allocator.free(r_hier);
-        const r_rb = try query_spatial_radius(&world_rb, tc.center, tc.radius);
-        defer world_rb.allocator.free(r_rb);
-
-        const ref = r_aos;
-        const others = [_][]EntityId{ r_soa, r_ts, r_col, r_hier, r_rb };
-        for (others) |o| {
-            try std.testing.expectEqual(ref.len, o.len);
-            for (0..ref.len) |i| {
-                try std.testing.expectEqual(ref[i], o[i]);
-            }
-        }
-    }
-}
-
-test "query_spatial_radius: exact boundary sensor included" {
-    var world = try World(aos).init(std.testing.allocator);
-    defer world.deinit();
-
-    // Insert only sensor 0 (position x=0, y=0, z=0)
-    try world.insert(.{ .sensor_id = 0, .timestamp = 1_000_000, .value = 20.0, .sensor_type = .temperature });
-
-    // Center at origin, radius exactly 0.0 — sensor 0 is at distance 0, included.
-    const result = try query_spatial_radius(&world, .{ .x = 0.0, .y = 0.0, .z = 0.0 }, 0.0);
-    defer world.allocator.free(result);
-    try std.testing.expectEqual(@as(usize, 1), result.len);
-    try std.testing.expectEqual(@as(EntityId, 0), result[0]);
-}
-
-test "query_spatial_radius: returns empty when no sensor within radius" {
-    var world = try World(soa).init(std.testing.allocator);
-    defer world.deinit();
-
-    const dataset = try generateDataset(std.testing.allocator);
-    defer std.testing.allocator.free(dataset);
-    try insertDataset(&world, dataset);
-
-    const result = try query_spatial_radius(&world, .{ .x = 999.0, .y = 999.0, .z = 0.0 }, 1.0);
-    defer world.allocator.free(result);
-    try std.testing.expectEqual(@as(usize, 0), result.len);
-}
-
-// ---------------------------------------------------------------------------
-// Golden-result equivalence tests for Q10 (query_zone_hierarchy)
-//
-// All six backends must return identical sensor ID sets for the same
-// (zone_id, depth). HierarchicalStorage is expected to be fastest because
-// its tree index avoids scanning the full dataset.
-// ---------------------------------------------------------------------------
-
-test "query_zone_hierarchy: all six backends agree on same seeded dataset" {
-    const dataset = try generateDataset(std.testing.allocator);
-    defer std.testing.allocator.free(dataset);
-
-    var world_aos = try World(aos).init(std.testing.allocator);
-    defer world_aos.deinit();
-    var world_soa = try World(soa).init(std.testing.allocator);
-    defer world_soa.deinit();
-    var world_ts = try World(timeseries).init(std.testing.allocator);
-    defer world_ts.deinit();
-    var world_col = try World(columnar).init(std.testing.allocator);
-    defer world_col.deinit();
-    var world_hier = try World(hierarchical).init(std.testing.allocator);
-    defer world_hier.deinit();
-    var world_rb = try World(ringbuffer).init(std.testing.allocator);
-    defer world_rb.deinit();
-
-    try insertDataset(&world_aos, dataset);
-    try insertDataset(&world_soa, dataset);
-    try insertDataset(&world_ts, dataset);
-    try insertDataset(&world_col, dataset);
-    try insertDataset(&world_hier, dataset);
-    try insertDataset(&world_rb, dataset);
-
-    // SENSORS_PER_ZONE=5, ZONES_PER_FLOOR=2 → zone 0 = sensors 0–4,
-    // zone 1 = sensors 5–9. Both zones on floor 0.
-    const test_cases = [_]struct { zone: u32, depth: u32 }{
-        .{ .zone = 0, .depth = 0 }, // sensors 0–4
-        .{ .zone = 1, .depth = 0 }, // sensors 5–9
-        .{ .zone = 0, .depth = 1 }, // floor 0 → sensors 0–9 (both zones)
-        .{ .zone = 1, .depth = 1 }, // floor 0 → sensors 0–9 (same floor)
-        .{ .zone = 0, .depth = 2 }, // building root → all sensors
-        .{ .zone = 0, .depth = 9 }, // depth overflow → all sensors
-    };
-
-    for (test_cases) |tc| {
-        const r_aos = try query_zone_hierarchy(&world_aos, tc.zone, tc.depth);
-        defer world_aos.allocator.free(r_aos);
-        const r_soa = try query_zone_hierarchy(&world_soa, tc.zone, tc.depth);
-        defer world_soa.allocator.free(r_soa);
-        const r_ts = try query_zone_hierarchy(&world_ts, tc.zone, tc.depth);
-        defer world_ts.allocator.free(r_ts);
-        const r_col = try query_zone_hierarchy(&world_col, tc.zone, tc.depth);
-        defer world_col.allocator.free(r_col);
-        const r_hier = try query_zone_hierarchy(&world_hier, tc.zone, tc.depth);
-        defer world_hier.allocator.free(r_hier);
-        const r_rb = try query_zone_hierarchy(&world_rb, tc.zone, tc.depth);
-        defer world_rb.allocator.free(r_rb);
-
-        const ref = r_aos;
-        const others = [_][]EntityId{ r_soa, r_ts, r_col, r_hier, r_rb };
-        for (others) |o| {
-            try std.testing.expectEqual(ref.len, o.len);
-            for (0..ref.len) |i| {
-                try std.testing.expectEqual(ref[i], o[i]);
-            }
-        }
-    }
-}
-
-test "query_zone_hierarchy: depth 0 returns only sensors in the requested zone" {
-    var world = try World(aos).init(std.testing.allocator);
-    defer world.deinit();
-
-    const dataset = try generateDataset(std.testing.allocator);
-    defer std.testing.allocator.free(dataset);
-    try insertDataset(&world, dataset);
-
-    // Zone 0 = sensors 0–4 (sensor_id / SENSORS_PER_ZONE == 0)
-    const result = try query_zone_hierarchy(&world, 0, 0);
-    defer world.allocator.free(result);
-    try std.testing.expectEqual(@as(usize, SENSORS_PER_ZONE), result.len);
-    for (0..SENSORS_PER_ZONE) |i| {
-        try std.testing.expectEqual(@as(EntityId, @intCast(i)), result[i]);
-    }
-}
-
-test "query_zone_hierarchy: depth 1 returns all sensors on the floor" {
-    var world = try World(soa).init(std.testing.allocator);
-    defer world.deinit();
-
-    const dataset = try generateDataset(std.testing.allocator);
-    defer std.testing.allocator.free(dataset);
-    try insertDataset(&world, dataset);
-
-    // Zone 0 is on floor 0. Floor 0 contains zones 0 and 1 → sensors 0–9.
-    const result = try query_zone_hierarchy(&world, 0, 1);
-    defer world.allocator.free(result);
-    try std.testing.expectEqual(@as(usize, NUM_SENSORS), result.len);
-    for (0..NUM_SENSORS) |i| {
-        try std.testing.expectEqual(@as(EntityId, @intCast(i)), result[i]);
-    }
-}
-
-test "query_zone_hierarchy: depth 2 returns all sensors" {
-    var world = try World(hierarchical).init(std.testing.allocator);
-    defer world.deinit();
-
-    const dataset = try generateDataset(std.testing.allocator);
-    defer std.testing.allocator.free(dataset);
-    try insertDataset(&world, dataset);
-
-    const result = try query_zone_hierarchy(&world, 0, 2);
-    defer world.allocator.free(result);
-    try std.testing.expectEqual(@as(usize, NUM_SENSORS), result.len);
-}
-
-test "query_zone_hierarchy: nonexistent zone returns empty" {
-    var world = try World(aos).init(std.testing.allocator);
-    defer world.deinit();
-
-    const dataset = try generateDataset(std.testing.allocator);
-    defer std.testing.allocator.free(dataset);
-    try insertDataset(&world, dataset);
-
-    const result = try query_zone_hierarchy(&world, 999, 0);
-    defer world.allocator.free(result);
-    try std.testing.expectEqual(@as(usize, 0), result.len);
-}
-
-// ---------------------------------------------------------------------------
-// Golden-result equivalence tests for Q11 (query_anomalies) and Q12
-// (query_threshold_breach). Anomaly queries are pure scans, so all six
-// backends — including RingBuffer (no eviction at this dataset size) — agree.
-// ---------------------------------------------------------------------------
-
-test "query_anomalies: all six backends agree on same seeded dataset" {
-    const ds = try generateDataset(std.testing.allocator);
-    defer std.testing.allocator.free(ds);
-
-    var world_aos = try World(aos).init(std.testing.allocator);
-    defer world_aos.deinit();
-    var world_soa = try World(soa).init(std.testing.allocator);
-    defer world_soa.deinit();
-    var world_ts = try World(timeseries).init(std.testing.allocator);
-    defer world_ts.deinit();
-    var world_col = try World(columnar).init(std.testing.allocator);
-    defer world_col.deinit();
-    var world_hier = try World(hierarchical).init(std.testing.allocator);
-    defer world_hier.deinit();
-    var world_rb = try World(ringbuffer).init(std.testing.allocator);
-    defer world_rb.deinit();
-
-    try insertDataset(&world_aos, ds);
-    try insertDataset(&world_soa, ds);
-    try insertDataset(&world_ts, ds);
-    try insertDataset(&world_col, ds);
-    try insertDataset(&world_hier, ds);
-    try insertDataset(&world_rb, ds);
-
-    const cases = [_]struct { st: sb.SensorType, sigma: f32 }{
-        .{ .st = .temperature, .sigma = 1.0 },
-        .{ .st = .temperature, .sigma = 2.0 },
-        .{ .st = .humidity, .sigma = 0.5 },
-        .{ .st = .co2, .sigma = 1.0 },
-        .{ .st = .occupancy, .sigma = 0.8 },
-        .{ .st = .vibration, .sigma = 1.0 },
-    };
-
-    // 72h comfortably covers the fixture's full 50h span (dataset.zig's
-    // READINGS_PER_SENSOR=50 hourly readings), so every backend's window
-    // includes the same readings the old whole-history version scanned.
-    const window_hours: u32 = 72;
-
-    for (cases) |tc| {
-        const r_aos = try query_anomalies(&world_aos, tc.st, tc.sigma, window_hours);
-        defer world_aos.allocator.free(r_aos);
-        const r_soa = try query_anomalies(&world_soa, tc.st, tc.sigma, window_hours);
-        defer world_soa.allocator.free(r_soa);
-        const r_ts = try query_anomalies(&world_ts, tc.st, tc.sigma, window_hours);
-        defer world_ts.allocator.free(r_ts);
-        const r_col = try query_anomalies(&world_col, tc.st, tc.sigma, window_hours);
-        defer world_col.allocator.free(r_col);
-        const r_hier = try query_anomalies(&world_hier, tc.st, tc.sigma, window_hours);
-        defer world_hier.allocator.free(r_hier);
-        const r_rb = try query_anomalies(&world_rb, tc.st, tc.sigma, window_hours);
-        defer world_rb.allocator.free(r_rb);
-
-        const ref = r_aos;
-        const others = [_][]AnomalyResult{ r_soa, r_ts, r_col, r_hier, r_rb };
-        for (others) |o| {
-            try std.testing.expectEqual(ref.len, o.len);
-            for (0..ref.len) |i| {
-                try std.testing.expectEqual(ref[i].reading.sensor_id, o[i].reading.sensor_id);
-                try std.testing.expectEqual(ref[i].reading.timestamp, o[i].reading.timestamp);
-                try std.testing.expectApproxEqAbs(ref[i].reading.value, o[i].reading.value, 1e-5);
-                try std.testing.expectApproxEqAbs(ref[i].z_score, o[i].z_score, 1e-4);
-            }
-        }
-    }
-}
-
-test "query_anomalies: returns empty when fewer than 2 readings of the type" {
-    var world = try World(aos).init(std.testing.allocator);
-    defer world.deinit();
-    try world.insert(.{ .sensor_id = 0, .timestamp = 1, .value = 100.0, .sensor_type = .temperature });
-    const r = try query_anomalies(&world, .temperature, 1.0, 24);
-    defer world.allocator.free(r);
-    try std.testing.expectEqual(@as(usize, 0), r.len);
-}
-
-test "query_anomalies: returns empty when all values are identical" {
-    var world = try World(soa).init(std.testing.allocator);
-    defer world.deinit();
-    try world.insert(.{ .sensor_id = 0, .timestamp = 1, .value = 42.0, .sensor_type = .temperature });
-    try world.insert(.{ .sensor_id = 0, .timestamp = 2, .value = 42.0, .sensor_type = .temperature });
-    try world.insert(.{ .sensor_id = 0, .timestamp = 3, .value = 42.0, .sensor_type = .temperature });
-    const r = try query_anomalies(&world, .temperature, 0.1, 24);
-    defer world.allocator.free(r);
-    try std.testing.expectEqual(@as(usize, 0), r.len);
-}
-
-test "query_anomalies: high-sigma threshold filters out modest deviations" {
-    var world = try World(aos).init(std.testing.allocator);
-    defer world.deinit();
-    var i: u32 = 0;
-    while (i < 19) : (i += 1) {
-        try world.insert(.{ .sensor_id = 1, .timestamp = @as(i64, i), .value = 10.0, .sensor_type = .temperature });
-    }
-    try world.insert(.{ .sensor_id = 1, .timestamp = 100, .value = 1000.0, .sensor_type = .temperature });
-
-    const high = try query_anomalies(&world, .temperature, 2.0, 24);
-    defer world.allocator.free(high);
-    try std.testing.expectEqual(@as(usize, 1), high.len);
-    try std.testing.expectEqual(@as(f32, 1000.0), high[0].reading.value);
-
-    const huge = try query_anomalies(&world, .temperature, 1000.0, 24);
-    defer world.allocator.free(huge);
-    try std.testing.expectEqual(@as(usize, 0), huge.len);
-}
-
-test "query_threshold_breach: all six backends agree on same seeded dataset" {
-    const ds = try generateDataset(std.testing.allocator);
-    defer std.testing.allocator.free(ds);
-
-    var world_aos = try World(aos).init(std.testing.allocator);
-    defer world_aos.deinit();
-    var world_soa = try World(soa).init(std.testing.allocator);
-    defer world_soa.deinit();
-    var world_ts = try World(timeseries).init(std.testing.allocator);
-    defer world_ts.deinit();
-    var world_col = try World(columnar).init(std.testing.allocator);
-    defer world_col.deinit();
-    var world_hier = try World(hierarchical).init(std.testing.allocator);
-    defer world_hier.deinit();
-    var world_rb = try World(ringbuffer).init(std.testing.allocator);
-    defer world_rb.deinit();
-
-    try insertDataset(&world_aos, ds);
-    try insertDataset(&world_soa, ds);
-    try insertDataset(&world_ts, ds);
-    try insertDataset(&world_col, ds);
-    try insertDataset(&world_hier, ds);
-    try insertDataset(&world_rb, ds);
-
-    const cases = [_]struct { sensor: u32, threshold: f32, min_dur_hours: i64 }{
-        .{ .sensor = 0, .threshold = 9.5, .min_dur_hours = 1 },
-        .{ .sensor = 0, .threshold = 9.5, .min_dur_hours = 24 },
-        .{ .sensor = 5, .threshold = 14.5, .min_dur_hours = 10 },
-        .{ .sensor = 9, .threshold = 100.0, .min_dur_hours = 1 },
-    };
-
-    // 72h comfortably covers the fixture's full 50h span (dataset.zig's
-    // READINGS_PER_SENSOR=50 hourly readings) — same reasoning as
-    // query_anomalies' golden test, so every backend's window includes the
-    // same readings the old unbounded version scanned.
-    const window_hours: u32 = 72;
-
-    for (cases) |tc| {
-        const min_dur_ms = tc.min_dur_hours * 60 * 60 * 1000;
-        const r_aos = try query_threshold_breach(&world_aos, tc.sensor, tc.threshold, min_dur_ms, window_hours);
-        const r_soa = try query_threshold_breach(&world_soa, tc.sensor, tc.threshold, min_dur_ms, window_hours);
-        const r_ts = try query_threshold_breach(&world_ts, tc.sensor, tc.threshold, min_dur_ms, window_hours);
-        const r_col = try query_threshold_breach(&world_col, tc.sensor, tc.threshold, min_dur_ms, window_hours);
-        const r_hier = try query_threshold_breach(&world_hier, tc.sensor, tc.threshold, min_dur_ms, window_hours);
-        const r_rb = try query_threshold_breach(&world_rb, tc.sensor, tc.threshold, min_dur_ms, window_hours);
-
-        const others = [_]?BreachEvent{ r_soa, r_ts, r_col, r_hier, r_rb };
-        if (r_aos) |ref| {
-            for (others) |o| {
-                try std.testing.expect(o != null);
-                try std.testing.expectEqual(ref.sensor_id, o.?.sensor_id);
-                try std.testing.expectEqual(ref.start_ts, o.?.start_ts);
-                try std.testing.expectEqual(ref.end_ts, o.?.end_ts);
-                try std.testing.expectEqual(ref.duration_ms, o.?.duration_ms);
-                try std.testing.expectApproxEqAbs(ref.peak_value, o.?.peak_value, 1e-5);
-            }
-        } else {
-            for (others) |o| try std.testing.expect(o == null);
-        }
-    }
-}
-
-test "query_threshold_breach: returns null for sensor with no readings" {
-    var world = try World(aos).init(std.testing.allocator);
-    defer world.deinit();
-    const r = try query_threshold_breach(&world, 0, 0.0, 0, 24);
-    try std.testing.expect(r == null);
-}
-
-test "query_threshold_breach: returns the first sustained run, not later ones" {
-    var world = try World(soa).init(std.testing.allocator);
-    defer world.deinit();
-    try world.insert(.{ .sensor_id = 7, .timestamp = 0, .value = 100.0, .sensor_type = .temperature });
-    try world.insert(.{ .sensor_id = 7, .timestamp = 10, .value = 5.0, .sensor_type = .temperature });
-    try world.insert(.{ .sensor_id = 7, .timestamp = 100, .value = 100.0, .sensor_type = .temperature });
-    try world.insert(.{ .sensor_id = 7, .timestamp = 200, .value = 110.0, .sensor_type = .temperature });
-    try world.insert(.{ .sensor_id = 7, .timestamp = 300, .value = 105.0, .sensor_type = .temperature });
-    try world.insert(.{ .sensor_id = 7, .timestamp = 400, .value = 5.0, .sensor_type = .temperature });
-    try world.insert(.{ .sensor_id = 7, .timestamp = 500, .value = 200.0, .sensor_type = .temperature });
-    try world.insert(.{ .sensor_id = 7, .timestamp = 600, .value = 250.0, .sensor_type = .temperature });
-    try world.insert(.{ .sensor_id = 7, .timestamp = 700, .value = 5.0, .sensor_type = .temperature });
-
-    const r = (try query_threshold_breach(&world, 7, 50.0, 150, 24)).?;
-    try std.testing.expectEqual(@as(i64, 100), r.start_ts);
-    try std.testing.expectEqual(@as(i64, 300), r.end_ts);
-    try std.testing.expectEqual(@as(i64, 200), r.duration_ms);
-    try std.testing.expectEqual(@as(f32, 110.0), r.peak_value);
-}
-
-test "query_threshold_breach: returns null when no run meets min_duration_ms" {
-    var world = try World(aos).init(std.testing.allocator);
-    defer world.deinit();
-    try world.insert(.{ .sensor_id = 3, .timestamp = 0, .value = 99.0, .sensor_type = .temperature });
-    try world.insert(.{ .sensor_id = 3, .timestamp = 10, .value = 99.0, .sensor_type = .temperature });
-    try world.insert(.{ .sensor_id = 3, .timestamp = 20, .value = 1.0, .sensor_type = .temperature });
-    const r = try query_threshold_breach(&world, 3, 50.0, 1000, 24);
-    try std.testing.expect(r == null);
-}

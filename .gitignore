@@ -3,3 +3,8 @@ zig-out/
 benchmark-results/
 graphify-out/
 *.ifc
+
+# Run outputs from dt.exe --out <dir> — regenerable artifacts, never tracked.
+smoke-out*/
+hospital-out*/
+house-results/

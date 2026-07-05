@@ -192,13 +192,29 @@ fn pickTypeSamples(
 /// across every DISTINCT sensor type actually placed — derived from what
 /// was parsed, not declared via a building-type guess. See
 /// synthetic/generator.zig's SensorProfile.relevant_queries doc comment.
+///
+/// Deduplicated by QUERY PATTERN, not just by sensor type: several types'
+/// relevant_queries overlap on the same building-level pattern (e.g.
+/// `anomalies` appears in temperature/co2/air_quality/vibration/energy/
+/// structural's lists). Every building-level query in this mix runs once
+/// per checkpoint against the SAME fixed `overall_sample` regardless of
+/// which type contributed it (see simulation.zig's runOne) — so a query
+/// pattern appearing from N types produced N byte-identical, redundant
+/// measurements, not N different ones. On a real multi-type building (e.g.
+/// a hospital placing most of the 9 sensor types) this multiplied the
+/// per-checkpoint query count several-fold for zero additional
+/// information — confirmed as the dominant cost once Steps 1-3 of the
+/// sim-perf-overhaul fixed generation. Kept: the highest weight seen across
+/// contributing types (a query several types consider high-priority should
+/// stay weighted accordingly, not get diluted by whichever type happened
+/// to contribute it first).
+///
 /// Caller frees with `allocator`.
 fn deriveQueryMix(allocator: std.mem.Allocator, placement: placer.Placement) ![]queries.QueryWeight {
     var seen_types: std.ArrayList(sb.SensorType) = .empty;
     defer seen_types.deinit(allocator);
 
-    var mix: std.ArrayList(queries.QueryWeight) = .empty;
-    errdefer mix.deinit(allocator);
+    var by_query: [std.enums.values(queries.QueryName).len]?queries.QueryWeight = @splat(null);
 
     for (placement.sensors) |sensor| {
         var found = false;
@@ -212,8 +228,17 @@ fn deriveQueryMix(allocator: std.mem.Allocator, placement: placer.Placement) ![]
         try seen_types.append(allocator, sensor.sensor_type);
 
         for (synthetic.profileFor(sensor.sensor_type).relevant_queries) |qw| {
-            try mix.append(allocator, qw);
+            const idx = @intFromEnum(qw.query);
+            if (by_query[idx] == null or qw.weight > by_query[idx].?.weight) {
+                by_query[idx] = qw;
+            }
         }
+    }
+
+    var mix: std.ArrayList(queries.QueryWeight) = .empty;
+    errdefer mix.deinit(allocator);
+    for (by_query) |maybe_qw| {
+        if (maybe_qw) |qw| try mix.append(allocator, qw);
     }
 
     return mix.toOwnedSlice(allocator);
@@ -278,13 +303,6 @@ const full_retention_names = blk: {
     for (runner.supported_backends, 0..) |b, i| names[i] = b.name;
     break :blk names;
 };
-
-fn isSupported(comptime b: runner.BackendEntry) bool {
-    for (runner.supported_backends) |sup| {
-        if (std.mem.eql(u8, sup.name, b.name)) return true;
-    }
-    return false;
-}
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
@@ -380,33 +398,28 @@ pub fn main(init: std.process.Init) !void {
     defer sim_stats.deinit(allocator);
     var type_volumes: std.ArrayList(sim.TypeVolume) = .empty;
     defer type_volumes.deinit(allocator);
+    var type_quality: std.ArrayList(sim.TypeQuality) = .empty;
+    defer type_quality.deinit(allocator);
 
-    var digests = try sim.DigestTable.init(allocator, checkpoints.len, query_mix.len);
-    defer digests.deinit(allocator);
-
-    inline for (runner.backends) |b| {
-        try sim.simulateBackend(
-            b,
-            isSupported(b),
-            allocator,
-            io,
-            placement.sensors,
-            placement.locations,
-            zone_floor,
-            query_mix,
-            overall_sample,
-            type_samples,
-            scale_label,
-            seed,
-            checkpoints,
-            &digests,
-            &rows,
-            &type_rows,
-            &growth,
-            &sim_stats,
-            &type_volumes,
-        );
-    }
+    try sim.simulateAllBackends(
+        allocator,
+        io,
+        placement.sensors,
+        placement.locations,
+        zone_floor,
+        query_mix,
+        overall_sample,
+        type_samples,
+        scale_label,
+        seed,
+        checkpoints,
+        &rows,
+        &type_rows,
+        &growth,
+        &sim_stats,
+        &type_volumes,
+        &type_quality,
+    );
 
     std.debug.print("\n[5/6] Computing recommendations...\n", .{});
     const compound = try report.recommendCompound(allocator, rows.items, scale_label, query_mix, &full_retention_names);
@@ -464,7 +477,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     std.debug.print("\n[6/6] Writing reports...\n", .{});
-    try writeRecommendationReport(allocator, io, args.output_dir, args.bim_path, scale_label, model, placement, compound, rows.items, type_recommendations.items, growth.items, sim_stats.items, type_volumes.items);
+    try writeRecommendationReport(allocator, io, args.output_dir, args.bim_path, scale_label, model, placement, compound, rows.items, type_recommendations.items, growth.items, sim_stats.items, type_volumes.items, type_quality.items);
     std.debug.print("  Wrote recommendation.md + simulation.json to {s}/\n", .{args.output_dir});
 
     const sd = try buildSchematicData(allocator, model, placement, zone_floor);
@@ -499,6 +512,7 @@ fn writeRecommendationReport(
     growth: []const sim.GrowthPoint,
     sim_stats: []const sim.SimStats,
     type_volumes: []const sim.TypeVolume,
+    type_quality: []const sim.TypeQuality,
 ) !void {
     var md: std.ArrayList(u8) = .empty;
     defer md.deinit(allocator);
@@ -600,6 +614,24 @@ fn writeRecommendationReport(
         });
     }
 
+    // Explicit per-query winner — the direct answer to "which backend for
+    // this query behavior": for each query pattern this building actually
+    // runs, the single fastest backend at steady state, not left for the
+    // reader to eyeball out of the raw latency table above. Same grouping
+    // logic the internal regression-suite report already uses
+    // (report.writeReports), reused rather than reimplemented. Non-real-time
+    // queries only admit full-retention backends — same eligibility rule the
+    // compound recommendation applies, so a count-capped cache that scanned
+    // 200x less data can't be presented as a "winner" (see writeWinners's
+    // doc comment).
+    try md.print(allocator, "\n### Per-query winner (lowest median)\n\n", .{});
+    try md.print(allocator, "For queries outside the real-time family, only full-retention backends compete " ++
+        "(same rule as the recommendation tracks above) — the real-time cache holds a fraction " ++
+        "of the data those queries need, so its latency on them is not comparable.\n\n", .{});
+    try md.print(allocator, "| Query | Winner | Median µs | Runner-up | Median µs | Speedup |\n", .{});
+    try md.print(allocator, "|---|---|---:|---|---:|---:|\n", .{});
+    try report.writeWinners(&md, allocator, rows, scale_label, &full_retention_names);
+
     try md.print(allocator, "\nSee `schematic.svg` in this directory for a floor-by-floor map of placed sensors.\n", .{});
 
     // Cost estimate — cloud-equivalent $/year per backend + naive vs optimised
@@ -633,8 +665,8 @@ fn writeRecommendationReport(
     var dir = try cwd.openDir(io, output_dir, .{});
     defer dir.close(io);
     try report.writeGrowthSection(&md, allocator, growth);
-    try report.writeSimSection(&md, allocator, sim_stats, type_volumes);
+    try report.writeSimSection(&md, allocator, sim_stats, type_volumes, type_quality);
 
     try dir.writeFile(io, .{ .sub_path = "recommendation.md", .data = md.items });
-    try report.writeSimJson(allocator, io, &dir, sim_stats, growth, type_volumes);
+    try report.writeSimJson(allocator, io, &dir, sim_stats, growth, type_volumes, type_quality);
 }
