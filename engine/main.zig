@@ -401,9 +401,27 @@ pub fn main(init: std.process.Init) !void {
     var type_quality: std.ArrayList(sim.TypeQuality) = .empty;
     defer type_quality.deinit(allocator);
 
+    // The output dir doubles as home for the simulation's replay cache
+    // (generated stream spilled once, replayed by backends 2..N — see
+    // simulateAllBackends), so it must exist before the simulation, not
+    // just before report writing. The cache is deleted right after the
+    // simulation; failure to delete is a warning, not a run failure.
+    const cwd = std.Io.Dir.cwd();
+    cwd.createDirPath(io, args.output_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+    var out_dir = try cwd.openDir(io, args.output_dir, .{});
+    defer out_dir.close(io);
+
+    defer out_dir.deleteFile(io, sim.REPLAY_FILE_NAME) catch |err| {
+        std.debug.print("  warning: could not delete {s}/{s}: {s}\n", .{ args.output_dir, sim.REPLAY_FILE_NAME, @errorName(err) });
+    };
+
     try sim.simulateAllBackends(
         allocator,
         io,
+        out_dir,
         placement.sensors,
         placement.locations,
         zone_floor,

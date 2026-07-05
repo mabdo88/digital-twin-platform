@@ -359,21 +359,32 @@ pub fn runOne(
 // ---------------------------------------------------------------------------
 // The simulation itself.
 //
-// Step 2 of the sim-perf-overhaul: every backend used to own its own
-// synthetic.Stream and independently regenerate the ENTIRE deterministic
-// multi-year feed from scratch (5x redundant generation for identical
-// output — only ingest genuinely differs per backend). Now there is a
-// single shared Stream and a single day loop: each simulated day's readings
-// are generated exactly once (`stream.nextChunk`) and fanned out to every
-// backend's own timed insert. Ingest/prune/query timing stays per-backend
-// and per-day exactly as before; only the (previously redundant) generation
-// work is now shared.
+// Steps 2 + memory fix of the sim-perf-overhaul: every backend used to own
+// its own synthetic.Stream and independently regenerate the ENTIRE
+// deterministic multi-year feed from scratch (5x redundant generation for
+// identical output — only ingest genuinely differs per backend). An
+// interim design shared one day loop across all backends simultaneously,
+// which fixed the redundant generation but kept every backend's full
+// multi-year history resident in RAM at the same time — ~4 full-retention
+// copies (~12-14GB at hospital scale), more than a 16GB machine holds.
+//
+// Current design: backends run SEQUENTIALLY, one full timeline each, so
+// peak memory is ONE backend's history plus one day's chunk — while
+// generation still happens exactly once. The first backend consumes the
+// live Stream, and each day's accepted readings are simultaneously spilled
+// to an on-disk replay file (length-prefixed raw SensorReading records);
+// every subsequent backend replays that file day-by-day. Byte-identical
+// input for every backend by construction (same seed wrote the file), so
+// results stay apples-to-apples and deterministic. The replay file is a
+// generation cache, not a storage backend — every backend still ingests
+// into RAM and is queried in RAM (CLAUDE.md §6's do-not-measure list is
+// untouched; file I/O happens between timed sections, never inside
+// metrics.timeQuery/timeMutation).
 // ---------------------------------------------------------------------------
 
 /// timeMutation callable — inserts one already-generated day's chunk into
-/// one backend's World, timed. Generation itself happens once, upstream in
-/// simulateAllBackends' day loop — this only measures this backend's own
-/// insert cost, not shared generation cost.
+/// one backend's World, timed. Generation/replay happens upstream in the
+/// day loop — this only measures this backend's own insert cost.
 fn IngestChunkCall(comptime W: type) type {
     return struct {
         world: *W,
@@ -399,45 +410,6 @@ fn PruneCall(comptime W: type) type {
 
 const SENSOR_TYPE_COUNT = std.enums.values(sb.SensorType).len;
 
-/// Per-backend mutable state carried across the shared day loop —
-/// everything simulateBackend used to keep in function-local variables,
-/// now living long enough to survive across every backend's turn within
-/// the same simulated day.
-fn BackendRunState(comptime T: type) type {
-    return struct {
-        world: World(T),
-        stats: SimStats,
-        /// Per-type prune bookkeeping, in sim-relative ms. The SCHEDULE
-        /// (shouldPrune's threshold) depends only on simulated time and is
-        /// identical across backends; the watermark of when THIS backend
-        /// last actually pruned is still tracked per backend since prune
-        /// calls are individually timed and independently scheduled around
-        /// slack.
-        last_prune: [SENSOR_TYPE_COUNT]i64 = @splat(0),
-    };
-}
-
-fn typeForBackend(comptime name: []const u8) type {
-    inline for (runner.backends) |b| {
-        if (std.mem.eql(u8, b.name, name)) return b.T;
-    }
-    @compileError("simulateAllBackends: no registered backend named " ++ name ++
-        " — keep AllBackendStates' fields in sync with runner.zig's backends list");
-}
-
-/// One named field per entry in runner.backends — hand-written rather than
-/// built via @Type/comptime reflection. runner.backends is explicitly "the
-/// single place all backends are registered" and changes rarely; adding a
-/// backend means adding one line here too, and typeForBackend turns a
-/// forgotten one into a clear @compileError rather than a silent mismatch.
-const AllBackendStates = struct {
-    TimeSeries: BackendRunState(typeForBackend("TimeSeries")),
-    Columnar: BackendRunState(typeForBackend("Columnar")),
-    Hierarchical: BackendRunState(typeForBackend("Hierarchical")),
-    RingBuffer: BackendRunState(typeForBackend("RingBuffer")),
-    Lake: BackendRunState(typeForBackend("Lake")),
-};
-
 fn isHistoricalSupported(comptime b: runner.BackendEntry) bool {
     inline for (runner.supported_backends) |sup| {
         if (std.mem.eql(u8, sup.name, b.name)) return true;
@@ -445,16 +417,128 @@ fn isHistoricalSupported(comptime b: runner.BackendEntry) bool {
     return false;
 }
 
+/// Name of the replay-cache file created inside the caller-provided
+/// directory for the duration of one simulateAllBackends run. Exposed so
+/// main.zig can clean it up (it lives in the run's output dir).
+pub const REPLAY_FILE_NAME = "replay-cache.tmp";
+
+/// Per-type ingest quality tally, accumulated during generation only (the
+/// first backend's pass) — rejection is a property of the reading itself,
+/// identical for every backend.
+const QualityAccum = struct { generated: u64 = 0, rejected: u64 = 0 };
+
+/// Append-side of the on-disk replay cache. One frame per simulated day:
+/// a 16-byte header (u64 raw generated count — pre-validation, so replaying
+/// backends can report the same generated/rejected stats as the generating
+/// one — then u64 accepted count) followed by that many raw SensorReading
+/// structs (std.mem.sliceAsBytes — same process, same ABI, never persisted
+/// beyond the run, so raw in-memory layout is safe and zero-cost).
+const ReplayWriter = struct {
+    file: std.Io.File,
+    io: std.Io,
+    offset: u64 = 0,
+
+    fn appendChunk(self: *ReplayWriter, generated: u64, chunk: []const sb.SensorReading) !void {
+        const header: [16]u8 = @bitCast([2]u64{ generated, chunk.len });
+        try self.file.writePositionalAll(self.io, &header, self.offset);
+        self.offset += header.len;
+        const bytes = std.mem.sliceAsBytes(chunk);
+        try self.file.writePositionalAll(self.io, bytes, self.offset);
+        self.offset += bytes.len;
+    }
+};
+
+/// Read-side cursor over the replay cache — one per replaying backend,
+/// starting at offset 0. nextChunk returns exactly the day frames
+/// appendChunk wrote, in order.
+const ReplayCursor = struct {
+    file: std.Io.File,
+    io: std.Io,
+    offset: u64 = 0,
+
+    fn nextChunk(self: *ReplayCursor, allocator: std.mem.Allocator, generated_out: *u64) ![]sb.SensorReading {
+        var header: [16]u8 = undefined;
+        const header_read = try self.file.readPositionalAll(self.io, &header, self.offset);
+        if (header_read != header.len) return error.ReplayCacheTruncated;
+        self.offset += header.len;
+
+        const counts: [2]u64 = @bitCast(header);
+        generated_out.* = counts[0];
+        const chunk = try allocator.alloc(sb.SensorReading, counts[1]);
+        errdefer allocator.free(chunk);
+        const bytes = std.mem.sliceAsBytes(chunk);
+        const body_read = try self.file.readPositionalAll(self.io, bytes, self.offset);
+        if (body_read != bytes.len) return error.ReplayCacheTruncated;
+        self.offset += bytes.len;
+
+        return chunk;
+    }
+};
+
+/// Where one backend's day loop gets its readings: the first backend
+/// generates (validating, tallying quality, and spilling to the replay
+/// file as it goes); every later backend replays the file. Both variants
+/// return the identical accepted-readings chunk for a given day.
+const DaySource = union(enum) {
+    generate: struct {
+        stream: *synthetic.Stream,
+        writer: *ReplayWriter,
+        quality: *[SENSOR_TYPE_COUNT]QualityAccum,
+    },
+    replay: ReplayCursor,
+
+    /// Caller frees the returned slice. `generated_out` reports how many
+    /// readings the stream produced BEFORE ingest validation (equals the
+    /// returned slice's length in replay mode, where rejected readings
+    /// were never written).
+    fn nextChunk(self: *DaySource, allocator: std.mem.Allocator, day_end: i64, generated_out: *u64) ![]sb.SensorReading {
+        switch (self.*) {
+            .generate => |g| {
+                const raw = try g.stream.nextChunk(allocator, day_end);
+                defer allocator.free(raw);
+                generated_out.* = raw.len;
+
+                // Ingest validation (see ingest_system.zig): rejected
+                // readings never reach ANY backend — they are neither
+                // ingested here nor written to the replay file.
+                var accepted: std.ArrayList(sb.SensorReading) = .empty;
+                errdefer accepted.deinit(allocator);
+                for (raw) |r| {
+                    g.quality[@intFromEnum(r.sensor_type)].generated += 1;
+                    if (ingest_system.shouldAccept(r)) {
+                        try accepted.append(allocator, r);
+                    } else {
+                        g.quality[@intFromEnum(r.sensor_type)].rejected += 1;
+                    }
+                }
+
+                const owned = try accepted.toOwnedSlice(allocator);
+                errdefer allocator.free(owned);
+                try g.writer.appendChunk(raw.len, owned);
+                return owned;
+            },
+            .replay => |*cursor| {
+                return cursor.nextChunk(allocator, generated_out);
+            },
+        }
+    }
+};
+
 /// Simulate every registered backend through the building's whole day-zero
-/// timeline together: one shared Stream generates each simulated day's
-/// readings once, fanned out to every backend's own timed insert, prune,
-/// and (at checkpoints) query benchmarking. The final (steady-state)
-/// checkpoint additionally times the type-scoped per-type queries and emits
-/// the RunRows that feed recommendCompound — the headline recommendation is
-/// grounded in steady state; earlier checkpoints only feed the growth curve.
+/// timeline, SEQUENTIALLY: the first backend consumes the live Stream
+/// (spilling each day's accepted readings to a replay file in
+/// `replay_dir`); every later backend replays that file — generation
+/// happens once, but only ONE backend's history is ever resident in RAM.
+/// The final (steady-state) checkpoint additionally times the type-scoped
+/// per-type queries and emits the RunRows that feed recommendCompound —
+/// the headline recommendation is grounded in steady state; earlier
+/// checkpoints only feed the growth curve.
+///
+/// The caller owns `replay_dir` and deletes REPLAY_FILE_NAME after the run.
 pub fn simulateAllBackends(
     allocator: std.mem.Allocator,
     io: std.Io,
+    replay_dir: std.Io.Dir,
     sensors: []const components.SensorMetadata,
     locations: []const components.ZoneLocation,
     zone_floor: []const ZoneFloor,
@@ -473,16 +557,38 @@ pub fn simulateAllBackends(
 ) !void {
     if (checkpoints.len == 0) return;
 
-    std.debug.print("\n--- Live day-zero simulation: {d} backends, shared generation ---\n", .{runner.backends.len});
-    std.debug.print("  Initializing worlds + registering {d} zones/floors each...\n", .{locations.len});
+    const total_days = checkpoints[checkpoints.len - 1].sim_day;
+
+    std.debug.print("\n--- Live day-zero simulation: {d} backends, sequential (replay-cached generation) ---\n", .{runner.backends.len});
     // Wall clock for operator-facing progress only — never a benchmark
     // metric (those all go through metrics.timeQuery/timeMutation).
-    const wall_start = std.Io.Clock.awake.now(io);
+    const run_start = std.Io.Clock.awake.now(io);
 
-    var states: AllBackendStates = undefined;
-    inline for (runner.backends) |b| {
+    // enable_failures = true: dropout/stuck/drift are active per each
+    // type's own FailureParams (synthetic.profileFor) — see
+    // ingest_system.zig's header comment for how each is actually handled.
+    var stream = try synthetic.Stream.init(allocator, sensors, seed, SIM_START_MS, true);
+    defer stream.deinit();
+
+    const replay_file = try replay_dir.createFile(io, REPLAY_FILE_NAME, .{ .read = true });
+    defer replay_file.close(io);
+
+    var replay_writer = ReplayWriter{ .file = replay_file, .io = io };
+    var quality_accum: [SENSOR_TYPE_COUNT]QualityAccum = @splat(.{});
+
+    inline for (runner.backends, 0..) |b, backend_idx| {
         const W = World(b.T);
+
+        std.debug.print("\n--- Backend {d}/{d}: {s} ({s}) ---\n", .{
+            backend_idx + 1,
+            runner.backends.len,
+            b.name,
+            if (backend_idx == 0) "generating + spilling replay cache" else "replaying cache",
+        });
+
         var world = try W.init(allocator);
+        defer world.deinit();
+
         // Cap every placed sensor type at RINGBUFFER_CAP BEFORE the first
         // insert (RingBuffer sizes a sensor's buffer when it's first seen);
         // a no-op on the full-retention backends.
@@ -491,74 +597,43 @@ pub fn simulateAllBackends(
         for (locations) |loc| try world.registerZone(loc.sensor_id, loc.zone_id);
         for (zone_floor) |zf| try world.registerFloor(zf.zone_id, zf.floor_id);
 
-        @field(states, b.name) = .{ .world = world, .stats = .{ .backend = b.name } };
-    }
-    defer inline for (runner.backends) |b| {
-        @field(states, b.name).world.deinit();
-    };
+        var source: DaySource = if (backend_idx == 0)
+            .{ .generate = .{ .stream = &stream, .writer = &replay_writer, .quality = &quality_accum } }
+        else
+            .{ .replay = .{ .file = replay_file, .io = io } };
 
-    // enable_failures = true: dropout/stuck/drift are now active per each
-    // type's own FailureParams (synthetic.profileFor) — see
-    // ingest_system.zig's header comment for how each is actually handled.
-    var stream = try synthetic.Stream.init(allocator, sensors, seed, SIM_START_MS, true);
-    defer stream.deinit();
+        var stats = SimStats{ .backend = b.name };
+        // Per-type prune bookkeeping, in sim-relative ms. The schedule
+        // depends only on simulated time -> identical across backends.
+        var last_prune: [SENSOR_TYPE_COUNT]i64 = @splat(0);
+        var next_cp: usize = 0;
+        const backend_start = std.Io.Clock.awake.now(io);
 
-    // Ingest quality tally, accumulated once across the whole run (shared —
-    // rejection is a property of the reading itself, identical for every
-    // backend, computed once here rather than 5x).
-    var quality_accum: [SENSOR_TYPE_COUNT]struct { generated: u64 = 0, rejected: u64 = 0 } = @splat(.{});
+        var day: u32 = 1;
+        while (day <= total_days) : (day += 1) {
+            const elapsed_ms: i64 = @as(i64, day) * CHUNK_MS;
+            const day_end: i64 = SIM_START_MS + elapsed_ms;
 
-    const total_days = checkpoints[checkpoints.len - 1].sim_day;
-    var next_cp: usize = 0;
+            var generated_today: u64 = 0;
+            const chunk = try source.nextChunk(allocator, day_end, &generated_today);
+            defer allocator.free(chunk);
 
-    var day: u32 = 1;
-    while (day <= total_days) : (day += 1) {
-        const elapsed_ms: i64 = @as(i64, day) * CHUNK_MS;
-        const day_end: i64 = SIM_START_MS + elapsed_ms;
+            var ingest = IngestChunkCall(W){ .world = &world, .chunk = chunk };
+            stats.ingest_ns += try metrics.timeMutation(io, IngestChunkCall(W).call, .{&ingest});
+            stats.generated += generated_today;
+            stats.ingested += chunk.len;
+            stats.rejected += generated_today - chunk.len;
 
-        // Generate this simulated day's readings ONCE, shared across every
-        // backend (the fix for the 5x redundant generation this file's
-        // header comment describes).
-        const chunk = try stream.nextChunk(allocator, day_end);
-        defer allocator.free(chunk);
-
-        // Ingest validation, also shared: a rejected reading never reaches
-        // ANY backend's storage, not just some — computed once here rather
-        // than once per backend.
-        var accepted: std.ArrayList(sb.SensorReading) = .empty;
-        defer accepted.deinit(allocator);
-        for (chunk) |r| {
-            const type_idx = @intFromEnum(r.sensor_type);
-            quality_accum[type_idx].generated += 1;
-            if (ingest_system.shouldAccept(r)) {
-                try accepted.append(allocator, r);
-            } else {
-                quality_accum[type_idx].rejected += 1;
+            // Operator-facing heartbeat between (possibly year-apart) checkpoints.
+            if (day % 100 == 0) {
+                const now = std.Io.Clock.awake.now(io);
+                const elapsed_s = @as(f64, @floatFromInt(@as(i64, @intCast(run_start.durationTo(now).nanoseconds)))) / 1e9;
+                std.debug.print("  [{s}] day {d}/{d} ({d:.0}%): {d} readings today, {d} live, {d:.1}s total elapsed\n", .{
+                    b.name, day, total_days, @as(f64, @floatFromInt(day)) / @as(f64, @floatFromInt(total_days)) * 100.0, chunk.len, world.count(), elapsed_s,
+                });
             }
-        }
 
-        // Operator-facing heartbeat between (possibly year-apart) checkpoints.
-        if (day % 100 == 0) {
-            const now = std.Io.Clock.awake.now(io);
-            const elapsed_s = @as(f64, @floatFromInt(@as(i64, @intCast(wall_start.durationTo(now).nanoseconds)))) / 1e9;
-            std.debug.print("  day {d}/{d} ({d:.0}%): {d} readings today, {d:.1}s elapsed\n", .{
-                day, total_days, @as(f64, @floatFromInt(day)) / @as(f64, @floatFromInt(total_days)) * 100.0, chunk.len, elapsed_s,
-            });
-        }
-
-        const at_checkpoint = next_cp < checkpoints.len and checkpoints[next_cp].sim_day == day;
-        const cp = if (at_checkpoint) checkpoints[next_cp] else undefined;
-        const is_final = at_checkpoint and next_cp == checkpoints.len - 1;
-
-        inline for (runner.backends) |b| {
-            const W = World(b.T);
-            const state = &@field(states, b.name);
-
-            var ingest = IngestChunkCall(W){ .world = &state.world, .chunk = accepted.items };
-            state.stats.ingest_ns += try metrics.timeMutation(io, IngestChunkCall(W).call, .{&ingest});
-            state.stats.generated += chunk.len;
-            state.stats.ingested += accepted.items.len;
-            state.stats.rejected += chunk.len - accepted.items.len;
+            const at_checkpoint = next_cp < checkpoints.len and checkpoints[next_cp].sim_day == day;
 
             // Retention eviction: slack-scheduled normally, but
             // unconditional right before a checkpoint so every backend is
@@ -566,28 +641,27 @@ pub fn simulateAllBackends(
             for (type_samples) |group| {
                 const type_idx = @intFromEnum(group.sensor_type);
                 const retention_ms: i64 = @as(i64, synthetic.profileFor(group.sensor_type).retention_days) * CHUNK_MS;
-                if (!at_checkpoint and !shouldPrune(state.last_prune[type_idx], elapsed_ms, retention_ms)) continue;
+                if (!at_checkpoint and !shouldPrune(last_prune[type_idx], elapsed_ms, retention_ms)) continue;
                 if (elapsed_ms <= retention_ms) continue; // Nothing can be out of retention yet.
 
                 const cutoff = day_end - retention_ms;
-                const before = state.world.count();
-                var prune = PruneCall(W){ .world = &state.world, .sensor_type = group.sensor_type, .cutoff = cutoff };
-                state.stats.prune_ns += try metrics.timeMutation(io, PruneCall(W).call, .{&prune});
-                state.stats.prune_calls += 1;
-                state.stats.evicted += before - state.world.count();
-                state.last_prune[type_idx] = elapsed_ms;
+                const before = world.count();
+                var prune = PruneCall(W){ .world = &world, .sensor_type = group.sensor_type, .cutoff = cutoff };
+                stats.prune_ns += try metrics.timeMutation(io, PruneCall(W).call, .{&prune});
+                stats.prune_calls += 1;
+                stats.evicted += before - world.count();
+                last_prune[type_idx] = elapsed_ms;
             }
 
-            // Checkpoint work is gated by a runtime `if`, not an early
-            // `continue` — a `continue` here would be comptime control
-            // flow (this whole block is the body of an `inline for`) gated
-            // on a runtime condition, which Zig rejects.
             if (at_checkpoint) {
+                const cp = checkpoints[next_cp];
+                const is_final = next_cp == checkpoints.len - 1;
+
                 std.debug.print("\n  [{s}] === Checkpoint {s} (day {d}/{d}) ===\n", .{ b.name, cp.label, cp.sim_day, total_days });
 
                 // Time the building-level query mix once each, against this
                 // backend's real accumulated state at this simulated age.
-                const live_count = state.world.count();
+                const live_count = world.count();
                 const live_bytes = live_count * @sizeOf(sb.SensorReading);
                 std.debug.print("  [{s}] running {d} building-level queries ({d} live readings, {d:.1} MB)...\n", .{
                     b.name, query_mix.len, live_count, @as(f64, @floatFromInt(live_bytes)) / (1024.0 * 1024.0),
@@ -595,7 +669,7 @@ pub fn simulateAllBackends(
                 for (query_mix) |qw| {
                     if (!isHistoricalSupported(b) and isHistorical(qw.query)) continue;
 
-                    const qstats = try runOne(&state.world, allocator, io, qw.query, overall_sample);
+                    const qstats = try runOne(&world, allocator, io, qw.query, overall_sample);
                     std.debug.print("    {s}: median {d:.1}µs, p95 {d:.1}µs\n", .{
                         queryName(qw.query),
                         @as(f64, @floatFromInt(qstats.median_ns)) / 1000.0,
@@ -607,7 +681,7 @@ pub fn simulateAllBackends(
                         .backend = b.name,
                         .query = queryName(qw.query),
                         .median_ns = qstats.median_ns,
-                        .memory_bytes = state.world.memoryUsed(),
+                        .memory_bytes = world.memoryUsed(),
                         .live_bytes = live_bytes,
                         .reading_count = live_count,
                     });
@@ -616,7 +690,7 @@ pub fn simulateAllBackends(
                             .scale = scale_label,
                             .query = queryName(qw.query),
                             .backend = b.name,
-                            .memory_bytes = state.world.memoryUsed(),
+                            .memory_bytes = world.memoryUsed(),
                             .stats = qstats,
                         });
                     }
@@ -624,9 +698,9 @@ pub fn simulateAllBackends(
 
                 // Steady state only: the type-scoped per-type queries that
                 // feed the per-sensor-type recommendations, and (once, from
-                // the first backend to reach it — a full-retention one) the
-                // per-type volume table the report uses to expose
-                // disproportionate types.
+                // the first backend — a full-retention one) the per-type
+                // volume table the report uses to expose disproportionate
+                // types.
                 if (is_final) {
                     std.debug.print("  [{s}] steady state — running type-scoped queries across {d} sensor types...\n", .{ b.name, type_samples.len });
                     for (type_samples) |group| {
@@ -635,12 +709,12 @@ pub fn simulateAllBackends(
                             if (!isTypeScoped(qw.query)) continue;
                             if (!isHistoricalSupported(b) and isHistorical(qw.query)) continue;
 
-                            const qstats = try runOne(&state.world, allocator, io, qw.query, group.args);
+                            const qstats = try runOne(&world, allocator, io, qw.query, group.args);
                             try type_rows.append(allocator, .{
                                 .scale = @tagName(group.sensor_type),
                                 .query = queryName(qw.query),
                                 .backend = b.name,
-                                .memory_bytes = state.world.memoryUsed(),
+                                .memory_bytes = world.memoryUsed(),
                                 .stats = qstats,
                             });
                         }
@@ -648,7 +722,7 @@ pub fn simulateAllBackends(
 
                     if (type_volumes.items.len == 0) {
                         for (type_samples) |group| {
-                            const rs = try state.world.readingsForType(group.sensor_type);
+                            const rs = try world.readingsForType(group.sensor_type);
                             defer allocator.free(rs);
                             try type_volumes.append(allocator, .{
                                 .sensor_type = group.sensor_type,
@@ -658,10 +732,32 @@ pub fn simulateAllBackends(
                         }
                     }
                 }
+
+                next_cp += 1;
             }
         }
 
-        if (at_checkpoint) next_cp += 1;
+        // wall_ns = this backend's own timed ingest+prune cost, NOT the
+        // backend's wall-clock span: the first backend's span includes
+        // shared generation + replay-file writes and the others' include
+        // replay-file reads — none of which is the backend's own work.
+        // ingest+prune is the symmetric, honest "how fast can THIS backend
+        // absorb and evict data" figure the compression ratio reports.
+        stats.sim_ms = @as(i64, total_days) * CHUNK_MS;
+        stats.wall_ns = stats.ingest_ns + stats.prune_ns;
+        try sim_stats_out.append(allocator, stats);
+
+        const backend_end = std.Io.Clock.awake.now(io);
+        std.debug.print("  [{s}] done: {d} days in {d:.1}s wall ({d} generated, {d} ingested, {d} evicted in {d} prunes, ~{d:.0}x ingest+prune compression)\n", .{
+            b.name,
+            total_days,
+            @as(f64, @floatFromInt(@as(i64, @intCast(backend_start.durationTo(backend_end).nanoseconds)))) / 1e9,
+            stats.generated,
+            stats.ingested,
+            stats.evicted,
+            stats.prune_calls,
+            stats.compressionRatio(),
+        });
     }
 
     for (type_samples) |group| {
@@ -669,34 +765,9 @@ pub fn simulateAllBackends(
         try type_quality.append(allocator, .{ .sensor_type = group.sensor_type, .generated = q.generated, .rejected = q.rejected });
     }
 
-    // Per-backend wall_ns is deliberately NOT a wall-clock measurement here:
-    // with generation now shared across backends within one interleaved day
-    // loop, no backend has an independent "start to finish" wall-clock span
-    // to attribute a compression ratio to. Instead it's the sum of that
-    // backend's own timed ingest+prune cost — an honest "how fast can THIS
-    // backend absorb and evict data" compression figure that excludes both
-    // shared generation and query time, rather than a number that would
-    // double-count time other backends were also using the CPU.
-    inline for (runner.backends) |b| {
-        const state = &@field(states, b.name);
-        state.stats.sim_ms = @as(i64, total_days) * CHUNK_MS;
-        state.stats.wall_ns = state.stats.ingest_ns + state.stats.prune_ns;
-        try sim_stats_out.append(allocator, state.stats);
-
-        std.debug.print("  [{s}] simulation complete: {d} days, {d} generated, {d} ingested, {d} evicted in {d} prunes (~{d:.0}x ingest+prune compression)\n", .{
-            b.name,
-            total_days,
-            state.stats.generated,
-            state.stats.ingested,
-            state.stats.evicted,
-            state.stats.prune_calls,
-            state.stats.compressionRatio(),
-        });
-    }
-
-    const wall_end = std.Io.Clock.awake.now(io);
-    const total_wall_s = @as(f64, @floatFromInt(@as(i64, @intCast(wall_start.durationTo(wall_end).nanoseconds)))) / 1e9;
-    std.debug.print("\n--- Simulation complete: {d} days across {d} backends in {d:.1}s wall time ---\n", .{ total_days, runner.backends.len, total_wall_s });
+    const run_end = std.Io.Clock.awake.now(io);
+    const total_wall_s = @as(f64, @floatFromInt(@as(i64, @intCast(run_start.durationTo(run_end).nanoseconds)))) / 1e9;
+    std.debug.print("\n--- Simulation complete: {d} days x {d} backends (sequential) in {d:.1}s wall time ---\n", .{ total_days, runner.backends.len, total_wall_s });
 }
 
 // ---------------------------------------------------------------------------
