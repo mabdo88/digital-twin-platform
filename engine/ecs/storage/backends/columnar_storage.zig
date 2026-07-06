@@ -180,6 +180,17 @@ pub fn count(self: *const Self) usize {
 /// Reports the compressed footprint across all partitions. Timestamp
 /// and value columns use delta+varint encoding; sensor_id uses dictionary
 /// encoding; sensor_type is eliminated (implicit from partition key).
+///
+/// Disclosed tradeoff: this is a storage-cost proxy for what a real
+/// column store persists to disk, NOT this benchmark's actual resident
+/// RAM. The raw `sensor_ids`/`timestamps`/`values` ArrayLists (see
+/// Partition above) stay fully allocated for every compressed part too —
+/// `rangeByTime`/`iterateAll` scan those raw columns directly rather than
+/// decoding `ts_deltas`/`sid_dict`/`val_deltas` on every query — so this
+/// backend's actual in-process RAM is closer to TimeSeries's uncompressed
+/// footprint than the number below suggests. Fine for comparing on-disk
+/// storage cost across backends; not a live memory measurement for this
+/// one.
 pub fn memoryUsed(self: *const Self) usize {
     var total: usize = self.partitions.capacity() * (@sizeOf(PartitionKey) + @sizeOf(Partition));
     var it = self.partitions.iterator();

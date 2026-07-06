@@ -21,10 +21,13 @@ Save it somewhere on your computer.
 If you prefer to compile it yourself:
 
 ```sh
-zig build -Doptimize=ReleaseFast
+zig build
 ```
 
-This requires [Zig](https://ziglang.org/) master (0.16.0+). The compiled executable lands in `zig-out/bin/`.
+This requires [Zig](https://ziglang.org/) master (0.16.0+). The compiled
+executable lands in `zig-out/bin/`. The `dt` executable is always built
+ReleaseFast regardless of `-Doptimize` — it's a measurement tool, and a
+Debug build would silently distort a multi-year simulation's wall time.
 
 ---
 
@@ -32,10 +35,16 @@ This requires [Zig](https://ziglang.org/) master (0.16.0+). The compiled executa
 
 You'll need an **IFC file** (`.ifc`, SPF text format) for the building you want to model.
 
-Two real sample files ship in [`assets/IFC/`](assets/IFC/):
-- `AC20-FZK-Haus.ifc` — a small single-family house, good for testing
-- `2KHRJ17-HASC-SD-710-EV-MOD-00001.ifc` — a medium office building (182 equipment items)
-- `2KHRJ17-CUN-TD-712-EL-MOD-00001-00-IFC.ifc` — another medium building
+IFC assets are **not tracked in this repository** (they're large binaries;
+`assets/IFC/` is gitignored) — bring your own export, or grab a public
+sample. The files this guide's examples use, all validated end-to-end:
+
+- `AC20-FZK-Haus.ifc` — a small single-family house (KIT's public sample), good for a first run
+- `LargeHospitalComplex.ifc` — a 2000-element hospital, the large-scale stress case
+- `2KHRJ17-HASC-SD-710-EV-MOD-00001.ifc` — a medium office building (760 equipment items)
+
+Any Revit/ArchiCAD IFC export in SPF text format should parse; missing or
+vendor-specific fields are handled gracefully.
 
 ---
 
@@ -59,27 +68,27 @@ Open a terminal/command prompt and run:
 
 ```bash
 # Linux/macOS:
-./dt-linux --bim assets/IFC/AC20-FZK-Haus.ifc --type office
+./dt-linux --bim assets/IFC/AC20-FZK-Haus.ifc
 
 # Windows, cmd.exe:
-dt.exe --bim assets\IFC\AC20-FZK-Haus.ifc --type office
+dt.exe --bim assets\IFC\AC20-FZK-Haus.ifc
 
 # Windows, PowerShell — note the .\ prefix:
-.\dt.exe --bim assets\IFC\AC20-FZK-Haus.ifc --type office
+.\dt.exe --bim assets\IFC\AC20-FZK-Haus.ifc
 ```
 
 **If you downloaded the .exe into `releases/` and run it from there**, the
 sample IFC files are one directory up, so the path becomes:
 
 ```powershell
-.\dt.exe --bim ..\assets\IFC\AC20-FZK-Haus.ifc --type office
+.\dt.exe --bim ..\assets\IFC\AC20-FZK-Haus.ifc
 ```
 
 When in doubt, use a full path instead of a relative one — it removes the
 ambiguity entirely:
 
 ```powershell
-.\dt.exe --bim "C:\digital-twin-platform\assets\IFC\AC20-FZK-Haus.ifc" --type office
+.\dt.exe --bim "C:\digital-twin-platform\assets\IFC\AC20-FZK-Haus.ifc"
 ```
 
 (Adjust the path to your IFC file.)
@@ -89,43 +98,86 @@ ambiguity entirely:
 | Flag     | Required | Description |
 |----------|----------|-------------|
 | `--bim`  | yes      | Path to the IFC file to parse and populate sensors from. |
-| `--type` | no       | Building profile: `hospital`, `office`, `warehouse`, `manufacturing`, `campus`. Default: `office`. Controls sensor density/frequency and which queries get weighted in the recommendation. |
 | `--out`  | no       | Output directory for reports. Default: `benchmark-results`. |
 | `--help` | no       | Print usage and exit. |
 
-Pick `--type` based on what the building actually is — it changes both how
-densely sensors are placed (a hospital samples equipment at 5 Hz; an office
-samples at 0.1 Hz) and which of the 12 query patterns the recommendation
-weights most heavily (CLAUDE.md's "a hospital is not a factory" principle).
+There is no `--type` flag anymore: the tool derives everything from what it
+actually parses out of YOUR building — which sensor types get placed (from
+the real elements/zones/equipment found), each type's sampling rate and
+retention window, and which of the 12 query patterns the recommendation
+weights (the union of the placed types' relevant queries). That is
+CLAUDE.md's "a hospital is not a factory" principle taken to its
+conclusion: the building itself is the profile.
 
 ### What happens when you run it
 
 1. The IFC file is parsed into building elements, zones, and equipment.
-2. Sensors are placed on matching elements per the profile's placement rules.
-3. Zone/floor topology is registered (so zone- and floor-scoped queries work).
-4. One hour of synthetic sensor data is generated for every placed sensor.
-5. Every storage backend (TimeSeries, Columnar, Hierarchical, RingBuffer) is
-   benchmarked against the building's actual query mix.
-6. A recommendation is computed and printed to the terminal, then written to
-   disk along with a sensor schematic.
+2. Sensors are placed on matching elements per data-driven placement rules;
+   zone/floor topology and real sensor positions are registered from the
+   IFC's own coordinates (zone-, floor-, and radius-scoped queries run
+   against the real building, not synthetic geometry).
+3. A **live day-zero simulation** runs: the building starts empty and
+   accumulates synthetic sensor data day by day for its whole derived
+   lifetime (driven by the longest retention window among the placed
+   sensor types — e.g. structural sensors push it to ~7 years). Backends
+   run **sequentially**: the first pass generates the data once and spills
+   it to an on-disk replay cache; the other backends replay that identical
+   feed, so results are byte-for-byte comparable while only one backend's
+   data is ever in RAM.
+4. At log-spaced **checkpoints** (day 1, week 1, month 1 ... steady state)
+   every query in the building's mix is timed against each backend's real
+   accumulated state — that's the latency-vs-building-age growth curve.
+5. A **compound recommendation** is computed: a real-time track (who
+   answers "latest value" queries fastest) and a historical track (who
+   wins aggregations/rollups/anomaly scans over full retention), plus a
+   per-sensor-type breakdown.
+6. Everything is printed to the terminal and written to disk.
 
-Expect terminal output like:
+Expect terminal output like this (a large hospital; a small house prints
+the same shape with smaller numbers):
 
 ```
-Parsed assets/IFC/AC20-FZK-Haus.ifc: 33 elements, 9 zones, 0 equipment items.
-Placed 21 sensors.
-Generated 7581 synthetic readings.
+[1/6] Parsing IFC: assets/IFC/LargeHospitalComplex.ifc...
+Parsed assets/IFC/LargeHospitalComplex.ifc: 2007 elements, 520 zones, 760 equipment items (0.1s).
 
-=== Recommendation (office profile) ===
+[2/6] Placing sensors...
+Placed 1520 sensors (0.0s).
+
+[3/6] Setting up simulation...
+  Sim duration: 2682 days (7.3 years)
+  Checkpoints: 13 — day 1, week 1, month 1, ... year 7, steady state
+  Backends: 5
+
+[4/6] Running live day-zero simulation...
+--- Backend 1/5: TimeSeries (generating + spilling replay cache) ---
+  [TimeSeries] === Checkpoint day 1 (day 1/2682) ===
+  ...
+[5/6] Computing recommendations...
+
+=== Recommendation (LargeHospitalComplex) ===
+Real-time track (latest_* queries — all backends compete):
 Backend              Score     Coverage
-Hierarchical         1.042         100%
-Columnar             1.585         100%
-RingBuffer           2.117          50%
-TimeSeries           3.475         100%
-Winner: Hierarchical (lowest weighted median across this building's query mix; 1.0 = won every query)
-Wrote recommendation.md to benchmark-results/
-Wrote schematic.svg to benchmark-results/
+Hierarchical         1.000         100%
+...
+Historical track (aggregation/historical/spatial/anomaly — full-retention backends only):
+...
+Deployment combo: Hierarchical (live) + Hierarchical (historical)
+
+[6/6] Writing reports...
+  Wrote recommendation.md + simulation.json to benchmark-results/
+  Wrote schematic.svg to benchmark-results/
 ```
+
+### How long does it take?
+
+Simulated duration is derived from the placed sensor types' retention
+windows, and each type stops generating once its own retention window has
+filled (its dataset is at steady-state size after that — longer generation
+would change nothing a query can see). Rough real-world figures from the
+two shipped samples on an ordinary 16 GB machine (release build):
+
+- `AC20-FZK-Haus.ifc` (small house, 39 sensors, 7.3 simulated years): **~8 seconds**.
+- `LargeHospitalComplex.ifc` (1520 sensors, 7.3 simulated years, ~163M readings × 5 backends): **~8 minutes**, peaking around 7.5 GB RAM at the final checkpoint.
 
 ---
 
@@ -135,19 +187,34 @@ Everything lands in `--out` (default `benchmark-results/`):
 
 | File | What it's for |
 |------|----------------|
-| `recommendation.md` | The human-readable report: building stats, sensor counts by type, the backend recommendation with score/coverage, and a per-query latency table for this specific building. **Start here.** |
+| `recommendation.md` | The human-readable report: building stats, sensor counts by type, the compound recommendation (real-time + historical tracks + per-type breakdown), a per-query winner table, the latency-vs-building-age growth curve, per-backend simulation cost, steady-state data volume per type, and an ingest data-quality table. **Start here.** |
+| `simulation.json` | The same data machine-readable: per-backend stats, growth-curve points, type volumes and quality. |
 | `schematic.svg` | A rough floor-by-floor map: zone labels and sensor positions (colored by sensor type), derived directly from the IFC file's real coordinates. Open it in a browser or image viewer. |
 
-### Reading the recommendation score
+### Reading the recommendation
+
+The headline is a **deployment combo**, not a single winner, because real
+deployments split hot and cold paths:
+
+- **Real-time track** — all backends compete on the `latest_*` queries.
+  A tiny count-capped cache (RingBuffer, 10 readings/sensor) can
+  legitimately win here.
+- **Historical track** — aggregations, rollups, spatial and anomaly
+  queries; only full-retention backends compete (a cache that evicted
+  the data can't fake-win a query it can't actually answer).
+
+Within each track:
 
 - **Score** = weighted average of (this backend's median latency / the
-  per-query winner's median latency), across every query this building's
-  profile cares about. **1.00 = this backend won every weighted query.**
-  Higher is worse.
-- **Coverage** = fraction of the profile's weighted queries this backend has
-  data for. Below 100% (e.g. RingBuffer on historical rollups, which it
-  can't answer because it evicts old data) means a low score might be
-  winning by omission, not speed — check coverage before trusting a score.
+  per-query winner's median latency), across every query in this
+  building's derived mix. **1.00 = this backend won every weighted
+  query.** Higher is worse.
+- **Coverage** = fraction of the weighted queries this backend has data
+  for. Check coverage before trusting a score.
+
+All scores come from the **steady-state checkpoint** — the building at
+retention-full, actively-evicting age — while the growth-curve table shows
+how each query's latency evolved from day 1 to get there.
 
 ### Honesty headline (per CLAUDE.md §6)
 
@@ -194,16 +261,20 @@ backend must produce identical query results on the same seeded dataset).
 
 ## Troubleshooting
 
-- **"No sensors placed"** — the IFC file has no elements matching the
-  selected profile's placement rules (e.g. a `--type hospital` rule set
-  expects equipment/flow segments that aren't present in a simple
-  residential model). Try a different `--type`, or check the parsed
-  element/zone counts in the terminal output.
+- **"No sensors placed"** — the IFC file has no elements matching any
+  placement rule (the rules key off parsed element/zone/equipment types).
+  Check the parsed element/zone/equipment counts in the terminal output —
+  if they're all near zero, the file may use IFC constructs outside the
+  supported subset.
 
-- **Run takes a very long time / seems to hang** — you're likely running
-  on a machine with limited resources, or the building is very large with
-  a dense profile (hospital/manufacturing = many high-frequency sensors).
-  If you built from source, try the release build: `zig build -Doptimize=ReleaseFast`.
+- **Run takes a long time** — expected for very large buildings: sensor
+  count and the longest retention window among placed types drive the
+  simulated duration (a building with structural sensors simulates ~7
+  years). A 1500-sensor hospital takes ~8 minutes; progress heartbeats
+  print every 100 simulated days so you can see it moving. The build
+  system always compiles the `dt` executable as ReleaseFast, so there is
+  no debug-build trap. If memory is tight, note the peak lands at each
+  backend's final (steady-state) checkpoint.
 
 - **On macOS: "cannot be opened because the developer cannot be verified"** —
   macOS blocks unsigned binaries by default. Either:

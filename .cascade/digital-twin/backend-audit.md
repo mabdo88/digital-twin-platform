@@ -5,7 +5,8 @@ _Hierarchical re-verified 2026-06-28: tree-exploitation fix confirmed in code + 
 _Hierarchical revised again 2026-06-29: zone/floor grouping was coupled to dataset.zig's synthetic sensor_id arithmetic, which never matched a real building's actual zone assignment — see update below._
 _World(T) query layer revised 2026-06-30: iterateAll() and zone/floor-scoped queries were redoing full-dataset work on every call, equally across all six backends — not a backend-correctness issue, see update below._
 _All backends gained pruneOlderThan (real per-type eviction) 2026-07-01, part of the storage-redesign-plan.md rework; two more query bugs found and fixed the same day, see update below._
-_Full-scale audit 2026-07-05 after the first-ever complete hospital-scale run: Lake's description below (2026-07-01 entry) is STALE — it was upgraded from a flat uncompressed array to an S3+Parquet cold-tier model, see update at the end. Hierarchical's mergeAllLeaves rewritten to a heap merge the same week. One open finding: query_spatial_radius still uses sensor_id-arithmetic placeholder positions, not real ZoneLocation.position — see `sequential-execution-and-audit.md`._
+_Full-scale audit 2026-07-05 after the first-ever complete hospital-scale run: Lake's description below (2026-07-01 entry) is STALE — it was upgraded from a flat uncompressed array to an S3+Parquet cold-tier model, see update at the end. Hierarchical's mergeAllLeaves rewritten to a heap merge the same week._
+_2026-07-06: the audit's open finding is CLOSED — query_spatial_radius now reads real registered positions (World.registerPosition, sourced from ZoneLocation.position) instead of sensor_id arithmetic. Same day: RingBuffer's simulation eviction stat fixed (derived from ingested − live count, so ring-overwrite eviction is finally visible), and per-type generation-horizon capping landed (Step 4). See `sequential-execution-and-audit.md` for all three._
 
 ## Verdict per backend
 

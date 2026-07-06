@@ -34,10 +34,10 @@ apples-to-apples through one shared interface.
 **For developers:** Clone the repo and build with Zig:
 
 ```sh
-zig build                # compile to zig-out/bin/
+zig build                # compile to zig-out/bin/ (dt/dtb always build ReleaseFast)
 zig build test           # run all unit + golden-result equivalence tests
 zig build bench          # run the full benchmark suite, write reports to ./benchmark-results/
-zig build -Doptimize=ReleaseFast  # release build (faster on large datasets)
+zig-out/bin/dt --bim path/to/model.ifc   # run against a real building (see HOW_TO_USE.md)
 ```
 
 Requires Zig master (tested against 0.16.0 / 0.17.0-dev). No external

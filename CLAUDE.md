@@ -72,11 +72,19 @@ rather than assumes.
   `timeMutation` for state-mutating operations like ingest/prune). No ad-hoc timing elsewhere.
 - **Live day-zero simulation** (replaces the former bulk-preload + live-tail
   methodology): the building starts at simulated day zero with empty backends.
-  A `synthetic.Stream` feeds readings chunk-by-chunk (1 simulated day per chunk)
-  into each backend, pruning to retention windows as simulated time advances,
-  with queries benchmarked at log-spaced checkpoints. Sim duration derives from
-  the placed sensor types' retention depths (`deriveSimDays`). See
-  `benchmark/simulation.zig` and `.cascade/digital-twin/live-simulation-plan.md`.
+  A `synthetic.Stream` feeds readings chunk-by-chunk (1 simulated day per chunk),
+  pruning to retention windows as simulated time advances, with queries
+  benchmarked at log-spaced checkpoints. Sim duration derives from the placed
+  sensor types' retention depths (`deriveSimDays`). Backends run
+  **sequentially** through the full timeline (one backend's history in RAM at
+  a time): the first pass generates once and spills each day's accepted
+  readings to an on-disk replay cache; later backends replay it byte-identically.
+  Each sensor type stops generating at its **own** retention-derived horizon
+  (`Stream.capHorizons`) and its prune watermark freezes with it — every query
+  anchors its window to the data's newest reading, so a frozen type's
+  steady-state window measures identically at any later checkpoint. See
+  `benchmark/simulation.zig`, `.cascade/digital-twin/live-simulation-plan.md`,
+  and `.cascade/digital-twin/sequential-execution-and-audit.md`.
 - **Iteration count is workload-dependent, by deliberate design decision (see
   `.cascade/digital-twin/storage-redesign-plan.md`):**
   - The **real per-building path** (`main.zig`) runs the live simulation and
@@ -108,7 +116,7 @@ engine/
 │   │   ├── sensor.zig          // SensorReading, SensorMetadata, ZoneLocation
 │   │   └── building.zig        // BuildingElement, ZoneMetadata
 │   ├── systems/
-│   │   ├── ingest_system.zig   // Writes synthetic sensor data into the world
+│   │   ├── ingest_system.zig   // Ingest-time validation (bounds rejection)
 │   │   ├── query_system.zig    // Runs all benchmark queries
 │   │   ├── metrics_system.zig  // Records latency, throughput, memory
 │   │   └── report_system.zig   // Outputs final recommendation report
@@ -119,6 +127,7 @@ engine/
 │           ├── columnar_storage.zig
 │           ├── hierarchical_storage.zig
 │           ├── ringbuffer_storage.zig
+│           ├── lake_storage.zig
 │           ├── soa_storage.zig
 │           └── aos_storage.zig
 ├── bim/
@@ -185,7 +194,7 @@ whether ClickHouse answers in 80 ms or 800 ms. Absolute numbers are approximate;
 zig build            # compile the platform
 zig build test       # run unit + golden-result tests
 zig build bench      # run the full benchmark suite
-zig build run -- --bim path/to/model.ifc --type Hospital --scale 5000
+zig build run -- --bim path/to/model.ifc --out results-dir
 ```
 
 > **Agent note:** if these commands are not yet wired in `build.zig`, wiring them is a
@@ -236,6 +245,13 @@ The same folder also holds **status docs** (read as current state, not as proced
   readings chunk-by-chunk (1 day per chunk), pruning to retention as simulated
   time advances, with queries benchmarked at log-spaced checkpoints. See
   `benchmark/simulation.zig` for the implementation.
+- **`sequential-execution-and-audit.md`** — agreed 2026-07-05, **implemented and
+  verified at hospital scale**: extends the live simulation with sequential
+  backend passes over an on-disk replay cache (one backend's history in RAM at
+  a time, generation happens once), per-type generation-horizon capping
+  (Step 4), and the full-scale audit findings — including the spatial-query
+  real-position fix and the RingBuffer eviction-stat fix. The most current of
+  the status docs; read it first when touching `benchmark/simulation.zig`.
 
 ---
 
@@ -245,12 +261,15 @@ The same folder also holds **status docs** (read as current state, not as proced
   not an IfcOpenShell C-interop wrapper. Validated end-to-end against two real Revit
   IFC exports (see the Roadmap, Phase 4).
 - **Scale ceiling:** target 100,000 sensors for Phase 1; keep allocation strategy
-  able to grow. Not yet exercised — the standalone synthetic generator (Phase 6)
-  doesn't exist yet, so the largest sensor count tested today is the benchmark
-  suite's "Large" tier (100 sensors, 500 readings each = 50,000 readings total).
-- **Report format:** emit JSON, a human-readable Markdown report, **and** an
-  interactive HTML dashboard — all three written by `engine/benchmark/report.zig`
-  (`latency.json`, `latency.md`, `benchmark.html`).
+  able to grow. Largest exercised to date (2026-07-06): 1,520 sensors on a real
+  hospital IFC through the full 7.3-year live simulation — ~163M readings
+  generated once, replayed to 5 backends, ~8 min wall / ~7.5 GB peak on a
+  16 GB machine (see `sequential-execution-and-audit.md`).
+- **Report format:** the regression suite (`zig build bench`) emits JSON, a
+  human-readable Markdown report, **and** an interactive HTML dashboard — all
+  three written by `engine/benchmark/report.zig` (`latency.json`, `latency.md`,
+  `benchmark.html`). The per-building path (`dt --bim ...`) writes
+  `recommendation.md`, `simulation.json`, and `schematic.svg`.
 - **Tiered strategies — resolved:** the platform now emits **compound recommendations**
   via `report.recommendCompound`: a real-time track (all backends compete, RingBuffer
   wins on `latest_*` queries) and a historical track (full-retention backends only;

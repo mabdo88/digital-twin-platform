@@ -2,6 +2,14 @@
 
 > Agreed 2026-07-02. **Status: implemented.**
 > Supersedes the bulk-preload + live-tail methodology from `storage-redesign-plan.md`.
+>
+> **Partially superseded in turn (2026-07-05/06)** by
+> `sequential-execution-and-audit.md`: backends no longer share one
+> interleaved day loop — they run sequentially over an on-disk replay cache
+> (one backend's history in RAM at a time), and each sensor type's
+> generation is capped at its own retention-derived horizon
+> (`Stream.capHorizons`). The checkpoint/growth-curve/eviction methodology
+> below is unchanged; only the execution order and generation extent are.
 
 ## Problem
 

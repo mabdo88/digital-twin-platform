@@ -150,10 +150,12 @@ pub fn generateDatasetScaled(
 }
 
 /// Insert a dataset into a world in slice order, and register each
-/// sensor's zone/floor per this fixture's topology convention (sensor_id
-/// / SENSORS_PER_ZONE, zone_id / ZONES_PER_FLOOR) — the same shape every
-/// zone/floor-aware query now expects to come from real registration
-/// (registerZone/registerFloor), not from arithmetic baked into the query
+/// sensor's zone/floor/position per this fixture's topology convention
+/// (sensor_id / SENSORS_PER_ZONE, zone_id / ZONES_PER_FLOOR, corridor-grid
+/// positions) — the same shape every topology-aware query now expects to
+/// come from real registration
+/// (registerZone/registerFloor/registerPosition), not from arithmetic
+/// baked into the query
 /// itself. This is the ONE place that convention is allowed to live: a
 /// synthetic benchmark fixture choosing its own made-up topology, exactly
 /// the same way a real pipeline would call registerZone/registerFloor
@@ -172,6 +174,16 @@ pub fn insertDataset(world: anytype, readings: []const sb.SensorReading) !void {
             const floor_id = zone_id / ZONES_PER_FLOOR;
             try world.registerZone(r.sensor_id, zone_id);
             try world.registerFloor(zone_id, floor_id);
+            // Fixture spatial convention (this file is the one sanctioned
+            // home for synthetic topology, same as the zone/floor formulas
+            // above): a corridor grid, 5 m apart along X, 3 m per floor
+            // along Y. The live path registers real parsed
+            // ZoneLocation.position instead.
+            try world.registerPosition(r.sensor_id, .{
+                .x = @as(f32, @floatFromInt(r.sensor_id % 10)) * 5.0,
+                .y = @as(f32, @floatFromInt(r.sensor_id / 10)) * 3.0,
+                .z = 0.0,
+            });
         }
     }
 }

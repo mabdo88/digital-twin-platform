@@ -15,6 +15,12 @@
 const std = @import("std");
 const sb = @import("storage/storage_backend.zig");
 
+/// A sensor's world position in metres — topology, like zone/floor
+/// membership, registered once per sensor from real placement data
+/// (sensor_placer.zig's ZoneLocation.position) or a fixture's synthetic
+/// convention. f32 matches the query layer's Vec3 precision.
+pub const Position = struct { x: f32, y: f32, z: f32 };
+
 pub fn World(comptime Backend: type) type {
     // Compile-time contract: Backend must implement the full interface.
     sb.assertImplements(Backend);
@@ -39,12 +45,24 @@ pub fn World(comptime Backend: type) type {
         /// already-large cached_all footprint. See readingsForType's doc
         /// comment for why this exists.
         type_index: ?std.AutoHashMap(sb.SensorType, std.ArrayList(u32)) = null,
+        /// sensor_id -> world position, registered once per sensor
+        /// (registerPosition). Lives at the World level, not in the
+        /// StorageBackend interface, because no backend can structurally
+        /// exploit positions — none models a spatial index, so a radius
+        /// query is a full sensor scan + distance check on every backend
+        /// alike. This mirrors a real deployment, where positions live in
+        /// an asset/metadata registry beside the historian, not inside the
+        /// time-series engine itself. Contrast registerZone/registerFloor,
+        /// which ARE interface methods because HierarchicalStorage's tree
+        /// genuinely organizes around them.
+        positions: std.AutoHashMap(u32, Position),
         const Self = @This();
 
         pub fn init(allocator: std.mem.Allocator) !Self {
             return .{
                 .backend = try Backend.init(allocator),
                 .allocator = allocator,
+                .positions = std.AutoHashMap(u32, Position).init(allocator),
             };
         }
 
@@ -60,6 +78,7 @@ pub fn World(comptime Backend: type) type {
         pub fn deinit(self: *Self) void {
             if (self.cached_all) |all| self.allocator.free(all);
             self.freeTypeIndex();
+            self.positions.deinit();
             self.backend.deinit();
         }
 
@@ -192,6 +211,20 @@ pub fn World(comptime Backend: type) type {
 
         pub fn registerZone(self: *Self, sensor_id: u32, zone_id: u32) !void {
             return self.backend.registerZone(sensor_id, zone_id);
+        }
+
+        /// Record a sensor's world position (topology, like registerZone —
+        /// see the `positions` field comment for why this is World-level).
+        /// Calling again for the same sensor_id overwrites (last write wins).
+        pub fn registerPosition(self: *Self, sensor_id: u32, pos: Position) !void {
+            try self.positions.put(sensor_id, pos);
+        }
+
+        /// The position most recently registered for sensor_id, or null if
+        /// none — a sensor with no known position simply can't match a
+        /// spatial query, same as a real asset registry missing an entry.
+        pub fn positionOf(self: *const Self, sensor_id: u32) ?Position {
+            return self.positions.get(sensor_id);
         }
 
         pub fn registerFloor(self: *Self, zone_id: u32, floor_id: u32) !void {

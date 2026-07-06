@@ -124,7 +124,7 @@ pub const QUERY_PATTERNS = [_]QueryPattern{
     .{ .name = "query_floor_stats", .family = .aggregation, .description = "Min/max/avg stats for sensors of a type on a floor over trailing hours" },
     .{ .name = "query_hourly_rollup", .family = .historical, .description = "Hourly avg/min/max/count rollup for a sensor over trailing days" },
     .{ .name = "query_daily_zone_rollup", .family = .historical, .description = "Daily avg/min/max/count rollup for sensors of a type in a zone over 1 year" },
-    .{ .name = "query_spatial_radius", .family = .spatial, .description = "Sensor IDs whose derived position falls within radius_m of center" },
+    .{ .name = "query_spatial_radius", .family = .spatial, .description = "Sensor IDs whose registered position falls within radius_m of center" },
     .{ .name = "query_zone_hierarchy", .family = .spatial, .description = "All sensor IDs reachable from zone_id within depth levels of the hierarchy" },
     .{ .name = "query_anomalies", .family = .anomaly, .description = "Readings of a given sensor_type whose value deviates by more than N std-devs from that type's mean" },
     .{ .name = "query_threshold_breach", .family = .anomaly, .description = "First sustained run of >= min_duration_ms where sensor's value exceeds threshold" },
@@ -507,43 +507,24 @@ pub fn query_daily_zone_rollup(world: anytype, zone_id: u32, sensor_type: sb.Sen
 // ---------------------------------------------------------------------------
 // Spatial query family (Q9–Q10)
 //
-// Both queries derive spatial metadata entirely from component data already
-// present in SensorReading:
+// Both queries read real registered topology, never sensor_id arithmetic:
 //
-//   position(sensor_id):
-//     x = @as(f32, sensor_id % 10) * 5.0          -- 0..45 m along X axis
-//     y = @as(f32, sensor_id / 10) * 3.0          -- floor height (3 m/floor)
-//     z = 0.0                                      -- single corridor
-//     (Q9 only — still a synthetic placeholder derived from sensor_id, not
-//     real placement position. Unlike zone/floor, this hasn't been wired
-//     to ZoneLocation.position yet; a real building's spatial queries
-//     would need that the same way Q10's zone/floor queries now need
-//     real registerZone/registerFloor data instead of arithmetic.)
+//   positions (Q9): World.registerPosition — real parsed placement
+//     (ZoneLocation.position from the IFC) on the live path, or the
+//     fixture's own synthetic convention (dataset.zig) on the regression
+//     path. World-level, not a StorageBackend method, because no backend
+//     models a spatial index (see world.zig's `positions` field comment).
 //
 //   zone hierarchy (Q10): real registered topology, not arithmetic —
 //     depth 0  = sensor leaf   (sensors registered to exactly zone_id)
 //     depth 1  = floor         (every zone sharing zone_id's registered floor)
 //     depth 2+ = building root (all sensors)
 //
-// No backend-specific code; Q9 calls only world.iterateAll(), Q10 calls
+// No backend-specific code; Q9 calls only world.allSensorIds(), Q10 calls
 // world.sensorIdsByZone/sensorIdsByFloor/floorOfZone. HierarchicalStorage
 // wins Q10 because its tree index lets it collect subtree leaves without
 // scanning the full dataset.
 // ---------------------------------------------------------------------------
-
-/// Derive a deterministic 3-D position from a sensor_id.
-/// Pure function — same output for the same sensor_id on every backend.
-///
-///   x = (sensor_id % 10) * 5.0 m   (position along a corridor)
-///   y = (sensor_id / 10) * 3.0 m   (floor height, 3 m per floor)
-///   z = 0.0 m                       (single corridor depth)
-pub fn sensorPosition(sensor_id: u32) Vec3 {
-    return .{
-        .x = @as(f32, @floatFromInt(sensor_id % 10)) * 5.0,
-        .y = @as(f32, @floatFromInt(sensor_id / 10)) * 3.0,
-        .z = 0.0,
-    };
-}
 
 fn vec3DistSq(a: Vec3, b: Vec3) f32 {
     const dx = a.x - b.x;
@@ -552,14 +533,18 @@ fn vec3DistSq(a: Vec3, b: Vec3) f32 {
     return dx * dx + dy * dy + dz * dz;
 }
 
-/// Q9: Return all unique sensor IDs whose derived position (ZoneLocation.position
-/// encoded as sensorPosition(sensor_id)) falls within `radius_m` of `center`.
+/// Q9: Return all unique sensor IDs whose registered position
+/// (World.registerPosition, sourced from real placement data —
+/// ZoneLocation.position — or a fixture's synthetic convention) falls
+/// within `radius_m` of `center`. Sensors with no registered position
+/// can't match, same as a real asset registry missing an entry.
 ///
 /// Only sensors that have at least one reading in the world are considered.
 /// Results are sorted by sensor_id ascending.
 /// Caller owns the returned slice (free with world.allocator).
 ///
-/// Pure: calls only world.iterateAll() — no backend-specific code.
+/// Pure: calls only world.allSensorIds()/positionOf() — no
+/// backend-specific code, no sensor_id arithmetic.
 pub fn query_spatial_radius(world: anytype, center: Vec3, radius_m: f32) ![]EntityId {
     // world.allSensorIds() delegates to the backend's topology index —
     // owned, caller frees. Position is per-sensor, not per-reading.
@@ -572,7 +557,8 @@ pub fn query_spatial_radius(world: anytype, center: Vec3, radius_m: f32) ![]Enti
     defer result.deinit(world.allocator);
 
     for (sensor_ids) |sid| {
-        const pos = sensorPosition(sid);
+        const p = world.positionOf(sid) orelse continue;
+        const pos = Vec3{ .x = p.x, .y = p.y, .z = p.z };
         if (vec3DistSq(pos, center) <= radius_sq) {
             try result.append(world.allocator, sid);
         }
@@ -1011,4 +997,27 @@ const MS_PER_HOUR = fixtures.MS_PER_HOUR;
 const SENSORS_PER_ZONE = fixtures.SENSORS_PER_ZONE;
 const ZONES_PER_FLOOR = fixtures.ZONES_PER_FLOOR;
 const SENSORS_PER_FLOOR = fixtures.SENSORS_PER_FLOOR;
+
+test "query_spatial_radius: registered positions decide membership — boundary inclusive, unregistered sensors never match" {
+    const allocator = std.testing.allocator;
+    var world = try World(aos).init(allocator);
+    defer world.deinit();
+
+    // Four sensors, one reading each (a sensor must exist in the world's
+    // topology to be a candidate at all).
+    for ([_]u32{ 1, 2, 3, 4 }) |sid| {
+        try world.insert(.{ .sensor_id = sid, .timestamp = 1000, .value = 20.0, .sensor_type = .temperature });
+        try world.registerZone(sid, 0);
+    }
+    try world.registerPosition(1, .{ .x = 0.0, .y = 0.0, .z = 0.0 }); // at center
+    try world.registerPosition(2, .{ .x = 3.0, .y = 4.0, .z = 0.0 }); // dist exactly 5 — boundary
+    try world.registerPosition(3, .{ .x = 10.0, .y = 0.0, .z = 0.0 }); // dist 10 — outside
+    // Sensor 4: reading exists but NO registered position — a real asset
+    // registry with a missing entry; must never match, not match at (0,0,0).
+
+    const result = try query_spatial_radius(&world, .{ .x = 0.0, .y = 0.0, .z = 0.0 }, 5.0);
+    defer allocator.free(result);
+
+    try std.testing.expectEqualSlices(EntityId, &.{ 1, 2 }, result);
+}
 

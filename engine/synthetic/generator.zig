@@ -596,6 +596,10 @@ pub const SensorState = struct {
     profile: SensorProfile,
     period_ms: i64,
     next_t: i64, // next tick time for this sensor
+    /// Absolute ms past which this sensor never ticks again (exclusive) —
+    /// set by Stream.capHorizons, unbounded by default. See capHorizons
+    /// for what this models and why it is caller-supplied data.
+    horizon_end: i64 = std.math.maxInt(i64),
     // Shape state
     binary_state: f32 = 0.0,
     binary_last_emitted: ?f32 = null,
@@ -705,6 +709,7 @@ pub const Stream = struct {
     allocator: std.mem.Allocator,
     base_seed: u64,
     enable_failures: bool,
+    start_time: i64,
 
     /// Create a stream. Each sensor gets its own `SensorState` with a
     /// per-sensor PRNG seeded from `seed` mixed with `sensor_id`. The
@@ -735,11 +740,41 @@ pub const Stream = struct {
             .allocator = allocator,
             .base_seed = seed,
             .enable_failures = enable_failures,
+            .start_time = start_time,
         };
     }
 
     pub fn deinit(self: *Stream) void {
         self.allocator.free(self.states);
+    }
+
+    /// Cap each sensor's generation at its own type's horizon:
+    /// `horizon_days_by_type` is indexed by `@intFromEnum(sensor_type)`
+    /// and gives the number of simulated days (from `start_time`) after
+    /// which sensors of that type stop ticking. 0 means "no cap".
+    ///
+    /// Why: once a type's retention window (+ margin) has filled, its
+    /// dataset is at steady-state size and further ticks only churn
+    /// identical-shaped data through insert+prune without changing any
+    /// query-relevant statistic — every benchmark query anchors its window
+    /// to the data's own newest reading, never to absolute sim-now. The
+    /// day counts are caller-supplied DATA (computed from each type's
+    /// retention_days by the simulation harness); this function neither
+    /// knows nor cares why a number was chosen.
+    ///
+    /// Determinism: each sensor has a private PRNG, so capping one type
+    /// leaves every other sensor's output byte-identical, and a capped
+    /// sensor's pre-horizon output is byte-identical to its uncapped run.
+    ///
+    /// Call before the first nextChunk/streamUntil — horizons are
+    /// anchored at `start_time`, not at the stream's current position.
+    pub fn capHorizons(self: *Stream, horizon_days_by_type: []const u32) void {
+        const ms_per_day: i64 = 24 * 60 * 60 * 1000;
+        for (self.states) |*state| {
+            const days = horizon_days_by_type[@intFromEnum(state.sensor.sensor_type)];
+            if (days == 0) continue;
+            state.horizon_end = self.start_time + @as(i64, days) * ms_per_day;
+        }
     }
 
     /// Generate all readings in `[max(current positions), chunk_end)` for
@@ -751,7 +786,8 @@ pub const Stream = struct {
         errdefer out.deinit(allocator);
 
         for (self.states) |*state| {
-            while (state.next_t < chunk_end) {
+            const end = @min(chunk_end, state.horizon_end);
+            while (state.next_t < end) {
                 if (tickOnce(state, state.next_t, self.enable_failures)) |value| {
                     try out.append(allocator, .{
                         .sensor_id = state.sensor.sensor_id,
@@ -804,7 +840,7 @@ pub const Stream = struct {
         defer heap.deinit(self.allocator);
 
         for (self.states, 0..) |*state, i| {
-            if (state.next_t < until_ms) {
+            if (state.next_t < @min(until_ms, state.horizon_end)) {
                 try heap.push(self.allocator, .{ .next_t = state.next_t, .sensor_id = state.sensor.sensor_id, .idx = i });
             }
         }
@@ -820,7 +856,7 @@ pub const Stream = struct {
                 });
             }
             state.next_t += state.period_ms;
-            if (state.next_t < until_ms) {
+            if (state.next_t < @min(until_ms, state.horizon_end)) {
                 try heap.push(self.allocator, .{ .next_t = state.next_t, .sensor_id = state.sensor.sensor_id, .idx = entry.idx });
             }
         }
@@ -1041,6 +1077,90 @@ test "Stream: streamUntil output is sorted by (timestamp asc, sensor_id asc)" {
         const prev = c.readings.items[i];
         try testing.expect(r.timestamp > prev.timestamp or
             (r.timestamp == prev.timestamp and r.sensor_id > prev.sensor_id));
+    }
+}
+
+test "Stream.capHorizons: a capped type stops exactly at its horizon; uncapped types continue; pre-horizon output is byte-identical to an uncapped run" {
+    const sensors = testSensors();
+    const one_day: i64 = 24 * 60 * 60 * 1000;
+    const until: i64 = 5 * one_day;
+
+    var uncapped = try Stream.init(testing.allocator, &sensors, 42, 0, false);
+    defer uncapped.deinit();
+    var capped = try Stream.init(testing.allocator, &sensors, 42, 0, false);
+    defer capped.deinit();
+
+    // Cap temperature at 2 days; energy and vibration stay unbounded (0).
+    var horizons: [std.enums.values(SensorType).len]u32 = @splat(0);
+    horizons[@intFromEnum(SensorType.temperature)] = 2;
+    capped.capHorizons(&horizons);
+
+    var cu = Collector{};
+    defer cu.readings.deinit(testing.allocator);
+    var cc = Collector{};
+    defer cc.readings.deinit(testing.allocator);
+    try uncapped.streamUntil(until, Collector.sink, &cu);
+    try capped.streamUntil(until, Collector.sink, &cc);
+
+    // 1. The capped run is exactly the uncapped run minus temperature
+    //    readings at/after the horizon — same order, same values (each
+    //    sensor's PRNG is private, so capping one type can't perturb
+    //    another's sequence).
+    var expected: std.ArrayList(SensorReading) = .empty;
+    defer expected.deinit(testing.allocator);
+    for (cu.readings.items) |r| {
+        if (r.sensor_type == .temperature and r.timestamp >= 2 * one_day) continue;
+        try expected.append(testing.allocator, r);
+    }
+    try testing.expectEqual(expected.items.len, cc.readings.items.len);
+    for (expected.items, cc.readings.items) |a, b| {
+        try testing.expectEqual(a.sensor_id, b.sensor_id);
+        try testing.expectEqual(a.timestamp, b.timestamp);
+        try testing.expectEqual(a.value, b.value);
+    }
+
+    // 2. Both boundary directions are real: temperature produced readings
+    //    right up to (but never at/after) the horizon, and an uncapped
+    //    type kept producing well after it.
+    var last_temp: i64 = -1;
+    var last_energy: i64 = -1;
+    for (cc.readings.items) |r| {
+        switch (r.sensor_type) {
+            .temperature => last_temp = @max(last_temp, r.timestamp),
+            .energy => last_energy = @max(last_energy, r.timestamp),
+            else => {},
+        }
+    }
+    try testing.expectEqual(2 * one_day - 300_000, last_temp); // final 5-min tick before day 2
+    try testing.expect(last_energy >= 4 * one_day);
+}
+
+test "Stream.capHorizons: nextChunk honors the horizon across chunk boundaries" {
+    const sensors = testSensors();
+    const one_day: i64 = 24 * 60 * 60 * 1000;
+
+    var stream = try Stream.init(testing.allocator, &sensors, 7, 0, false);
+    defer stream.deinit();
+    var horizons: [std.enums.values(SensorType).len]u32 = @splat(0);
+    horizons[@intFromEnum(SensorType.temperature)] = 1;
+    stream.capHorizons(&horizons);
+
+    // Day 1: temperature present. Days 2-3: temperature absent, others present.
+    var day: i64 = 1;
+    while (day <= 3) : (day += 1) {
+        const chunk = try stream.nextChunk(testing.allocator, day * one_day);
+        defer testing.allocator.free(chunk);
+        var temp_count: usize = 0;
+        var other_count: usize = 0;
+        for (chunk) |r| {
+            if (r.sensor_type == .temperature) temp_count += 1 else other_count += 1;
+        }
+        if (day == 1) {
+            try testing.expect(temp_count > 0);
+        } else {
+            try testing.expectEqual(@as(usize, 0), temp_count);
+        }
+        try testing.expect(other_count > 0);
     }
 }
 

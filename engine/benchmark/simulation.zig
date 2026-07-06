@@ -202,6 +202,14 @@ pub const SimStats = struct {
     generated: u64 = 0,
     ingested: u64 = 0,
     rejected: u64 = 0,
+    /// Total readings no longer resident at run end (ingested minus live
+    /// count), derived generically from `ingested - count()` rather than
+    /// accumulated from pruneOlderThan deltas. A per-prune delta would read
+    /// as zero for RingBuffer, whose real eviction is an unobservable
+    /// overwrite inside insert() (pruneOlderThan is a no-op for it, per
+    /// storage_backend.zig) — the interface exposes no eviction-count
+    /// method (CLAUDE.md 3.2: no backend-specific public surface), so this
+    /// is computed from data every backend already reports.
     evicted: u64 = 0,
     ingest_ns: i64 = 0,
     prune_ns: i64 = 0,
@@ -570,6 +578,23 @@ pub fn simulateAllBackends(
     var stream = try synthetic.Stream.init(allocator, sensors, seed, SIM_START_MS, true);
     defer stream.deinit();
 
+    // Step 4 of the sim-perf-overhaul: cap each sensor type's generation at
+    // its OWN retention-derived horizon (simDaysForRetention — the same
+    // formula that sizes the whole run off the longest type, so the longest
+    // type's horizon equals total_days and is never actually capped). Past
+    // its horizon a type's dataset is frozen at steady-state size; ticking
+    // it further would only churn identical-shaped data through
+    // insert+prune. Safe because every benchmark query anchors its window
+    // to the data's own newest reading (getLatestBySensor / newest among
+    // members), never to absolute sim-now. Data-driven per type — the day
+    // counts come from profileFor's retention_days, no type branches.
+    var type_horizon_days: [SENSOR_TYPE_COUNT]u32 = @splat(0);
+    for (type_samples) |group| {
+        const retention = synthetic.profileFor(group.sensor_type).retention_days;
+        type_horizon_days[@intFromEnum(group.sensor_type)] = simDaysForRetention(retention);
+    }
+    stream.capHorizons(&type_horizon_days);
+
     const replay_file = try replay_dir.createFile(io, REPLAY_FILE_NAME, .{ .read = true });
     defer replay_file.close(io);
 
@@ -593,8 +618,17 @@ pub fn simulateAllBackends(
         // insert (RingBuffer sizes a sensor's buffer when it's first seen);
         // a no-op on the full-retention backends.
         for (type_samples) |group| try world.setRetentionHint(group.sensor_type, RINGBUFFER_CAP);
-        // Topology up front — the first checkpoint's zone/floor queries need it.
-        for (locations) |loc| try world.registerZone(loc.sensor_id, loc.zone_id);
+        // Topology up front — the first checkpoint's zone/floor/spatial
+        // queries need it. Positions are the REAL parsed placement
+        // (ZoneLocation.position from the IFC), same source as zones.
+        for (locations) |loc| {
+            try world.registerZone(loc.sensor_id, loc.zone_id);
+            try world.registerPosition(loc.sensor_id, .{
+                .x = @floatCast(loc.position.x),
+                .y = @floatCast(loc.position.y),
+                .z = @floatCast(loc.position.z),
+            });
+        }
         for (zone_floor) |zf| try world.registerFloor(zf.zone_id, zf.floor_id);
 
         var source: DaySource = if (backend_idx == 0)
@@ -638,19 +672,30 @@ pub fn simulateAllBackends(
             // Retention eviction: slack-scheduled normally, but
             // unconditional right before a checkpoint so every backend is
             // at the exact retention watermark when queried.
+            //
+            // The prune watermark freezes with the type's generation
+            // horizon (capHorizons above): once a type stops generating,
+            // advancing the cutoff with sim time would eventually evict
+            // its ENTIRE frozen dataset and late checkpoints would measure
+            // empty backends. Freezing the cutoff keeps exactly the
+            // steady-state retention window resident — the same data the
+            // type would hold at any later checkpoint anyway. After the
+            // freeze-watermark prune has run once, the type is skipped
+            // (further prunes with the same cutoff are guaranteed no-ops).
             for (type_samples) |group| {
                 const type_idx = @intFromEnum(group.sensor_type);
                 const retention_ms: i64 = @as(i64, synthetic.profileFor(group.sensor_type).retention_days) * CHUNK_MS;
-                if (!at_checkpoint and !shouldPrune(last_prune[type_idx], elapsed_ms, retention_ms)) continue;
-                if (elapsed_ms <= retention_ms) continue; // Nothing can be out of retention yet.
+                const horizon_ms: i64 = @as(i64, type_horizon_days[type_idx]) * CHUNK_MS;
+                const watermark_ms = @min(elapsed_ms, horizon_ms);
+                if (last_prune[type_idx] >= horizon_ms) continue; // Frozen; final prune already ran.
+                if (!at_checkpoint and !shouldPrune(last_prune[type_idx], watermark_ms, retention_ms)) continue;
+                if (watermark_ms <= retention_ms) continue; // Nothing can be out of retention yet.
 
-                const cutoff = day_end - retention_ms;
-                const before = world.count();
+                const cutoff = SIM_START_MS + watermark_ms - retention_ms;
                 var prune = PruneCall(W){ .world = &world, .sensor_type = group.sensor_type, .cutoff = cutoff };
                 stats.prune_ns += try metrics.timeMutation(io, PruneCall(W).call, .{&prune});
                 stats.prune_calls += 1;
-                stats.evicted += before - world.count();
-                last_prune[type_idx] = elapsed_ms;
+                last_prune[type_idx] = watermark_ms;
             }
 
             if (at_checkpoint) {
@@ -745,6 +790,7 @@ pub fn simulateAllBackends(
         // absorb and evict data" figure the compression ratio reports.
         stats.sim_ms = @as(i64, total_days) * CHUNK_MS;
         stats.wall_ns = stats.ingest_ns + stats.prune_ns;
+        stats.evicted = stats.ingested - world.count();
         try sim_stats_out.append(allocator, stats);
 
         const backend_end = std.Io.Clock.awake.now(io);
