@@ -906,12 +906,36 @@ test "isCloseRace: within threshold is close, beyond it is not, fewer than 2 sco
     };
     try std.testing.expect(!isCloseRace(&far));
 
-    // Boundary: exactly CLOSE_RACE_THRESHOLD (15%) is still a close race (`<=`).
+    // Boundary: exactly CLOSE_RACE_THRESHOLD (15%) is still a close race
+    // (`<=`). 0.15 is not exactly representable in binary, so a decimal
+    // literal near it (e.g. winner=1.000/runner_up=1.150) does NOT reliably
+    // land on CLOSE_RACE_THRESHOLD bit-for-bit — verified: that pair's ratio
+    // lands 3 ULPs below it, meaning such a test can't distinguish `<=` from
+    // `<`. winner=10.0/runner_up=11.5 does land exactly: 11.5-10.0=1.5 is
+    // exact (both operands exactly representable in binary; Sterbenz's
+    // lemma also guarantees the subtraction itself is exact), and
+    // 1.5/10.0's correctly-rounded result happens to be the identical
+    // double as the `0.15` literal used to define CLOSE_RACE_THRESHOLD. The
+    // sanity check below proves this bit-exactness rather than assuming it.
+    const winner_score: f64 = 10.0;
+    const runner_up_score: f64 = 11.5;
+    const ratio = (runner_up_score - winner_score) / winner_score;
+    try std.testing.expectEqual(CLOSE_RACE_THRESHOLD, ratio);
+
     const boundary = [_]BackendScore{
-        .{ .backend = "A", .score = 1.000, .coverage = 1.0 },
-        .{ .backend = "B", .score = 1.150, .coverage = 1.0 },
+        .{ .backend = "A", .score = winner_score, .coverage = 1.0 },
+        .{ .backend = "B", .score = runner_up_score, .coverage = 1.0 },
     };
     try std.testing.expect(isCloseRace(&boundary));
+
+    // One ULP further from winner than the exact-boundary case — proves the
+    // comparison doesn't drift past the intended threshold.
+    const just_beyond_score = std.math.nextAfter(f64, runner_up_score, std.math.inf(f64));
+    const just_beyond = [_]BackendScore{
+        .{ .backend = "A", .score = winner_score, .coverage = 1.0 },
+        .{ .backend = "B", .score = just_beyond_score, .coverage = 1.0 },
+    };
+    try std.testing.expect(!isCloseRace(&just_beyond));
 
     const single = [_]BackendScore{
         .{ .backend = "A", .score = 1.000, .coverage = 1.0 },
