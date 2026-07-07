@@ -8,6 +8,7 @@ graphify-out/
 smoke-out*/
 hospital-out*/
 house-results/
+benchmark-results-office/
 
 # Run outputs from older commits — same category as smoke-out*/house-results.
 output/

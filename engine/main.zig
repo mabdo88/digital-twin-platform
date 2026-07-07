@@ -583,14 +583,21 @@ fn writeRecommendationReport(
     try md.print(allocator, "**Deployment combo: {s} (live) + {s} (historical)**\n\n", .{ compound.realtime.winner, compound.historical.winner });
 
     if (type_recommendations.len > 0) {
+        var placed_type_count: u32 = 0;
+        for (counts) |c| {
+            if (c > 0) placed_type_count += 1;
+        }
+
         try md.print(allocator, "## Recommendation by Sensor Type\n\n", .{});
-        try md.print(allocator, "Same scoring rule as above, but scoped to one sensor type at a time. For each of the " ++
-            "{d} sensor types actually placed in this building, each of that type's canonical type-scoped queries is " ++
-            "measured once against a real placed sensor of that exact type, over its full independently-generated " ++
-            "dataset. Scores only the query patterns in that type's own canonical relevant_queries that take a sensor " ++
-            "type as an argument (`latest_by_type`, `avg_zone_type`, `floor_stats`, `daily_zone_rollup`, `anomalies` " ++
-            "— whichever are relevant for this specific type). A type's winner can differ from the building-wide " ++
-            "winner above if that type's relevant queries behave differently.\n\n", .{
+        try md.print(allocator, "Same scoring rule as above, but scoped to one sensor type at a time. Of the " ++
+            "{d} sensor types actually placed in this building, {d} have at least one type-scoped query in their " ++
+            "canonical relevant_queries and are scored below; each is measured once against a real placed sensor " ++
+            "of that exact type, over its full independently-generated dataset. Scores only the query patterns in " ++
+            "that type's own canonical relevant_queries that take a sensor type as an argument (`latest_by_type`, " ++
+            "`avg_zone_type`, `floor_stats`, `daily_zone_rollup`, `anomalies` — whichever are relevant for this " ++
+            "specific type). A type's winner can differ from the building-wide winner above if that type's " ++
+            "relevant queries behave differently.\n\n", .{
+            placed_type_count,
             type_recommendations.len,
         });
         for (type_recommendations) |tr| {
