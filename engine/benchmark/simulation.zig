@@ -40,16 +40,44 @@ const ONE_HOUR_MS: i64 = 60 * 60 * 1000;
 pub const SIM_START_MS: i64 = 1_700_000_000_000; // 2023-11-14T22:13:20Z
 
 /// RingBuffer is a deliberately tiny, real-time-only cache: a flat capacity
-/// of this many readings PER SENSOR for EVERY sensor type — no per-type,
-/// retention, or frequency math (explicit design decision 2026-07-01). The
-/// live feed writes at each type's own cadence and RingBuffer's existing
-/// eviction (the Nth+1 write drops the oldest) keeps only the most recent
-/// `RINGBUFFER_CAP`. `setRetentionHint` is a genuine no-op on every
-/// full-retention backend, so applying it unconditionally caps only
-/// RingBuffer. Because RingBuffer thus holds a fraction of the data most
-/// queries need, it competes only in the compound recommendation's
-/// real-time track (report.recommendCompound), never the historical one.
-pub const RINGBUFFER_CAP: usize = 10;
+/// of this many readings PER SENSOR for EVERY sensor type, floored here and
+/// raised only if a placed type samples fast enough to need more (see
+/// deriveRingBufferCap below — revised 2026-07-07; the original design
+/// decision 2026-07-01 used this as an unconditional flat value with no
+/// per-type or frequency math at all). The live feed writes at each type's
+/// own cadence and RingBuffer's existing eviction (the Nth+1 write drops
+/// the oldest) keeps only the most recent capacity. `setRetentionHint` is a
+/// genuine no-op on every full-retention backend, so applying it
+/// unconditionally caps only RingBuffer. Because RingBuffer thus holds a
+/// fraction of the data most queries need, it competes only in the compound
+/// recommendation's real-time track (report.recommendCompound), never the
+/// historical one.
+pub const RINGBUFFER_CAP_FLOOR: usize = 10;
+
+/// RingBuffer capacity for a building whose fastest-sampling placed type
+/// samples at max_frequency_hz — enough readings to cover a 1-second
+/// real-time window at that rate, floored at RINGBUFFER_CAP_FLOOR. A flat
+/// 10-reading cap is fine for today's sub-1Hz sensor types (5-60 minute
+/// intervals) but would starve a genuinely high-frequency type (e.g. a
+/// 100Hz accelerometer) down to a fraction of a second of history. Pure
+/// math, exposed for tests; production callers use deriveRingBufferCap.
+pub fn ringBufferCapForFrequency(max_frequency_hz: f32) usize {
+    const from_rate: usize = @intFromFloat(@ceil(max_frequency_hz));
+    return @max(RINGBUFFER_CAP_FLOOR, from_rate);
+}
+
+/// Flat RingBuffer capacity for the actual placed sensor types in this
+/// building — sized to whichever placed type samples fastest, not
+/// hardcoded. Still one flat number applied to every type (no per-type
+/// formula — CLAUDE.md's storage-redesign-plan.md), just building-derived
+/// instead of a literal constant. Returns the floor for an empty slice.
+pub fn deriveRingBufferCap(sensor_types: []const sb.SensorType) usize {
+    var max_frequency_hz: f32 = 0;
+    for (sensor_types) |t| {
+        max_frequency_hz = @max(max_frequency_hz, synthetic.profileFor(t).frequency_hz);
+    }
+    return ringBufferCapForFrequency(max_frequency_hz);
+}
 
 /// One simulated day per generated/ingested chunk. At least as long as
 /// every sensor type's sampling period (the slowest is energy at 15 min),
@@ -565,6 +593,14 @@ pub fn simulateAllBackends(
 ) !void {
     if (checkpoints.len == 0) return;
 
+    // Same flat cap for every backend/type this run — computed once from
+    // the building's actual placed types (deriveRingBufferCap), not the
+    // old hardcoded literal.
+    var placed_types: std.ArrayList(sb.SensorType) = .empty;
+    defer placed_types.deinit(allocator);
+    for (type_samples) |ts| try placed_types.append(allocator, ts.sensor_type);
+    const ringbuffer_cap = deriveRingBufferCap(placed_types.items);
+
     const total_days = checkpoints[checkpoints.len - 1].sim_day;
 
     std.debug.print("\n--- Live day-zero simulation: {d} backends, sequential (replay-cached generation) ---\n", .{runner.backends.len});
@@ -614,10 +650,10 @@ pub fn simulateAllBackends(
         var world = try W.init(allocator);
         defer world.deinit();
 
-        // Cap every placed sensor type at RINGBUFFER_CAP BEFORE the first
+        // Cap every placed sensor type at ringbuffer_cap BEFORE the first
         // insert (RingBuffer sizes a sensor's buffer when it's first seen);
         // a no-op on the full-retention backends.
-        for (type_samples) |group| try world.setRetentionHint(group.sensor_type, RINGBUFFER_CAP);
+        for (type_samples) |group| try world.setRetentionHint(group.sensor_type, ringbuffer_cap);
         // Topology up front — the first checkpoint's zone/floor/spatial
         // queries need it. Positions are the REAL parsed placement
         // (ZoneLocation.position from the IFC), same source as zones.
@@ -842,6 +878,26 @@ test "deriveSimDays: uses the longest retention among placed types; empty input 
     try testing.expectEqual(simDaysForRetention(90), deriveSimDays(&short));
 
     try testing.expectEqual(@as(u32, 0), deriveSimDays(&.{}));
+}
+
+test "ringBufferCapForFrequency: floors at RINGBUFFER_CAP_FLOOR for today's sub-1Hz sensor rates" {
+    try testing.expectEqual(@as(usize, RINGBUFFER_CAP_FLOOR), ringBufferCapForFrequency(1.0 / 300.0));
+}
+
+test "ringBufferCapForFrequency: zero frequency still floors" {
+    try testing.expectEqual(@as(usize, RINGBUFFER_CAP_FLOOR), ringBufferCapForFrequency(0));
+}
+
+test "ringBufferCapForFrequency: a rate faster than the floor raises the cap to cover it" {
+    // 100Hz sensor -> a 1-second real-time window needs 100 readings, not 10.
+    try testing.expectEqual(@as(usize, 100), ringBufferCapForFrequency(100.0));
+}
+
+test "deriveRingBufferCap: uses the fastest placed type's rate; empty input is the floor" {
+    const types = [_]sb.SensorType{ .temperature, .vibration, .structural };
+    try testing.expectEqual(@as(usize, RINGBUFFER_CAP_FLOOR), deriveRingBufferCap(&types));
+
+    try testing.expectEqual(@as(usize, RINGBUFFER_CAP_FLOOR), deriveRingBufferCap(&.{}));
 }
 
 test "deriveCheckpoints: short building gets day/week/month ladder + steady state, no duplicate" {

@@ -599,6 +599,24 @@ fn writeRecommendationReport(
 
     try md.print(allocator, "\n> Honesty headline: relative rankings are reliable; absolute numbers are approximate (CLAUDE.md §6).\n\n", .{});
 
+    {
+        var storey_count: u32 = 0;
+        var space_count: u32 = 0;
+        for (model.zones) |z| switch (z.zone_type) {
+            .storey => storey_count += 1,
+            .space => space_count += 1,
+        };
+        if (space_count == 0 and storey_count > 0) {
+            try md.print(allocator, "> **Data-quality note:** this IFC file has {d} `IfcBuildingStorey` " ++
+                "entit{s} but zero `IfcSpace` entities. Comfort/IAQ sensors (temperature, humidity, occupancy, " ++
+                "CO2, air_quality) attach only to `IfcSpace` elements, so none were placed — this is likely a " ++
+                "discipline-specific export (e.g. furniture/MEP-only) detached from the architectural model " ++
+                "that would normally carry room boundaries, not a placement bug.\n\n", .{
+                storey_count, if (storey_count == 1) "y" else "ies",
+            });
+        }
+    }
+
     try md.print(allocator, "## Recommendation\n\n", .{});
     try md.print(allocator, "Recommendations are **compound** — split into two independently-won tracks, because no single backend " ++
         "should serve both a tiny live cache's workload and a full-history store's workload:\n\n", .{});
