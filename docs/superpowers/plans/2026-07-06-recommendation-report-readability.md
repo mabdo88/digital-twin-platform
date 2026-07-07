@@ -88,7 +88,7 @@ Insert into `engine/benchmark/report.zig` right after the `CompoundRecommendatio
 
 ```zig
 /// Auto-scaled human-readable duration — µs below 1000µs, ms below
-/// 1_000_000µs, s otherwise. Used everywhere a raw query latency is
+/// 100_000µs (100ms), s otherwise. Used everywhere a raw query latency is
 /// displayed; never applied to scores/coverage/ratios (those stay as
 /// plain numbers). See docs/superpowers/specs/2026-07-06-recommendation-
 /// report-readability-design.md.
@@ -96,7 +96,7 @@ pub const ScaledDuration = struct { value: f64, unit: []const u8 };
 
 pub fn scaleMicros(us: f64) ScaledDuration {
     if (us < 1000.0) return .{ .value = us, .unit = "µs" };
-    if (us < 1_000_000.0) return .{ .value = us / 1000.0, .unit = "ms" };
+    if (us < 100_000.0) return .{ .value = us / 1000.0, .unit = "ms" };
     return .{ .value = us / 1_000_000.0, .unit = "s" };
 }
 
@@ -700,15 +700,121 @@ git commit -m "Restructure recommendation.md: verdict-first, collapsed detail, s
 ### Task 7: `writeBuildingHtmlReport` — new self-contained HTML dashboard in `report.zig`
 
 **Files:**
-- Modify: `engine/benchmark/report.zig` (add three new functions at the end of the file: `writeBuildingHtmlReport`, `writeScoreTableHtml`, `writeWinnersHtml`)
+- Modify: `engine/benchmark/report.zig` — (a) extract a shared `findWinnerAndRunnerUp` helper out of `writeWinners`' selection logic and refactor `writeWinners` to call it, (b) add three new functions at the end of the file: `writeBuildingHtmlReport`, `writeScoreTableHtml`, `writeWinnersHtml`
 
 **Interfaces:**
 - Consumes: `BackendScore`, `CompoundRecommendation`, `TypeRecommendation`, `SensorTypeCount`, `CostRow` (Task 5), `writeScaledUs`/`scaleMicros` (Task 1), `isCloseRace` (Task 2), `RunRow`, `queryNameFromStr`, `backendEligible` (all pre-existing in this file), `sim_mod.GrowthPoint`/`sim_mod.SimStats` (pre-existing `const sim_mod = @import("simulation.zig");` alias in this file).
-- Produces: `pub fn writeBuildingHtmlReport(allocator, io, dir, bim_path, scale_label, sensor_type_counts, compound, type_recommendations, rows, full_retention_names, growth, sim_stats, cost_rows, naive_cost, optimised_cost) !void` — writes `recommendation.html`. Consumed by Task 8.
+- Produces: `const WinnerPair = struct { winner: RunRow, runner_up: ?RunRow }`, `fn findWinnerAndRunnerUp(rows, scale, query, historical_eligible) ?WinnerPair` — shared by `writeWinners` and the new `writeWinnersHtml`. `pub fn writeBuildingHtmlReport(allocator, io, dir, bim_path, scale_label, sensor_type_counts, compound, type_recommendations, rows, full_retention_names, growth, sim_stats, cost_rows, naive_cost, optimised_cost) !void` — writes `recommendation.html`. Consumed by Task 8.
 
-This intentionally duplicates `writeWinners`' winner/runner-up selection logic into a second, HTML-flavored `writeWinnersHtml` rather than sharing print statements between Markdown-pipe output and HTML-tag output — the two renderings differ enough (`| a | b |` vs `<td>a</td><td>b</td>`) that a shared-callback abstraction would cost more than the ~30 duplicated lines it removes.
+Markdown (`writeWinners`) and HTML (`writeWinnersHtml`) render each query's winner/runner-up row very differently (`| a | b |` vs `<td>a</td><td>b</td>`), but the underlying best/second-fastest-backend selection is identical logic — so it's extracted once into `findWinnerAndRunnerUp` and each renderer only owns its own cell formatting.
 
-- [ ] **Step 1: Add the three functions at the end of `engine/benchmark/report.zig`**
+- [ ] **Step 1: Extract the shared selection helper and refactor `writeWinners` to use it**
+
+In `engine/benchmark/report.zig`, replace `writeWinners`' entire body (as left by Task 3) with a version that delegates selection to a new `findWinnerAndRunnerUp`:
+
+```zig
+pub fn writeWinners(
+    w: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    rows: []const RunRow,
+    scale: []const u8,
+    historical_eligible: ?[]const []const u8,
+    scaled_units: bool,
+) !void {
+    var seen: std.ArrayList([]const u8) = .empty;
+    defer seen.deinit(allocator);
+
+    for (rows) |r| {
+        if (!std.mem.eql(u8, r.scale, scale)) continue;
+
+        var already = false;
+        for (seen.items) |s| {
+            if (std.mem.eql(u8, s, r.query)) {
+                already = true;
+                break;
+            }
+        }
+        if (already) continue;
+        try seen.append(allocator, r.query);
+
+        const pair = findWinnerAndRunnerUp(rows, scale, r.query, historical_eligible) orelse continue;
+        const best_us = @as(f64, @floatFromInt(pair.winner.stats.median_ns)) / 1000.0;
+
+        try w.print(allocator, "| {s} | **{s}** | ", .{ r.query, pair.winner.backend });
+        try writeScaledUs(w, allocator, best_us, scaled_units);
+
+        if (pair.runner_up) |second| {
+            const second_us = @as(f64, @floatFromInt(second.stats.median_ns)) / 1000.0;
+            const speedup = if (pair.winner.stats.median_ns > 0)
+                @as(f64, @floatFromInt(second.stats.median_ns)) /
+                    @as(f64, @floatFromInt(pair.winner.stats.median_ns))
+            else
+                0.0;
+            try w.print(allocator, " | {s} | ", .{second.backend});
+            try writeScaledUs(w, allocator, second_us, scaled_units);
+            try w.print(allocator, " | {d:.2}× |\n", .{speedup});
+        } else {
+            try w.print(allocator, " | — | — | — |\n", .{});
+        }
+    }
+}
+
+/// Result of scanning `rows` for one query's fastest backend (winner) and
+/// second-fastest (runner-up) at `scale`, respecting the same eligibility
+/// rule scoreBackends/recommendCompound apply (non-real-time queries only
+/// admit `historical_eligible` backends when it's non-null). Shared by
+/// writeWinners (Markdown) and writeWinnersHtml (HTML) below so the two
+/// renderers can't drift on selection logic while each still emits its own
+/// cell format. Returns null when no eligible backend has data for this
+/// query.
+const WinnerPair = struct {
+    winner: RunRow,
+    runner_up: ?RunRow,
+};
+
+fn findWinnerAndRunnerUp(
+    rows: []const RunRow,
+    scale: []const u8,
+    query: []const u8,
+    historical_eligible: ?[]const []const u8,
+) ?WinnerPair {
+    const rowEligible = struct {
+        fn check(eligible: ?[]const []const u8, query_name: []const u8, backend: []const u8) bool {
+            const list = eligible orelse return true;
+            const q = queryNameFromStr(query_name) orelse return true;
+            if (queries.familyOf(q) == .real_time) return true;
+            return backendEligible(list, backend);
+        }
+    }.check;
+
+    var best_idx: ?usize = null;
+    var second_idx: ?usize = null;
+    for (rows, 0..) |candidate, i| {
+        if (!std.mem.eql(u8, candidate.scale, scale)) continue;
+        if (!std.mem.eql(u8, candidate.query, query)) continue;
+        if (!rowEligible(historical_eligible, candidate.query, candidate.backend)) continue;
+        if (best_idx == null or candidate.stats.median_ns < rows[best_idx.?].stats.median_ns) {
+            second_idx = best_idx;
+            best_idx = i;
+        } else if (second_idx == null or candidate.stats.median_ns < rows[second_idx.?].stats.median_ns) {
+            second_idx = i;
+        }
+    }
+
+    const bi = best_idx orelse return null;
+    return .{
+        .winner = rows[bi],
+        .runner_up = if (second_idx) |si| rows[si] else null,
+    };
+}
+```
+
+- [ ] **Step 2: Build and run tests**
+
+Run: `zig build && zig build test`
+Expected: both succeed — this confirms the `writeWinners` refactor didn't change its observable behavior before moving on to new code.
+
+- [ ] **Step 3: Add the three new functions at the end of `engine/benchmark/report.zig`**
 
 ```zig
 // ---------------------------------------------------------------------------
@@ -893,11 +999,8 @@ fn writeScoreTableHtml(
     try html.print(allocator, "</table></div>\n", .{});
 }
 
-/// HTML-table equivalent of writeWinners above — same winner/runner-up
-/// selection logic and eligibility rule, rendered as <tr> rows instead of
-/// Markdown pipes (kept separate rather than shared: the two output
-/// formats differ enough per-cell that a shared row-renderer callback
-/// would cost more than the duplication it removes).
+/// HTML-table equivalent of writeWinners above — same findWinnerAndRunnerUp
+/// selection helper, rendered as <tr> rows instead of Markdown pipes.
 fn writeWinnersHtml(
     html: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
@@ -905,14 +1008,6 @@ fn writeWinnersHtml(
     scale: []const u8,
     historical_eligible: ?[]const []const u8,
 ) !void {
-    const rowEligible = struct {
-        fn check(eligible: ?[]const []const u8, query_name: []const u8, backend: []const u8) bool {
-            const list = eligible orelse return true;
-            const q = queryNameFromStr(query_name) orelse return true;
-            if (queries.familyOf(q) == .real_time) return true;
-            return backendEligible(list, backend);
-        }
-    }.check;
     var seen: std.ArrayList([]const u8) = .empty;
     defer seen.deinit(allocator);
 
@@ -928,50 +1023,34 @@ fn writeWinnersHtml(
         if (already) continue;
         try seen.append(allocator, r.query);
 
-        var best_idx: ?usize = null;
-        var second_idx: ?usize = null;
-        for (rows, 0..) |candidate, i| {
-            if (!std.mem.eql(u8, candidate.scale, scale)) continue;
-            if (!std.mem.eql(u8, candidate.query, r.query)) continue;
-            if (!rowEligible(historical_eligible, candidate.query, candidate.backend)) continue;
-            if (best_idx == null or candidate.stats.median_ns < rows[best_idx.?].stats.median_ns) {
-                second_idx = best_idx;
-                best_idx = i;
-            } else if (second_idx == null or candidate.stats.median_ns < rows[second_idx.?].stats.median_ns) {
-                second_idx = i;
-            }
-        }
+        const pair = findWinnerAndRunnerUp(rows, scale, r.query, historical_eligible) orelse continue;
+        const best_us = @as(f64, @floatFromInt(pair.winner.stats.median_ns)) / 1000.0;
 
-        if (best_idx) |bi| {
-            const best = rows[bi];
-            const best_us = @as(f64, @floatFromInt(best.stats.median_ns)) / 1000.0;
-            try html.print(allocator, "<tr><td>{s}</td><td><strong>{s}</strong></td><td>", .{ r.query, best.backend });
-            try writeScaledUs(html, allocator, best_us, true);
-            try html.print(allocator, "</td>", .{});
-            if (second_idx) |si| {
-                const second = rows[si];
-                const second_us = @as(f64, @floatFromInt(second.stats.median_ns)) / 1000.0;
-                const speedup = if (best.stats.median_ns > 0)
-                    @as(f64, @floatFromInt(second.stats.median_ns)) / @as(f64, @floatFromInt(best.stats.median_ns))
-                else
-                    0.0;
-                try html.print(allocator, "<td>{s}</td><td>", .{second.backend});
-                try writeScaledUs(html, allocator, second_us, true);
-                try html.print(allocator, "</td><td>{d:.2}×</td></tr>\n", .{speedup});
-            } else {
-                try html.print(allocator, "<td>—</td><td>—</td><td>—</td></tr>\n", .{});
-            }
+        try html.print(allocator, "<tr><td>{s}</td><td><strong>{s}</strong></td><td>", .{ r.query, pair.winner.backend });
+        try writeScaledUs(html, allocator, best_us, true);
+        try html.print(allocator, "</td>", .{});
+        if (pair.runner_up) |second| {
+            const second_us = @as(f64, @floatFromInt(second.stats.median_ns)) / 1000.0;
+            const speedup = if (pair.winner.stats.median_ns > 0)
+                @as(f64, @floatFromInt(second.stats.median_ns)) / @as(f64, @floatFromInt(pair.winner.stats.median_ns))
+            else
+                0.0;
+            try html.print(allocator, "<td>{s}</td><td>", .{second.backend});
+            try writeScaledUs(html, allocator, second_us, true);
+            try html.print(allocator, "</td><td>{d:.2}×</td></tr>\n", .{speedup});
+        } else {
+            try html.print(allocator, "<td>—</td><td>—</td><td>—</td></tr>\n", .{});
         }
     }
 }
 ```
 
-- [ ] **Step 2: Build**
+- [ ] **Step 4: Build**
 
 Run: `zig build`
 Expected: succeeds. `writeBuildingHtmlReport` isn't called yet (Task 8 wires it), so this only checks the new code compiles standalone — if it doesn't get dead-code-stripped by the compiler and any unused-parameter or type error surfaces, fix it here before moving on.
 
-- [ ] **Step 3: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
 git add engine/benchmark/report.zig

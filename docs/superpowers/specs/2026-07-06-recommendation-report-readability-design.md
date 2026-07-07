@@ -82,9 +82,12 @@ const ScaledDuration = struct { value: f64, unit: []const u8 };
 fn scaleMicros(us: f64) ScaledDuration
 ```
 
-Rules: `< 1000µs` stays `µs` (1 decimal); `< 1_000_000µs` becomes `ms` (2
-decimals); otherwise `s` (2 decimals). Scores/coverage are not passed through
-this — only raw latency values.
+Rules: `< 1000µs` stays `µs` (1 decimal); `< 100_000µs` (100ms) becomes `ms`
+(2 decimals); otherwise `s` (2 decimals) — corrected during Task 1's
+implementation from an initial `1_000_000µs` draft, which contradicted this
+doc's own worked example (`582859.8µs → 0.58s`, which needs the cutover
+below 1 second to actually reach the `s` branch). Scores/coverage are not
+passed through this — only raw latency values.
 
 ## HTML dashboard (new)
 
