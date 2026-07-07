@@ -263,6 +263,28 @@ pub fn recommendCompound(
     };
 }
 
+/// A track's top two backends count as a "close race" when within this
+/// fraction of each other — a disclosed, deliberate policy constant (not
+/// researched), same spirit as UNCOVERED_QUERY_PENALTY above. Motivated by
+/// an observed case: three consecutive runs of the same 32-sensor office
+/// building (identical seed, identical code) produced three different
+/// real-time-track winners between two backends whose scores sat within
+/// ~10% of each other on two of those three runs, while a >30x-margin
+/// track never reordered across the same three runs.
+pub const CLOSE_RACE_THRESHOLD: f64 = 0.15;
+
+/// True when `scores` (sorted ascending — best first, the shape
+/// TrackRecommendation.scores is already in) has a winner and runner-up
+/// within CLOSE_RACE_THRESHOLD of each other. Fewer than 2 scores is never
+/// a close race (nothing to compare against).
+pub fn isCloseRace(scores: []const BackendScore) bool {
+    if (scores.len < 2) return false;
+    const winner = scores[0].score;
+    const runner_up = scores[1].score;
+    if (winner <= 0) return false;
+    return (runner_up - winner) / winner <= CLOSE_RACE_THRESHOLD;
+}
+
 /// Write `latency.md`, `latency.json`, and `benchmark.html` under
 /// `dir_path` (created if missing).
 pub fn writeReports(
@@ -869,4 +891,26 @@ test "scaleMicros: stays microseconds below 1000, switches to ms then s at each 
     // Boundary: exactly 1000µs is the first value that becomes ms, not µs.
     const boundary = scaleMicros(1000.0);
     try std.testing.expectEqualStrings("ms", boundary.unit);
+}
+
+test "isCloseRace: within threshold is close, beyond it is not, fewer than 2 scores is never close" {
+    const close = [_]BackendScore{
+        .{ .backend = "A", .score = 1.000, .coverage = 1.0 },
+        .{ .backend = "B", .score = 1.100, .coverage = 1.0 },
+    };
+    try std.testing.expect(isCloseRace(&close));
+
+    const far = [_]BackendScore{
+        .{ .backend = "A", .score = 1.000, .coverage = 1.0 },
+        .{ .backend = "B", .score = 1.318, .coverage = 1.0 },
+    };
+    try std.testing.expect(!isCloseRace(&far));
+
+    const single = [_]BackendScore{
+        .{ .backend = "A", .score = 1.000, .coverage = 1.0 },
+    };
+    try std.testing.expect(!isCloseRace(&single));
+
+    const empty = [_]BackendScore{};
+    try std.testing.expect(!isCloseRace(&empty));
 }
