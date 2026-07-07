@@ -16,3 +16,10 @@ output/
 # subagent-driven-development scratch state (progress ledger, task briefs,
 # review packages) — never tracked.
 .superpowers/
+
+# AI coding-tool local config/scratch — machine-local, not project docs.
+# (.cascade/digital-twin/, CLAUDE.md, AGENT.md are kept: cross-referenced
+# from README.md as the project's actual rules/status documentation.)
+.claude/
+.windsurf/
+docs/superpowers/
