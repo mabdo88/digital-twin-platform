@@ -723,15 +723,12 @@ pub fn writeGrowthSection(
         "(retention-full, actively evicting). This shows whether a backend's query " ++
         "latency is constant (O(1) access) or grows with data volume.\n\n", .{});
 
-    try md.print(allocator, "| Checkpoint | Day | Backend | Query | Median µs | Live readings | Memory (MB) |\n", .{});
+    try md.print(allocator, "| Checkpoint | Day | Backend | Query | Median | Live readings | Memory (MB) |\n", .{});
     try md.print(allocator, "|---|---:|---|---|---:|---:|---:|\n", .{});
     for (growth) |g| {
-        try md.print(allocator, "| {s} | {d} | {s} | {s} | {d:.1} | {d} | {d:.1} |\n", .{
-            g.label,
-            g.sim_day,
-            g.backend,
-            g.query,
-            @as(f64, @floatFromInt(g.median_ns)) / 1000.0,
+        try md.print(allocator, "| {s} | {d} | {s} | {s} | ", .{ g.label, g.sim_day, g.backend, g.query });
+        try writeScaledUs(md, allocator, @as(f64, @floatFromInt(g.median_ns)) / 1000.0, true);
+        try md.print(allocator, " | {d} | {d:.1} |\n", .{
             g.reading_count,
             @as(f64, @floatFromInt(g.memory_bytes)) / (1024.0 * 1024.0),
         });
