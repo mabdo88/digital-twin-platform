@@ -11,3 +11,7 @@ house-results/
 
 # Run outputs from older commits — same category as smoke-out*/house-results.
 output/
+
+# subagent-driven-development scratch state (progress ledger, task briefs,
+# review packages) — never tracked.
+.superpowers/
