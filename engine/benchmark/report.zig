@@ -9,6 +9,7 @@ const std = @import("std");
 const metrics = @import("../ecs/systems/metrics_system.zig");
 const fixtures = @import("dataset.zig");
 const queries = @import("queries.zig");
+const sb = @import("../ecs/storage/storage_backend.zig");
 
 /// One latency-table row, decoupled from how it's rendered.
 pub const RunRow = struct {
@@ -107,6 +108,38 @@ pub fn writeScaledUs(w: *std.ArrayList(u8), allocator: std.mem.Allocator, us: f6
         try w.print(allocator, "{d:.2}{s}", .{ d.value, d.unit });
     }
 }
+
+/// One backend ranking scoped to a single sensor type — same shape as the
+/// building-level CompoundRecommendation, filtered down to that type's own
+/// type-scoped queries. Moved here (from main.zig) so both the markdown
+/// assembly in main.zig and writeBuildingHtmlReport below can share one
+/// definition.
+pub const TypeRecommendation = struct {
+    sensor_type: sb.SensorType,
+    compound: CompoundRecommendation,
+};
+
+/// One row of the "Sensors placed, by type" table — plain data, no
+/// dependency on synthetic/generator.zig's SensorProfile so this file's
+/// import graph stays as-is.
+pub const SensorTypeCount = struct {
+    name: []const u8,
+    count: u32,
+    retention_days: u32,
+};
+
+/// One row of the cost-estimate table — mirrors cost_model.CostEstimate's
+/// printed fields without importing cost_model.zig here (cost_model.zig
+/// already imports report.zig for RunRow, so importing it back would be a
+/// circular dependency; main.zig maps cost_model.CostEstimate values into
+/// this type instead).
+pub const CostRow = struct {
+    backend: []const u8,
+    storage_gb: f64,
+    storage_cost_year: f64,
+    query_cost_year: f64,
+    total_cost_year: f64,
+};
 
 /// How much each unit of *uncovered* query weight counts against a backend
 /// in `scoreBackends`'s score (1.0 = as good as tying the per-query

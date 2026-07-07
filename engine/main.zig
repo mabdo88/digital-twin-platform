@@ -286,15 +286,6 @@ fn buildSchematicData(
     return .{ .sensors = sensors, .zones = try zones.toOwnedSlice(allocator) };
 }
 
-/// One backend ranking scoped to a single sensor type — same shape as
-/// the building-level `report.Recommendation`, just filtered down to that
-/// type's own type-scoped queries (synthetic.profileFor(st).relevant_queries
-/// filtered through filterTypeScoped).
-const TypeCompoundRecommendation = struct {
-    sensor_type: sb.SensorType,
-    compound: report.CompoundRecommendation,
-};
-
 /// Comptime-extracted names of the full-retention backends
 /// (runner.supported_backends) — passed to `recommendCompound` as the
 /// eligible set for the historical track.
@@ -460,7 +451,7 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("Historical winner: {s}\n", .{compound.historical.winner});
     std.debug.print("\nDeployment combo: {s} (live) + {s} (historical)\n", .{ compound.realtime.winner, compound.historical.winner });
 
-    var type_recommendations: std.ArrayList(TypeCompoundRecommendation) = .empty;
+    var type_recommendations: std.ArrayList(report.TypeRecommendation) = .empty;
     defer {
         for (type_recommendations.items) |tr| {
             allocator.free(tr.compound.realtime.scores);
@@ -526,7 +517,7 @@ fn writeRecommendationReport(
     placement: placer.Placement,
     compound: report.CompoundRecommendation,
     rows: []const report.RunRow,
-    type_recommendations: []const TypeCompoundRecommendation,
+    type_recommendations: []const report.TypeRecommendation,
     growth: []const sim.GrowthPoint,
     sim_stats: []const sim.SimStats,
     type_volumes: []const sim.TypeVolume,
