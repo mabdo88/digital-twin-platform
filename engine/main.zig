@@ -533,6 +533,37 @@ fn writeRecommendationReport(
         model.building_elements.len, model.zones.len, model.equipment.len, placement.sensors.len,
     });
 
+    try md.print(allocator, "## Verdict\n\n", .{});
+    try md.print(allocator, "**Use `{s}` for live/latest-value queries.**\n\n", .{compound.realtime.winner});
+    try md.print(allocator, "**Use `{s}` for everything else** (history, aggregates, anomalies).\n\n", .{compound.historical.winner});
+
+    if (compound.historical.scores.len > 1) {
+        try md.print(allocator, "`{s}` wins historical queries by **{d:.1}x** over the next-best backend " ++
+            "(`{s}`) — a decisive, noise-proof margin.\n\n", .{
+            compound.historical.winner,
+            compound.historical.scores[1].score,
+            compound.historical.scores[1].backend,
+        });
+    }
+
+    if (compound.realtime.scores.len > 1) {
+        if (report.isCloseRace(compound.realtime.scores)) {
+            try md.print(allocator, "The live-query race is close: `{s}` vs `{s}` (within 15%) — treat this " ++
+                "specific ranking as a near-tie, not a confident win; single-shot microsecond-scale timing is " ++
+                "sensitive to run-to-run noise at this margin (CLAUDE.md §3.4).\n\n", .{
+                compound.realtime.scores[0].backend,
+                compound.realtime.scores[1].backend,
+            });
+        } else {
+            try md.print(allocator, "`{s}` wins live queries by **{d:.1}x** over the next-best backend " ++
+                "(`{s}`) — a clear margin.\n\n", .{
+                compound.realtime.winner,
+                compound.realtime.scores[1].score,
+                compound.realtime.scores[1].backend,
+            });
+        }
+    }
+
     try md.print(allocator, "## Sensors placed, by type\n\n", .{});
     try md.print(allocator, "Density, sampling rate, and retention all come from each type's own canonical " ++
         "characteristics (synthetic/generator.zig) — not a building-type guess.\n\n", .{});
@@ -560,14 +591,14 @@ fn writeRecommendationReport(
     try md.print(allocator, "### Real-time track\n\n", .{});
     try md.print(allocator, "| Backend | Score | Coverage |\n|---|---:|---:|\n", .{});
     for (compound.realtime.scores) |s| {
-        try md.print(allocator, "| {s} | {d:.3} | {d:.0}% |\n", .{ s.backend, s.score, s.coverage * 100 });
+        try md.print(allocator, "| {s} | {d:.2} | {d:.0}% |\n", .{ s.backend, s.score, s.coverage * 100 });
     }
     try md.print(allocator, "\n**Real-time winner: {s}**\n\n", .{compound.realtime.winner});
 
     try md.print(allocator, "### Historical track\n\n", .{});
     try md.print(allocator, "| Backend | Score | Coverage |\n|---|---:|---:|\n", .{});
     for (compound.historical.scores) |s| {
-        try md.print(allocator, "| {s} | {d:.3} | {d:.0}% |\n", .{ s.backend, s.score, s.coverage * 100 });
+        try md.print(allocator, "| {s} | {d:.2} | {d:.0}% |\n", .{ s.backend, s.score, s.coverage * 100 });
     }
     try md.print(allocator, "\n**Historical winner: {s}**\n\n", .{compound.historical.winner});
 
@@ -596,7 +627,7 @@ fn writeRecommendationReport(
                 try md.print(allocator, "Real-time:\n\n", .{});
                 try md.print(allocator, "| Backend | Score | Coverage |\n|---|---:|---:|\n", .{});
                 for (tr.compound.realtime.scores) |s| {
-                    try md.print(allocator, "| {s} | {d:.3} | {d:.0}% |\n", .{ s.backend, s.score, s.coverage * 100 });
+                    try md.print(allocator, "| {s} | {d:.2} | {d:.0}% |\n", .{ s.backend, s.score, s.coverage * 100 });
                 }
                 try md.print(allocator, "\n", .{});
             }
@@ -604,21 +635,22 @@ fn writeRecommendationReport(
                 try md.print(allocator, "Historical:\n\n", .{});
                 try md.print(allocator, "| Backend | Score | Coverage |\n|---|---:|---:|\n", .{});
                 for (tr.compound.historical.scores) |s| {
-                    try md.print(allocator, "| {s} | {d:.3} | {d:.0}% |\n", .{ s.backend, s.score, s.coverage * 100 });
+                    try md.print(allocator, "| {s} | {d:.2} | {d:.0}% |\n", .{ s.backend, s.score, s.coverage * 100 });
                 }
                 try md.print(allocator, "\n", .{});
             }
         }
     }
 
+    try md.print(allocator, "<details>\n<summary><strong>Per-query latency detail</strong> (all backends × this building's actual query mix)</summary>\n\n", .{});
     try md.print(allocator, "## Per-query latency (this building's actual query mix)\n\n", .{});
-    try md.print(allocator, "| Query | Backend | Median µs | p95 µs | Memory (KB) |\n|---|---|---:|---:|---:|\n", .{});
+    try md.print(allocator, "| Query | Backend | Median | p95 | Memory (KB) |\n|---|---|---:|---:|---:|\n", .{});
     for (rows) |r| {
-        try md.print(allocator, "| {s} | {s} | {d:.1} | {d:.1} | {d:.1} |\n", .{
-            r.query,
-            r.backend,
-            @as(f64, @floatFromInt(r.stats.median_ns)) / 1000.0,
-            @as(f64, @floatFromInt(r.stats.p95_ns)) / 1000.0,
+        try md.print(allocator, "| {s} | {s} | ", .{ r.query, r.backend });
+        try report.writeScaledUs(&md, allocator, @as(f64, @floatFromInt(r.stats.median_ns)) / 1000.0, true);
+        try md.print(allocator, " | ", .{});
+        try report.writeScaledUs(&md, allocator, @as(f64, @floatFromInt(r.stats.p95_ns)) / 1000.0, true);
+        try md.print(allocator, " | {d:.1} |\n", .{
             @as(f64, @floatFromInt(r.memory_bytes)) / 1024.0,
         });
     }
@@ -637,11 +669,12 @@ fn writeRecommendationReport(
     try md.print(allocator, "For queries outside the real-time family, only full-retention backends compete " ++
         "(same rule as the recommendation tracks above) — the real-time cache holds a fraction " ++
         "of the data those queries need, so its latency on them is not comparable.\n\n", .{});
-    try md.print(allocator, "| Query | Winner | Median µs | Runner-up | Median µs | Speedup |\n", .{});
+    try md.print(allocator, "| Query | Winner | Median | Runner-up | Median | Speedup |\n", .{});
     try md.print(allocator, "|---|---|---:|---|---:|---:|\n", .{});
-    try report.writeWinners(&md, allocator, rows, scale_label, &full_retention_names, false);
+    try report.writeWinners(&md, allocator, rows, scale_label, &full_retention_names, true);
+    try md.print(allocator, "\n</details>\n\n", .{});
 
-    try md.print(allocator, "\nSee `schematic.svg` in this directory for a floor-by-floor map of placed sensors.\n", .{});
+    try md.print(allocator, "See `schematic.svg` in this directory for a floor-by-floor map of placed sensors.\n\n", .{});
 
     // Cost estimate — cloud-equivalent $/year per backend + naive vs optimised
     const all_backend_names = comptime blk: {
@@ -673,8 +706,13 @@ fn writeRecommendationReport(
     };
     var dir = try cwd.openDir(io, output_dir, .{});
     defer dir.close(io);
+    try md.print(allocator, "<details>\n<summary><strong>Growth curve detail</strong> (latency at every checkpoint from day 1 to steady state)</summary>\n\n", .{});
     try report.writeGrowthSection(&md, allocator, growth);
+    try md.print(allocator, "\n</details>\n\n", .{});
+
+    try md.print(allocator, "<details>\n<summary><strong>Simulation summary</strong> (compression, eviction, and data-quality stats)</summary>\n\n", .{});
     try report.writeSimSection(&md, allocator, sim_stats, type_volumes, type_quality);
+    try md.print(allocator, "\n</details>\n\n", .{});
 
     try dir.writeFile(io, .{ .sub_path = "recommendation.md", .data = md.items });
     try report.writeSimJson(allocator, io, &dir, sim_stats, growth, type_volumes, type_quality);
