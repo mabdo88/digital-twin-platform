@@ -487,7 +487,7 @@ pub fn main(init: std.process.Init) !void {
 
     std.debug.print("\n[6/6] Writing reports...\n", .{});
     try writeRecommendationReport(allocator, io, args.output_dir, args.bim_path, scale_label, model, placement, compound, rows.items, type_recommendations.items, growth.items, sim_stats.items, type_volumes.items, type_quality.items);
-    std.debug.print("  Wrote recommendation.md + simulation.json to {s}/\n", .{args.output_dir});
+    std.debug.print("  Wrote recommendation.md + recommendation.html + simulation.json to {s}/\n", .{args.output_dir});
 
     const sd = try buildSchematicData(allocator, model, placement, zone_floor);
     defer allocator.free(sd.sensors);
@@ -573,6 +573,17 @@ fn writeRecommendationReport(
     for (all_types) |t| {
         const c = counts[@intFromEnum(t)];
         if (c > 0) try md.print(allocator, "| {s} | {d} | {d} days |\n", .{ @tagName(t), c, synthetic.profileFor(t).retention_days });
+    }
+
+    var sensor_type_counts: std.ArrayList(report.SensorTypeCount) = .empty;
+    defer sensor_type_counts.deinit(allocator);
+    for (all_types) |t| {
+        const c = counts[@intFromEnum(t)];
+        if (c > 0) try sensor_type_counts.append(allocator, .{
+            .name = @tagName(t),
+            .count = c,
+            .retention_days = synthetic.profileFor(t).retention_days,
+        });
     }
 
     try md.print(allocator, "\n> Honesty headline: relative rankings are reliable; absolute numbers are approximate (CLAUDE.md §6).\n\n", .{});
@@ -687,6 +698,23 @@ fn writeRecommendationReport(
     // historical/aggregate are ~1/min — so real-time is the majority of
     // total query count).
     const realtime_query_fraction = 0.7;
+
+    const cost_estimates = try cost_model.estimateAll(allocator, rows, &all_backend_names, cost_model.DEFAULT_WORKLOAD, cost_model.DEFAULT_PRICING);
+    defer allocator.free(cost_estimates);
+    var cost_rows: std.ArrayList(report.CostRow) = .empty;
+    defer cost_rows.deinit(allocator);
+    for (cost_estimates) |e| {
+        try cost_rows.append(allocator, .{
+            .backend = e.backend,
+            .storage_gb = e.storage_tb * 1024.0,
+            .storage_cost_year = e.storage_cost_year,
+            .query_cost_year = e.query_cost_year,
+            .total_cost_year = e.total_cost_year,
+        });
+    }
+    const naive_cost = cost_model.naiveTotalCost(rows, &all_backend_names, cost_model.DEFAULT_WORKLOAD, cost_model.DEFAULT_PRICING);
+    const optimised_cost = cost_model.optimisedCost(rows, compound.realtime.winner, compound.historical.winner, realtime_query_fraction, cost_model.DEFAULT_WORKLOAD, cost_model.DEFAULT_PRICING);
+
     try cost_model.writeCostSection(
         &md,
         allocator,
@@ -715,5 +743,22 @@ fn writeRecommendationReport(
     try md.print(allocator, "\n</details>\n\n", .{});
 
     try dir.writeFile(io, .{ .sub_path = "recommendation.md", .data = md.items });
+    try report.writeBuildingHtmlReport(
+        allocator,
+        io,
+        &dir,
+        bim_path,
+        scale_label,
+        sensor_type_counts.items,
+        compound,
+        type_recommendations,
+        rows,
+        &full_retention_names,
+        growth,
+        sim_stats,
+        cost_rows.items,
+        naive_cost,
+        optimised_cost,
+    );
     try report.writeSimJson(allocator, io, &dir, sim_stats, growth, type_volumes, type_quality);
 }
