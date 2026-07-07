@@ -78,7 +78,7 @@ pub const CompoundRecommendation = struct {
 };
 
 /// Auto-scaled human-readable duration — µs below 1000µs, ms below
-/// 1_000_000µs, s otherwise. Used everywhere a raw query latency is
+/// 100_000µs (100ms), s otherwise. Used everywhere a raw query latency is
 /// displayed; never applied to scores/coverage/ratios (those stay as
 /// plain numbers). See docs/superpowers/specs/2026-07-06-recommendation-
 /// report-readability-design.md.
