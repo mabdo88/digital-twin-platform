@@ -538,15 +538,26 @@ fn writeRecommendationReport(
     try md.print(allocator, "**Use `{s}` for everything else** (history, aggregates, anomalies).\n\n", .{compound.historical.winner});
 
     if (compound.historical.scores.len > 1) {
-        try md.print(allocator, "`{s}` wins historical queries by **{d:.1}x** over the next-best backend " ++
-            "(`{s}`) — a decisive, noise-proof margin.\n\n", .{
-            compound.historical.winner,
-            compound.historical.scores[1].score,
-            compound.historical.scores[1].backend,
-        });
+        const hist_margin = compound.historical.scores[1].score / compound.historical.scores[0].score;
+        if (report.isCloseRace(compound.historical.scores)) {
+            try md.print(allocator, "The historical-query race is close: `{s}` vs `{s}` (within 15%) — treat this " ++
+                "specific ranking as a near-tie, not a confident win; single-shot microsecond-scale timing is " ++
+                "sensitive to run-to-run noise at this margin (CLAUDE.md §3.4).\n\n", .{
+                compound.historical.scores[0].backend,
+                compound.historical.scores[1].backend,
+            });
+        } else {
+            try md.print(allocator, "`{s}` wins historical queries by **{d:.1}x** over the next-best backend " ++
+                "(`{s}`) — a decisive, noise-proof margin.\n\n", .{
+                compound.historical.winner,
+                hist_margin,
+                compound.historical.scores[1].backend,
+            });
+        }
     }
 
     if (compound.realtime.scores.len > 1) {
+        const rt_margin = compound.realtime.scores[1].score / compound.realtime.scores[0].score;
         if (report.isCloseRace(compound.realtime.scores)) {
             try md.print(allocator, "The live-query race is close: `{s}` vs `{s}` (within 15%) — treat this " ++
                 "specific ranking as a near-tie, not a confident win; single-shot microsecond-scale timing is " ++
@@ -558,7 +569,7 @@ fn writeRecommendationReport(
             try md.print(allocator, "`{s}` wins live queries by **{d:.1}x** over the next-best backend " ++
                 "(`{s}`) — a clear margin.\n\n", .{
                 compound.realtime.winner,
-                compound.realtime.scores[1].score,
+                rt_margin,
                 compound.realtime.scores[1].backend,
             });
         }

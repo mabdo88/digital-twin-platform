@@ -947,6 +947,14 @@ test "scaleMicros: stays microseconds below 1000, switches to ms then s at each 
     // Boundary: exactly 1000µs is the first value that becomes ms, not µs.
     const boundary = scaleMicros(1000.0);
     try std.testing.expectEqualStrings("ms", boundary.unit);
+
+    // Boundary: 100_000µs (100ms) is the ms/s threshold — corrected mid-implementation
+    // from an originally-drafted 1_000_000; pin it against future drift.
+    const just_under_s = scaleMicros(99_999.0);
+    try std.testing.expectEqualStrings("ms", just_under_s.unit);
+
+    const at_s = scaleMicros(100_000.0);
+    try std.testing.expectEqualStrings("s", at_s.unit);
 }
 
 test "isCloseRace: within threshold is close, beyond it is not, fewer than 2 scores is never close" {
@@ -1107,18 +1115,26 @@ pub fn writeBuildingHtmlReport(
     try html.print(allocator, "<p>Use <strong class=\"win\">{s}</strong> for live/latest-value queries.</p>\n", .{compound.realtime.winner});
     try html.print(allocator, "<p>Use <strong class=\"win\">{s}</strong> for everything else (history, aggregates, anomalies).</p>\n", .{compound.historical.winner});
     if (compound.historical.scores.len > 1) {
-        try html.print(allocator, "<p>{s} wins historical queries by <strong>{d:.1}x</strong> over {s} — a decisive, noise-proof margin.</p>\n", .{
-            compound.historical.winner, compound.historical.scores[1].score, compound.historical.scores[1].backend,
-        });
+        const hist_margin = compound.historical.scores[1].score / compound.historical.scores[0].score;
+        if (isCloseRace(compound.historical.scores)) {
+            try html.print(allocator, "<p class=\"caveat\">The historical-query race is close: {s} vs {s} (within 15%) — treat this ranking as a near-tie, not a confident win.</p>\n", .{
+                compound.historical.scores[0].backend, compound.historical.scores[1].backend,
+            });
+        } else {
+            try html.print(allocator, "<p>{s} wins historical queries by <strong>{d:.1}x</strong> over {s} — a decisive, noise-proof margin.</p>\n", .{
+                compound.historical.winner, hist_margin, compound.historical.scores[1].backend,
+            });
+        }
     }
     if (compound.realtime.scores.len > 1) {
+        const rt_margin = compound.realtime.scores[1].score / compound.realtime.scores[0].score;
         if (isCloseRace(compound.realtime.scores)) {
             try html.print(allocator, "<p class=\"caveat\">The live-query race is close: {s} vs {s} (within 15%) — treat this ranking as a near-tie, not a confident win.</p>\n", .{
                 compound.realtime.scores[0].backend, compound.realtime.scores[1].backend,
             });
         } else {
             try html.print(allocator, "<p>{s} wins live queries by <strong>{d:.1}x</strong> over {s} — a clear margin.</p>\n", .{
-                compound.realtime.winner, compound.realtime.scores[1].score, compound.realtime.scores[1].backend,
+                compound.realtime.winner, rt_margin, compound.realtime.scores[1].backend,
             });
         }
     }
