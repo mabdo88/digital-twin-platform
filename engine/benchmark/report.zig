@@ -906,6 +906,13 @@ test "isCloseRace: within threshold is close, beyond it is not, fewer than 2 sco
     };
     try std.testing.expect(!isCloseRace(&far));
 
+    // Boundary: exactly CLOSE_RACE_THRESHOLD (15%) is still a close race (`<=`).
+    const boundary = [_]BackendScore{
+        .{ .backend = "A", .score = 1.000, .coverage = 1.0 },
+        .{ .backend = "B", .score = 1.150, .coverage = 1.0 },
+    };
+    try std.testing.expect(isCloseRace(&boundary));
+
     const single = [_]BackendScore{
         .{ .backend = "A", .score = 1.000, .coverage = 1.0 },
     };
