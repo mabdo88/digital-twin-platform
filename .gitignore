@@ -2,3 +2,17 @@
 zig-out/
 benchmark-results/
 graphify-out/
+*.ifc
+
+# Run outputs from dt.exe --out <dir> — regenerable artifacts, never tracked.
+smoke-out*/
+hospital-out*/
+house-results/
+benchmark-results-office/
+
+# Run outputs from older commits — same category as smoke-out*/house-results.
+output/
+
+# subagent-driven-development scratch state (progress ledger, task briefs,
+# review packages) — never tracked.
+.superpowers/

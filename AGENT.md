@@ -3,6 +3,15 @@
 This document is **for Claude (or any agent)** working on the digital twin platform.
 Read CLAUDE.md first — that is the law. This explains *how* to work within it.
 
+> **Staleness warning (2026-07-06):** the phase checklists below have drifted
+> from what was actually built (e.g. the Phase 3 query list no longer matches
+> `queries.zig`, and the benchmark methodology is now the live day-zero
+> simulation with sequential backend passes, not the flow sketched here).
+> Treat the **guardrails (§2) as current**; for actual project state read
+> `.cascade/digital-twin/Digital Twin Roadmap.html` and
+> `.cascade/digital-twin/sequential-execution-and-audit.md` instead of the
+> phase checklists.
+
 ---
 
 ## 1. Your job

@@ -34,7 +34,7 @@ jobs:
 
       - name: Build ${{ matrix.target }}
         run: |
-          zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }}
+          zig build -Dtarget=${{ matrix.target }}
           mkdir -p dist
           cp zig-out/bin/${{ matrix.output }} dist/ || cp zig-out/bin/dt dist/${{ matrix.output }}
 
@@ -74,7 +74,7 @@ jobs:
 
             Download the executable for your platform and run:
             ```
-            ./dt-linux --bim model.ifc --type office
+            ./dt-linux --bim model.ifc
             ```
 
             See [HOW_TO_USE.md](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/HOW_TO_USE.md) for full documentation.

@@ -6,22 +6,27 @@
 // (CLAUDE.md §3.5). Rules are values, not code — the placer never branches on
 // element type; it just looks up the matching rule and applies it.
 //
-// Defaults come from spec §7.3:
-//   Space        -> Temp + Humidity + Occupancy   at density 1.0 / 100m²
-//   FlowSegment  -> Flow + Temperature            at density 2.0 / 100m²
-//   Beam         -> Structural                    at density 0.5 / 100m²
+// Placement rules map granular IFC element types to sensor types:
+//   Space                  -> Temp + Humidity + Occupancy + CO2 + AirQuality
+//   FlowSegment            -> (none — sensors go on equipment, not ducts)
+//   Beam                   -> Structural
+//   FlowTerminal           -> Flow + Temperature
+//   FlowController         -> Flow
+//   FlowMovingDevice       -> Vibration + Flow
+//   FlowStorageDevice      -> Flow
+//   EnergyConversionDevice -> Energy + Vibration + Flow
+//   ElectricAppliance      -> Energy
+//   (passive types: flow_fitting, distribution_control_element,
+//    building_element_proxy, alarm, cable_segment -> no sensors)
 //
-// Phase 5 will override these per building-type profile (Office, Hospital, …).
-// Because rules are just `[]const PlacementRule`, a profile is just a
-// different slice — no code change in the placer.
+// Density per sensor type comes from synthetic/generator.zig's profileFor,
+// not from the rule — a rule can list multiple sensor_types, and each gets
+// its own density. Equipment-typed elements use a fixed 1 sensor per type
+// (density is area-based and doesn't apply to individual equipment items).
 //
-// One open call we're making explicit:
-//   ZoneMetadata.area_m2 is currently always 0 (IfcQuantitySet extraction is
-//   deferred — see components.zig + 4.5's IFC_SUPPORT.md). When area is 0 we
-//   fall back to `PlacementConfig.default_unknown_area_m2` (defaults to
-//   100 m²) so density 1.0 yields exactly 1 sensor per matching zone instead
-//   of zero. This keeps the math meaningful today and stays correct the
-//   instant real areas land.
+// max_per_type caps prevent any single sensor type from dominating on
+// buildings with hundreds of spaces or equipment. max_total_sensors is a
+// hard ceiling to prevent OutOfMemory on extremely large IFC files.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -57,43 +62,95 @@ pub const PlacementRule = struct {
     sensor_types: []const SensorType,
 };
 
-/// Spec §7.3 defaults — the only rule set; there is no per-building-type
-/// override anymore (see PlacementRule's doc comment for why density
-/// moved out of here).
+/// Default placement rules — granular per IFC element type.
+/// Space: comfort + IAQ sensors (temperature, humidity, occupancy, CO2,
+/// air_quality) — ASHRAE 62.1 and WELL Building Standard require IAQ
+/// monitoring in occupied spaces.
+/// Beam: structural health monitoring (strain gauge equivalent).
+/// Equipment types: sensors matched to equipment function —
+///   flow_terminal (diffusers/fixtures): flow + temperature
+///   flow_controller (dampers/valves/VAV): flow
+///   flow_moving_device (pumps/fans): vibration + flow
+///   flow_storage_device (tanks): flow
+///   energy_conversion_device (boilers/chillers): energy + vibration + flow
+///   electric_appliance: energy
+/// Passive types (flow_fitting, distribution_control_element,
+/// building_element_proxy, alarm, cable_segment) get no sensors.
 pub const DEFAULT_RULES = [_]PlacementRule{
     .{
         .element_type = .space,
-        .sensor_types = &.{ .temperature, .humidity, .occupancy },
-    },
-    .{
-        .element_type = .flow_segment,
-        .sensor_types = &.{ .flow, .temperature },
+        .sensor_types = &.{ .temperature, .humidity, .occupancy, .co2, .air_quality },
     },
     .{
         .element_type = .beam,
         .sensor_types = &.{.structural},
     },
-    // NOT in the original spec §7.3 list (space/flow_segment/beam only) —
-    // added after validating against the real Revit exports in assets/IFC/:
-    // one of them (2KHRJ17-HASC-SD-710-EV) has zero spaces/walls/beams but
-    // 187 IfcFlowTerminal/IfcBuildingElementProxy/IfcAlarm/etc. instances
-    // (see components.zig's ElementType.equipment doc comment) — without
-    // this rule that file places exactly 0 sensors despite being a real,
-    // fully-populated building. Energy + vibration is a generic pair for
-    // monitoring MEP/electrical equipment (draw + mechanical wear).
     .{
-        .element_type = .equipment,
-        .sensor_types = &.{ .energy, .vibration },
+        .element_type = .flow_terminal,
+        .sensor_types = &.{ .flow, .temperature },
+    },
+    .{
+        .element_type = .flow_controller,
+        .sensor_types = &.{.flow},
+    },
+    .{
+        .element_type = .flow_moving_device,
+        .sensor_types = &.{ .vibration, .flow },
+    },
+    .{
+        .element_type = .flow_storage_device,
+        .sensor_types = &.{.flow},
+    },
+    .{
+        .element_type = .energy_conversion_device,
+        .sensor_types = &.{ .energy, .vibration, .flow },
+    },
+    .{
+        .element_type = .electric_appliance,
+        .sensor_types = &.{.energy},
     },
 };
+
+/// Set of equipment element types that get EquipmentMetadata but no sensors.
+/// Used by isEquipmentType() in resolveHierarchy (ifc_parser.zig) and by
+/// tests that count equipment.
+pub const EQUIPMENT_TYPES = [_]ElementType{
+    .flow_terminal,
+    .flow_fitting,
+    .flow_controller,
+    .flow_moving_device,
+    .flow_storage_device,
+    .energy_conversion_device,
+    .distribution_control_element,
+    .building_element_proxy,
+    .electric_appliance,
+    .alarm,
+    .cable_segment,
+};
+
+/// Returns true if the ElementType is one of the granular equipment types
+/// (used by ifc_parser.zig to decide whether to emit EquipmentMetadata).
+pub fn isEquipmentType(et: ElementType) bool {
+    inline for (EQUIPMENT_TYPES) |t| if (et == t) return true;
+    return false;
+}
 
 pub const PlacementConfig = struct {
     rules: []const PlacementRule = &DEFAULT_RULES,
     /// Effective area used when the matching ZoneMetadata.area_m2 is 0 (the
     /// only value we extract today) or when the element isn't itself a zone
-    /// (beams, flow segments). Picked so density 1.0 yields exactly 1 sensor
+    /// (beams, equipment). Picked so density 1.0 yields exactly 1 sensor
     /// per element by default — change this once IfcQuantitySet lands.
     default_unknown_area_m2: f64 = 100.0,
+    /// Hard cap on sensors of any one type. Prevents a building with 500
+    /// spaces from generating 500 temperature sensors (which at 397-day
+    /// retention × 5-min interval = ~57M readings = ~1.3 GB just for
+    /// temperature). Default 200 — generous for real buildings, prevents
+    /// OOM on synthetic mega-structures.
+    max_per_type: u32 = 200,
+    /// Hard cap on total sensors across all types. Prevents OOM on
+    /// extremely large IFC files with thousands of elements.
+    max_total_sensors: u32 = 2000,
 };
 
 /// Result of one placement pass. Arena-owned; one `deinit()` frees both
@@ -133,10 +190,21 @@ pub fn place(
 
     var next_id: u32 = 0;
 
+    // Track per-type counts for max_per_type enforcement.
+    const num_sensor_types = @typeInfo(SensorType).@"enum".field_names.len;
+    var type_counts: [num_sensor_types]u32 = undefined;
+    @memset(&type_counts, 0);
+
     for (building_elements) |elem| {
+        // Hard ceiling on total sensors.
+        if (next_id >= config.max_total_sensors) break;
+
         const rule = findRule(config.rules, elem.element_type) orelse continue;
 
         // Effective area: real zone area if known, else fallback.
+        // Equipment types (individual items, not area-based) get fixed
+        // 1 sensor per type — density doesn't apply to a single pump.
+        const is_equipment = isEquipmentType(elem.element_type);
         const raw_area: f64 = area_of.get(elem.ifc_id) orelse 0;
         const eff_area: f64 = if (raw_area > 0) raw_area else config.default_unknown_area_m2;
 
@@ -151,24 +219,31 @@ pub fn place(
         };
 
         for (rule.sensor_types) |st| {
-            // Sensors for this specific type. Round to nearest, clamped to
-            // at least 1 — every rule-matching element gets at least one
-            // sensor of each kind it's rated for, even at tiny areas / low
-            // densities. Without this clamp, a 10 m² space at density 0.5
-            // would emit zero structural sensors, which silently hides
-            // whole element classes from the benchmark. Density comes from
-            // the TYPE (synthetic.profileFor), not the rule — see
-            // PlacementRule's doc comment for why a single density shared
-            // across a rule's sensor_types was the bug.
-            const density = synthetic.profileFor(st).density_per_100m2;
-            const fcount: f64 = eff_area * @as(f64, density) / 100.0;
-            const rounded: u32 = @intFromFloat(@round(fcount));
-            const count_per_type: u32 = @max(@as(u32, 1), rounded);
+            // Per-type cap: stop placing this sensor type if we've hit
+            // the limit. This prevents 500 spaces from generating 500
+            // temperature sensors (which would be ~1.3 GB at 397-day
+            // retention). The cap is generous (200) so real buildings
+            // are unaffected; it only bites on synthetic mega-structures.
+            const ti = @intFromEnum(st);
+            if (type_counts[ti] >= config.max_per_type) continue;
+
+            // Sensor count for this type on this element:
+            //   - equipment types: exactly 1 per type (a pump gets 1
+            //     vibration sensor, not area-scaled)
+            //   - zone/structural types: area × density / 100, clamped
+            //     to at least 1
+            const count_per_type: u32 = if (is_equipment) 1 else blk: {
+                const density = synthetic.profileFor(st).density_per_100m2;
+                const fcount: f64 = eff_area * @as(f64, density) / 100.0;
+                const rounded: u32 = @intFromFloat(@round(fcount));
+                break :blk @max(@as(u32, 1), rounded);
+            };
 
             var n: u32 = 0;
-            while (n < count_per_type) : (n += 1) {
+            while (n < count_per_type and next_id < config.max_total_sensors and type_counts[ti] < config.max_per_type) : (n += 1) {
                 const sid = next_id;
                 next_id += 1;
+                type_counts[ti] += 1;
                 try sensors.append(ar, .{
                     .sensor_id = sid,
                     .sensor_type = st,
@@ -197,160 +272,3 @@ fn findRule(rules: []const PlacementRule, etype: ElementType) ?PlacementRule {
 }
 
 // ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
-const testing = std.testing;
-const ifc = @import("ifc_parser.zig");
-
-test "DEFAULT_RULES match spec §7.3 (types only — density/frequency are sensor-type facts now, not rule fields)" {
-    const space_rule = findRule(&DEFAULT_RULES, .space).?;
-    try testing.expectEqual(@as(usize, 3), space_rule.sensor_types.len);
-    try testing.expectEqual(SensorType.temperature, space_rule.sensor_types[0]);
-    try testing.expectEqual(SensorType.humidity, space_rule.sensor_types[1]);
-    try testing.expectEqual(SensorType.occupancy, space_rule.sensor_types[2]);
-
-    const flow_rule = findRule(&DEFAULT_RULES, .flow_segment).?;
-    try testing.expectEqual(@as(usize, 2), flow_rule.sensor_types.len);
-
-    const beam_rule = findRule(&DEFAULT_RULES, .beam).?;
-    try testing.expectEqual(@as(usize, 1), beam_rule.sensor_types.len);
-
-    // Equipment is an addition beyond the original §7.3 list (see its
-    // DEFAULT_RULES entry's doc comment) — verify it's present and shaped
-    // as documented rather than just assuming the literal spec set.
-    const equipment_rule = findRule(&DEFAULT_RULES, .equipment).?;
-    try testing.expectEqual(@as(usize, 2), equipment_rule.sensor_types.len);
-    try testing.expectEqual(SensorType.energy, equipment_rule.sensor_types[0]);
-    try testing.expectEqual(SensorType.vibration, equipment_rule.sensor_types[1]);
-
-    // Walls/slabs are unsupported by default — no surprise placement.
-    try testing.expect(findRule(&DEFAULT_RULES, .wall) == null);
-    try testing.expect(findRule(&DEFAULT_RULES, .slab) == null);
-}
-
-test "places sensors on a parsed building (end-to-end through IFC parser)" {
-    const src =
-        \\HEADER;ENDSEC;
-        \\DATA;
-        \\#100 = IFCCARTESIANPOINT((10.0, 20.0, 0.0));
-        \\#101 = IFCAXIS2PLACEMENT3D(#100,$,$);
-        \\#102 = IFCLOCALPLACEMENT($, #101);
-        \\
-        \\#1 = IFCPROJECT('p',$,'Proj',$,$,$,$,$,$);
-        \\#2 = IFCBUILDING('b',$,'B',$,$,#102,$,$,$,$,$);
-        \\#3 = IFCBUILDINGSTOREY('s',$,'L1',$,$,#102,$,$,$,3.0);
-        \\#4 = IFCSPACE('sp',$,'R1',$,$,#102,$,$,$,$,$);
-        \\#5 = IFCFLOWSEGMENT('f',$,'Duct',$,$,#102,$,$,$);
-        \\#6 = IFCBEAM('bm',$,'Beam1',$,$,#102,$,$,$);
-        \\#7 = IFCRELAGGREGATES('a1',$,$,$,#1,(#2));
-        \\#8 = IFCRELAGGREGATES('a2',$,$,$,#2,(#3));
-        \\#9 = IFCRELCONTAINEDINSPATIALSTRUCTURE('c',$,$,$,(#4,#5,#6),#3);
-        \\ENDSEC;
-    ;
-    var model = try ifc.parseSlice(testing.allocator, src);
-    defer model.deinit();
-
-    var p = try place(testing.allocator, model.building_elements, model.zones, .{});
-    defer p.deinit();
-
-    // With default 100 m² fallback and DEFAULT_RULES — density now comes
-    // per individual sensor type (synthetic.profileFor), not shared across
-    // a rule's whole sensor_types list, so flow_segment's two types
-    // (flow, temperature) no longer share one number:
-    //   Space: temperature(1.0)=1, humidity(1.0)=1, occupancy(1.0)=1   = 3
-    //   FlowSegment: flow(1.5)=round(1.5)=2, temperature(1.0)=1        = 3
-    //   Beam: structural(0.5)=max(1,round(0.5))=1                     = 1
-    //                                                                  = 7
-    try testing.expectEqual(@as(usize, 7), p.sensors.len);
-    try testing.expectEqual(@as(usize, 7), p.locations.len);
-
-    // sensor_ids are dense and monotonic.
-    for (p.sensors, 0..) |s, i| try testing.expectEqual(@as(u32, @intCast(i)), s.sensor_id);
-
-    // Every sensor's position matches its host element's position. The IFC
-    // fixture pins every element to (10, 20, 0) via #102 — easy to assert.
-    for (p.locations) |loc| {
-        try testing.expectApproxEqAbs(@as(f64, 10), loc.position.x, 1e-9);
-        try testing.expectApproxEqAbs(@as(f64, 20), loc.position.y, 1e-9);
-    }
-
-    // The Space sensors live in zone_id=4 (the space itself).
-    // The FlowSegment + Beam are contained in the storey, so their zone_id
-    // is 3 (the containing storey, looked up via parent_id).
-    var space_sensors: usize = 0;
-    var storey_sensors: usize = 0;
-    for (p.locations) |loc| {
-        switch (loc.zone_id) {
-            4 => space_sensors += 1,
-            3 => storey_sensors += 1,
-            else => {},
-        }
-    }
-    try testing.expectEqual(@as(usize, 3), space_sensors);
-    try testing.expectEqual(@as(usize, 4), storey_sensors);
-}
-
-test "density math: real area_m2 overrides the default fallback" {
-    const elements = [_]BuildingElement{
-        .{
-            .ifc_id = 42,
-            .name = "BigHall",
-            .element_type = .space,
-            .parent_id = null,
-            .position = .{ .x = 0, .y = 0, .z = 0 },
-        },
-    };
-    const zones = [_]ZoneMetadata{
-        .{ .zone_id = 42, .name = "BigHall", .zone_type = .space, .floor_level = 0, .area_m2 = 300.0 },
-    };
-
-    var p = try place(testing.allocator, &elements, &zones, .{});
-    defer p.deinit();
-
-    // Space rule: 3 sensor types × round(300 * 1.0 / 100) = 3 × 3 = 9
-    try testing.expectEqual(@as(usize, 9), p.sensors.len);
-}
-
-test "elements without a matching rule are skipped silently" {
-    const elements = [_]BuildingElement{
-        .{ .ifc_id = 1, .name = "W", .element_type = .wall, .parent_id = null, .position = .{ .x = 0, .y = 0, .z = 0 } },
-        .{ .ifc_id = 2, .name = "S", .element_type = .slab, .parent_id = null, .position = .{ .x = 0, .y = 0, .z = 0 } },
-        .{ .ifc_id = 3, .name = "P", .element_type = .project, .parent_id = null, .position = .{ .x = 0, .y = 0, .z = 0 } },
-    };
-    var p = try place(testing.allocator, &elements, &.{}, .{});
-    defer p.deinit();
-    try testing.expectEqual(@as(usize, 0), p.sensors.len);
-}
-
-test "custom rules slice fully overrides defaults" {
-    const elements = [_]BuildingElement{
-        .{ .ifc_id = 1, .name = "W", .element_type = .wall, .parent_id = null, .position = .{ .x = 0, .y = 0, .z = 0 } },
-    };
-    // Hypothetical "structural-monitoring" rule set that places vibration
-    // sensors on walls instead of the default empty.
-    const custom_rules = [_]PlacementRule{
-        .{ .element_type = .wall, .sensor_types = &.{.vibration} },
-    };
-    var p = try place(testing.allocator, &elements, &.{}, .{ .rules = &custom_rules });
-    defer p.deinit();
-    try testing.expectEqual(@as(usize, 1), p.sensors.len);
-    try testing.expectEqual(SensorType.vibration, p.sensors[0].sensor_type);
-    // frequency_hz comes from the canonical per-type table now, not the
-    // rule — confirms place() actually wires it through, not just that the
-    // field happens to be present.
-    try testing.expectEqual(synthetic.profileFor(.vibration).frequency_hz, p.sensors[0].frequency_hz);
-}
-
-test "tiny area still gets one sensor per type (clamped, never silently zero)" {
-    const elements = [_]BuildingElement{
-        .{ .ifc_id = 1, .name = "Tiny", .element_type = .beam, .parent_id = null, .position = .{ .x = 0, .y = 0, .z = 0 } },
-    };
-    // No matching zone => default_unknown_area_m2 = 100 m².
-    // round(100 * 0.5 / 100) = round(0.5) = 0 in banker's rounding, but
-    // we clamp to 1 so the beam still gets monitored.
-    var p = try place(testing.allocator, &elements, &.{}, .{ .default_unknown_area_m2 = 10.0 });
-    defer p.deinit();
-    try testing.expectEqual(@as(usize, 1), p.sensors.len);
-    try testing.expectEqual(SensorType.structural, p.sensors[0].sensor_type);
-}

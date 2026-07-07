@@ -25,12 +25,12 @@ const ifc = @import("bim/ifc_parser.zig");
 const placer = @import("bim/sensor_placer.zig");
 const synthetic = @import("synthetic/generator.zig");
 const sb = @import("ecs/storage/storage_backend.zig");
-const World = @import("ecs/world.zig").World;
 const queries = @import("benchmark/queries.zig");
 const runner = @import("benchmark/runner.zig");
-const metrics = @import("ecs/systems/metrics_system.zig");
 const report = @import("benchmark/report.zig");
+const cost_model = @import("benchmark/cost_model.zig");
 const schematic = @import("benchmark/schematic.zig");
+const sim = @import("benchmark/simulation.zig");
 
 const Args = struct {
     bim_path: []const u8,
@@ -91,8 +91,6 @@ fn scaleLabel(bim_path: []const u8) []const u8 {
 // found by walking its parent chain up to the nearest storey.
 // ---------------------------------------------------------------------------
 
-const ZoneFloor = struct { zone_id: u32, floor_id: u32 };
-
 fn findElement(elements: []const ifc.BuildingElement, id: u32) ?ifc.BuildingElement {
     for (elements) |e| {
         if (e.ifc_id == id) return e;
@@ -115,19 +113,12 @@ fn buildZoneFloorMap(
     allocator: std.mem.Allocator,
     elements: []const ifc.BuildingElement,
     zones: []const ifc.ZoneMetadata,
-) ![]ZoneFloor {
-    const out = try allocator.alloc(ZoneFloor, zones.len);
+) ![]sim.ZoneFloor {
+    const out = try allocator.alloc(sim.ZoneFloor, zones.len);
     for (zones, 0..) |z, i| {
         out[i] = .{ .zone_id = z.zone_id, .floor_id = floorIdForZone(elements, z.zone_id, z.zone_type) };
     }
     return out;
-}
-
-fn floorFor(zone_floor: []const ZoneFloor, zone_id: u32) u32 {
-    for (zone_floor) |zf| {
-        if (zf.zone_id == zone_id) return zf.floor_id;
-    }
-    return 0;
 }
 
 /// Wall-clock seconds since `start`, for operator-facing progress logging
@@ -145,190 +136,85 @@ fn elapsedSeconds(io: std.Io, start: anytype) f64 {
 // exercised against a real sensor_id / zone_id / position from this building.
 // ---------------------------------------------------------------------------
 
-const SampleArgs = struct {
-    sensor_id: u32,
-    sensor_type: sb.SensorType,
-    zone_id: u32,
-    floor_id: u32,
-    position: queries.Vec3,
-};
-
-/// Up to TYPE_SAMPLE_CAP distinct real sensors across the whole building
-/// (not filtered by type — for the queries that aren't type-scoped),
-/// cycling if fewer are placed. Same rationale and convention as
-/// pickSamplesByType: repeating one fixed sensor 25 times keeps its data
-/// artificially cache-hot and only measures that one sensor, not a real
-/// deployment's mix of many. Caller frees with the same allocator.
-fn pickOverallSamples(allocator: std.mem.Allocator, placement: placer.Placement, zone_floor: []const ZoneFloor) ![]SampleArgs {
-    const n = @min(placement.sensors.len, TYPE_SAMPLE_CAP);
-    const pool = try allocator.alloc(SampleArgs, n);
-    defer allocator.free(pool);
-    for (pool, 0..) |*s, i| {
-        const sensor = placement.sensors[i];
-        const loc = placement.locations[i];
-        s.* = .{
-            .sensor_id = sensor.sensor_id,
-            .sensor_type = sensor.sensor_type,
-            .zone_id = loc.zone_id,
-            .floor_id = floorFor(zone_floor, loc.zone_id),
-            .position = .{
-                .x = @floatCast(loc.position.x),
-                .y = @floatCast(loc.position.y),
-                .z = @floatCast(loc.position.z),
-            },
-        };
-    }
-
-    const samples = try allocator.alloc(SampleArgs, TYPE_SAMPLE_CAP);
-    for (samples, 0..) |*s, i| s.* = pool[i % pool.len];
-    return samples;
+fn pickOverallSample(placement: placer.Placement, zone_floor: []const sim.ZoneFloor) sim.SampleArgs {
+    const sensor = placement.sensors[0];
+    const loc = placement.locations[0];
+    return .{
+        .sensor_id = sensor.sensor_id,
+        .sensor_type = sensor.sensor_type,
+        .zone_id = loc.zone_id,
+        .floor_id = sim.floorFor(zone_floor, loc.zone_id),
+        .position = .{
+            .x = @floatCast(loc.position.x),
+            .y = @floatCast(loc.position.y),
+            .z = @floatCast(loc.position.z),
+        },
+    };
 }
 
-/// Up to `TYPE_SAMPLE_CAP` distinct real sensors per sensor type actually
-/// placed in the building — not one sensor repeated. A type with fewer than
-/// the cap has its sensor list cycled (repeated from the start) until the
-/// cap is reached, so small populations still get the noise-smoothing
-/// benefit of multiple timed calls, just spread across whichever real
-/// sensors exist instead of hammering a single one. Caller owns `samples`
-/// (free with the same allocator).
-const TypeSamples = struct { sensor_type: sb.SensorType, samples: []const SampleArgs };
-
-/// Reuses CLAUDE.md §3.4's 25-iteration floor as the sample cap too — no
-/// new magic number, and it ties the "how many real sensors do we touch"
-/// knob to the same constant as "how many timed calls do we make" (see
-/// `runOneAcrossSamples`, which makes exactly this many calls, one per
-/// cycled sample).
-const TYPE_SAMPLE_CAP: usize = ITERATIONS;
-
-fn pickSamplesByType(
+fn pickTypeSamples(
     allocator: std.mem.Allocator,
     placement: placer.Placement,
-    zone_floor: []const ZoneFloor,
-) ![]TypeSamples {
-    // Pass 1: bucket every placed sensor's args by its sensor_type, in
-    // placement order. At most 9 buckets (sb.SensorType has 9 variants), so
-    // a linear scan per insert is cheap.
-    const Bucket = struct { sensor_type: sb.SensorType, list: std.ArrayList(SampleArgs) };
-    var buckets: std.ArrayList(Bucket) = .empty;
-    defer {
-        for (buckets.items) |*bucket| bucket.list.deinit(allocator);
-        buckets.deinit(allocator);
-    }
+    zone_floor: []const sim.ZoneFloor,
+) ![]sim.TypeSample {
+    var result: std.ArrayList(sim.TypeSample) = .empty;
+    errdefer result.deinit(allocator);
 
     for (placement.sensors, placement.locations) |sensor, loc| {
-        const args = SampleArgs{
-            .sensor_id = sensor.sensor_id,
-            .sensor_type = sensor.sensor_type,
-            .zone_id = loc.zone_id,
-            .floor_id = floorFor(zone_floor, loc.zone_id),
-            .position = .{
-                .x = @floatCast(loc.position.x),
-                .y = @floatCast(loc.position.y),
-                .z = @floatCast(loc.position.z),
-            },
-        };
-
         var found = false;
-        for (buckets.items) |*bucket| {
-            if (bucket.sensor_type == sensor.sensor_type) {
-                try bucket.list.append(allocator, args);
+        for (result.items) |ts| {
+            if (ts.sensor_type == sensor.sensor_type) {
                 found = true;
                 break;
             }
         }
-        if (!found) {
-            var list: std.ArrayList(SampleArgs) = .empty;
-            try list.append(allocator, args);
-            try buckets.append(allocator, .{ .sensor_type = sensor.sensor_type, .list = list });
-        }
-    }
-
-    // Pass 2: cap each bucket at TYPE_SAMPLE_CAP distinct sensors, cycling
-    // (repeating from the start) if the type has fewer than that many.
-    var result: std.ArrayList(TypeSamples) = .empty;
-    errdefer {
-        for (result.items) |ts| allocator.free(ts.samples);
-        result.deinit(allocator);
-    }
-
-    for (buckets.items) |bucket| {
-        const pool = bucket.list.items; // always >= 1 element
-        const samples = try allocator.alloc(SampleArgs, TYPE_SAMPLE_CAP);
-        for (samples, 0..) |*s, i| s.* = pool[i % pool.len];
-        try result.append(allocator, .{ .sensor_type = bucket.sensor_type, .samples = samples });
+        if (found) continue;
+        try result.append(allocator, .{
+            .sensor_type = sensor.sensor_type,
+            .args = .{
+                .sensor_id = sensor.sensor_id,
+                .sensor_type = sensor.sensor_type,
+                .zone_id = loc.zone_id,
+                .floor_id = sim.floorFor(zone_floor, loc.zone_id),
+                .position = .{
+                    .x = @floatCast(loc.position.x),
+                    .y = @floatCast(loc.position.y),
+                    .z = @floatCast(loc.position.z),
+                },
+            },
+        });
     }
 
     return result.toOwnedSlice(allocator);
-}
-
-fn queryName(q: queries.QueryName) []const u8 {
-    return switch (q) {
-        .avg_window => "query_avg_window",
-        .avg_zone_type => "query_avg_zone_type",
-        .floor_stats => "query_floor_stats",
-        .hourly_rollup => "query_hourly_rollup",
-        .daily_zone_rollup => "query_daily_zone_rollup",
-        .spatial_radius => "query_spatial_radius",
-        .zone_hierarchy => "query_zone_hierarchy",
-        .anomalies => "query_anomalies",
-        .threshold_breach => "query_threshold_breach",
-        .latest_single => "query_latest_single",
-        .latest_zone => "query_latest_zone",
-        .latest_by_type => "query_latest_by_type",
-    };
-}
-
-fn isHistorical(q: queries.QueryName) bool {
-    return q == .hourly_rollup or q == .daily_zone_rollup;
-}
-
-/// True for queries whose argument list includes a sensor_type (see
-/// `runOneAcrossSamples`'s switch) — these are the queries a
-/// per-sensor-type recommendation can actually distinguish. The other
-/// seven queries are scoped to a sensor_id/zone_id/floor_id/position
-/// instead and would just repeat the same result if reused per type.
-fn isTypeScoped(q: queries.QueryName) bool {
-    return switch (q) {
-        .latest_by_type, .avg_zone_type, .floor_stats, .daily_zone_rollup, .anomalies => true,
-        .avg_window, .hourly_rollup, .latest_single, .latest_zone, .spatial_radius, .zone_hierarchy, .threshold_breach => false,
-    };
-}
-
-/// True if `mix` weights `name` at all — used to decide whether a sensor
-/// type's own canonical relevant_queries (synthetic.profileFor) cares
-/// about a given query, e.g. whether to bother warming anomalies' stats
-/// cache for that type.
-fn hasQuery(mix: []const queries.QueryWeight, name: queries.QueryName) bool {
-    for (mix) |qw| {
-        if (qw.query == name) return true;
-    }
-    return false;
-}
-
-/// Filters `mix` down to the type-scoped queries (isTypeScoped) — used both
-/// to build a single sensor type's own type-scoped query set
-/// (synthetic.profileFor(st).relevant_queries) for its per-type
-/// recommendation. Caller frees with `allocator`.
-fn filterTypeScoped(allocator: std.mem.Allocator, mix: []const queries.QueryWeight) ![]queries.QueryWeight {
-    var list: std.ArrayList(queries.QueryWeight) = .empty;
-    errdefer list.deinit(allocator);
-    for (mix) |qw| {
-        if (isTypeScoped(qw.query)) try list.append(allocator, qw);
-    }
-    return list.toOwnedSlice(allocator);
 }
 
 /// A building's effective query mix is the union of relevant_queries
 /// across every DISTINCT sensor type actually placed — derived from what
 /// was parsed, not declared via a building-type guess. See
 /// synthetic/generator.zig's SensorProfile.relevant_queries doc comment.
+///
+/// Deduplicated by QUERY PATTERN, not just by sensor type: several types'
+/// relevant_queries overlap on the same building-level pattern (e.g.
+/// `anomalies` appears in temperature/co2/air_quality/vibration/energy/
+/// structural's lists). Every building-level query in this mix runs once
+/// per checkpoint against the SAME fixed `overall_sample` regardless of
+/// which type contributed it (see simulation.zig's runOne) — so a query
+/// pattern appearing from N types produced N byte-identical, redundant
+/// measurements, not N different ones. On a real multi-type building (e.g.
+/// a hospital placing most of the 9 sensor types) this multiplied the
+/// per-checkpoint query count several-fold for zero additional
+/// information — confirmed as the dominant cost once Steps 1-3 of the
+/// sim-perf-overhaul fixed generation. Kept: the highest weight seen across
+/// contributing types (a query several types consider high-priority should
+/// stay weighted accordingly, not get diluted by whichever type happened
+/// to contribute it first).
+///
 /// Caller frees with `allocator`.
 fn deriveQueryMix(allocator: std.mem.Allocator, placement: placer.Placement) ![]queries.QueryWeight {
     var seen_types: std.ArrayList(sb.SensorType) = .empty;
     defer seen_types.deinit(allocator);
 
-    var mix: std.ArrayList(queries.QueryWeight) = .empty;
-    errdefer mix.deinit(allocator);
+    var by_query: [std.enums.values(queries.QueryName).len]?queries.QueryWeight = @splat(null);
 
     for (placement.sensors) |sensor| {
         var found = false;
@@ -342,182 +228,20 @@ fn deriveQueryMix(allocator: std.mem.Allocator, placement: placer.Placement) ![]
         try seen_types.append(allocator, sensor.sensor_type);
 
         for (synthetic.profileFor(sensor.sensor_type).relevant_queries) |qw| {
-            try mix.append(allocator, qw);
+            const idx = @intFromEnum(qw.query);
+            if (by_query[idx] == null or qw.weight > by_query[idx].?.weight) {
+                by_query[idx] = qw;
+            }
         }
+    }
+
+    var mix: std.ArrayList(queries.QueryWeight) = .empty;
+    errdefer mix.deinit(allocator);
+    for (by_query) |maybe_qw| {
+        if (maybe_qw) |qw| try mix.append(allocator, qw);
     }
 
     return mix.toOwnedSlice(allocator);
-}
-
-/// Minimum iteration count per CLAUDE.md §3.4.
-const ITERATIONS: u32 = 25;
-const ONE_HOUR_MS: i64 = 60 * 60 * 1000;
-
-/// Times any query by cycling through `samples` (up to TYPE_SAMPLE_CAP real
-/// sensors — type-filtered for type-scoped queries via pickSamplesByType,
-/// or building-wide via pickOverallSamples for the rest) instead of
-/// repeating one fixed sample. Hammering one sensor `ITERATIONS` times in a
-/// row keeps its data artificially hot in cache, which is not how a real
-/// deployment queries hundreds of different sensors. Still calls the
-/// *same*, unmodified `metrics.timeQuery` (CLAUDE.md §3.4:
-/// metrics_system.zig is the only place that times queries) — the only
-/// difference is that the thing being timed (`Sampler.call`) advances to
-/// the next real sensor on every invocation instead of reusing fixed args,
-/// the same pattern `q1_wrapper`..`q12_wrapper` already use to adapt query
-/// signatures into timeQuery's `!void`-returning shape.
-fn runOneAcrossSamples(
-    world: anytype,
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    query: queries.QueryName,
-    samples: []const SampleArgs,
-) !metrics.LatencyStats {
-    const Sampler = struct {
-        world: @TypeOf(world),
-        query: queries.QueryName,
-        samples: []const SampleArgs,
-        idx: usize = 0,
-
-        fn call(self: *@This()) !void {
-            const sample = self.samples[self.idx % self.samples.len];
-            self.idx += 1;
-            switch (self.query) {
-                .avg_window => _ = try queries.query_avg_window(self.world, sample.sensor_id, @as(u32, 24)),
-                .latest_single => try runner.q1_wrapper(self.world, sample.sensor_id),
-                .latest_zone => try runner.q2_wrapper(self.world, sample.zone_id),
-                .latest_by_type => try runner.q3_wrapper(self.world, sample.sensor_type),
-                .avg_zone_type => try runner.q5_wrapper(self.world, sample.zone_id, sample.sensor_type, @as(u32, 24)),
-                .floor_stats => try runner.q6_wrapper(self.world, sample.floor_id, sample.sensor_type, @as(u32, 24)),
-                .hourly_rollup => try runner.q7_wrapper(self.world, sample.sensor_id, @as(u32, 2)),
-                .daily_zone_rollup => try runner.q8_wrapper(self.world, sample.zone_id, sample.sensor_type),
-                .spatial_radius => try runner.q9_wrapper(self.world, sample.position, @as(f32, 50.0)),
-                .zone_hierarchy => try runner.q10_wrapper(self.world, sample.zone_id, @as(u32, 2)),
-                .anomalies => try runner.q11_wrapper(self.world, sample.sensor_type, @as(f32, 1.0)),
-                .threshold_breach => try runner.q12_wrapper(self.world, sample.sensor_id, synthetic.profileFor(sample.sensor_type).base_value, ONE_HOUR_MS),
-            }
-        }
-    };
-
-    var sampler = Sampler{ .world = world, .query = query, .samples = samples };
-    return metrics.timeQuery(allocator, io, ITERATIONS, Sampler.call, .{&sampler});
-}
-
-fn benchProfile(
-    comptime b: runner.BackendEntry,
-    comptime historical_supported: bool,
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    readings: []const sb.SensorReading,
-    locations: []const placer.ZoneLocation,
-    zone_floor: []const ZoneFloor,
-    query_mix: []const queries.QueryWeight,
-    overall_samples: []const SampleArgs,
-    type_samples: []const TypeSamples,
-    scale_label: []const u8,
-    rows: *std.ArrayList(report.RunRow),
-    type_rows: *std.ArrayList(report.RunRow),
-) !void {
-    std.debug.print("\n--- Backend: {s} ---\n", .{b.name});
-
-    var world = try World(b.T).init(allocator);
-    defer world.deinit();
-
-    std.debug.print("  [{s}] ingesting {d} readings + {d} zone/floor registrations...\n", .{ b.name, readings.len, locations.len });
-    const ingest_start = std.Io.Clock.awake.now(io);
-    for (readings) |r| try world.insert(r);
-    for (locations) |loc| try world.registerZone(loc.sensor_id, loc.zone_id);
-    for (zone_floor) |zf| try world.registerFloor(zf.zone_id, zf.floor_id);
-
-    // Force the lazy sort/cache-build/sensor-index every backend otherwise
-    // defers to its first query call — attribute that one-time cost to
-    // ingest (already measured here) instead of letting it silently
-    // inflate whichever query happens to run first (we measured this
-    // directly: TimeSeries's first-ever sort cost 337s hidden inside
-    // query_latest_single's uncounted warmup, then every later query
-    // looked artificially fast because the work was already done).
-    _ = try world.iterateAll();
-    const warm = try world.readingsForSensor(overall_samples[0].sensor_id);
-    allocator.free(warm);
-
-    // statsForType/readingsForType exist solely for query_anomalies —
-    // forcing them for every placed type would waste full-dataset passes
-    // on types whose own canonical relevant_queries doesn't even include
-    // anomalies (e.g. occupancy/temperature). Only warm what will
-    // actually be queried, per each type's own table.
-    var warmed_type_index = false;
-    for (type_samples) |group| {
-        const type_mix = synthetic.profileFor(group.sensor_type).relevant_queries;
-        if (!hasQuery(type_mix, .anomalies)) continue;
-        _ = try world.statsForType(group.sensor_type);
-        if (!warmed_type_index) {
-            const warm_type = try world.readingsForType(group.sensor_type);
-            allocator.free(warm_type);
-            warmed_type_index = true;
-        }
-    }
-
-    std.debug.print("  [{s}] ingest done in {d:.1}s ({d:.1} MB)\n", .{
-        b.name, elapsedSeconds(io, ingest_start), @as(f64, @floatFromInt(world.memoryUsed())) / (1024.0 * 1024.0),
-    });
-
-    std.debug.print("  [{s}] running {d} building-level queries...\n", .{ b.name, query_mix.len });
-    for (query_mix) |qw| {
-        if (!historical_supported and isHistorical(qw.query)) continue;
-
-        std.debug.print("    {s}: starting...\n", .{queryName(qw.query)});
-        const q_start = std.Io.Clock.awake.now(io);
-        const stats = try runOneAcrossSamples(&world, allocator, io, qw.query, overall_samples);
-        std.debug.print("    {s}: finished — median {d:.1}us, p95 {d:.1}us (took {d:.1}s)\n", .{
-            queryName(qw.query),
-            @as(f64, @floatFromInt(stats.median_ns)) / 1000.0,
-            @as(f64, @floatFromInt(stats.p95_ns)) / 1000.0,
-            elapsedSeconds(io, q_start),
-        });
-        try rows.append(allocator, .{
-            .scale = scale_label,
-            .query = queryName(qw.query),
-            .backend = b.name,
-            .memory_bytes = world.memoryUsed(),
-            .stats = stats,
-        });
-    }
-
-    // Re-run the type-scoped queries from each type's OWN canonical
-    // relevant_queries (synthetic.profileFor), once per distinct sensor
-    // type placed, against this same already-ingested world — no
-    // re-ingest, so this stays cheap even at 72M-reading scale. Each query
-    // is timed across up to TYPE_SAMPLE_CAP real sensors of that type (see
-    // runOneAcrossSamples), not one sensor repeated.
-    if (type_samples.len > 0) {
-        std.debug.print("  [{s}] running type-scoped queries across {d} sensor types...\n", .{ b.name, type_samples.len });
-    }
-    for (type_samples) |group| {
-        const type_mix = synthetic.profileFor(group.sensor_type).relevant_queries;
-        for (type_mix) |qw| {
-            if (!isTypeScoped(qw.query)) continue;
-            if (!historical_supported and isHistorical(qw.query)) continue;
-
-            std.debug.print("    {s} / {s}: starting...\n", .{ @tagName(group.sensor_type), queryName(qw.query) });
-            const q_start = std.Io.Clock.awake.now(io);
-            const stats = try runOneAcrossSamples(&world, allocator, io, qw.query, group.samples);
-            std.debug.print("    {s} / {s}: finished — median {d:.1}us, p95 {d:.1}us (took {d:.1}s)\n", .{
-                @tagName(group.sensor_type),
-                queryName(qw.query),
-                @as(f64, @floatFromInt(stats.median_ns)) / 1000.0,
-                @as(f64, @floatFromInt(stats.p95_ns)) / 1000.0,
-                elapsedSeconds(io, q_start),
-            });
-            try type_rows.append(allocator, .{
-                .scale = @tagName(group.sensor_type),
-                .query = queryName(qw.query),
-                .backend = b.name,
-                .memory_bytes = world.memoryUsed(),
-                .stats = stats,
-            });
-        }
-    }
-
-    std.debug.print("  [{s}] backend done.\n", .{b.name});
 }
 
 // ---------------------------------------------------------------------------
@@ -535,14 +259,14 @@ fn buildSchematicData(
     allocator: std.mem.Allocator,
     model: ifc.ParsedModel,
     placement: placer.Placement,
-    zone_floor: []const ZoneFloor,
+    zone_floor: []const sim.ZoneFloor,
 ) !SchematicData {
     var sensors = try allocator.alloc(schematic.SensorPoint, placement.sensors.len);
     for (placement.sensors, placement.locations, 0..) |sensor, loc, i| {
         sensors[i] = .{
             .x = loc.position.x,
             .y = loc.position.y,
-            .floor_id = floorFor(zone_floor, loc.zone_id),
+            .floor_id = sim.floorFor(zone_floor, loc.zone_id),
             .sensor_type = sensor.sensor_type,
         };
     }
@@ -562,18 +286,14 @@ fn buildSchematicData(
     return .{ .sensors = sensors, .zones = try zones.toOwnedSlice(allocator) };
 }
 
-/// One backend ranking scoped to a single sensor type — same shape as
-/// the building-level `report.Recommendation`, just filtered down to that
-/// type's own type-scoped queries (synthetic.profileFor(st).relevant_queries
-/// filtered through filterTypeScoped).
-const TypeRecommendation = struct { sensor_type: sb.SensorType, rec: report.Recommendation };
-
-fn isSupported(comptime b: runner.BackendEntry) bool {
-    for (runner.supported_backends) |sup| {
-        if (std.mem.eql(u8, sup.name, b.name)) return true;
-    }
-    return false;
-}
+/// Comptime-extracted names of the full-retention backends
+/// (runner.supported_backends) — passed to `recommendCompound` as the
+/// eligible set for the historical track.
+const full_retention_names = blk: {
+    var names: [runner.supported_backends.len][]const u8 = undefined;
+    for (runner.supported_backends, 0..) |b, i| names[i] = b.name;
+    break :blk names;
+};
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
@@ -591,7 +311,7 @@ pub fn main(init: std.process.Init) !void {
         },
     };
 
-    std.debug.print("Parsing {s}...\n", .{args.bim_path});
+    std.debug.print("\n[1/6] Parsing IFC: {s}...\n", .{args.bim_path});
     const parse_start = std.Io.Clock.awake.now(io);
     const source = try std.Io.Dir.cwd().readFileAlloc(io, args.bim_path, allocator, .limited(1024 * 1024 * 1024));
     defer allocator.free(source);
@@ -604,7 +324,7 @@ pub fn main(init: std.process.Init) !void {
         .{ args.bim_path, model.building_elements.len, model.zones.len, model.equipment.len, elapsedSeconds(io, parse_start) },
     );
 
-    std.debug.print("Placing sensors...\n", .{});
+    std.debug.print("\n[2/6] Placing sensors...\n", .{});
     const place_start = std.Io.Clock.awake.now(io);
     var placement = try placer.place(allocator, model.building_elements, model.zones, .{});
     defer placement.deinit();
@@ -615,27 +335,19 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    // 1h of synthetic data (generator's own default duration). Sample rates
-    // now come from synthetic.profileFor's canonical per-type table
-    // (minutes-scale for most types), so this is a modest dataset — see
-    // that file's header comment for why literal real-world retention
-    // windows (e.g. 30 days of 100Hz vibration) aren't generated outright.
-    std.debug.print("Generating synthetic readings for {d} sensors...\n", .{placement.sensors.len});
-    const gen_start = std.Io.Clock.awake.now(io);
-    const readings = try synthetic.generate(allocator, placement.sensors, .{});
-    defer allocator.free(readings);
-    std.debug.print("Generated {d} synthetic readings ({d:.1}s).\n", .{ readings.len, elapsedSeconds(io, gen_start) });
-
+    // Live day-zero simulation: the building starts at simulated day zero
+    // with empty backends. A synthetic.Stream feeds readings chunk-by-chunk
+    // (1 simulated day per chunk) into each backend, pruning to retention
+    // windows as simulated time advances, with queries benchmarked at
+    // log-spaced checkpoints. Sim duration derives from the placed sensor
+    // types' retention depths — no CLI flag.
+    std.debug.print("\n[3/6] Setting up simulation...\n", .{});
     const zone_floor = try buildZoneFloorMap(allocator, model.building_elements, model.zones);
     defer allocator.free(zone_floor);
 
-    const overall_samples = try pickOverallSamples(allocator, placement, zone_floor);
-    defer allocator.free(overall_samples);
-    const type_samples = try pickSamplesByType(allocator, placement, zone_floor);
-    defer {
-        for (type_samples) |ts| allocator.free(ts.samples);
-        allocator.free(type_samples);
-    }
+    const overall_sample = pickOverallSample(placement, zone_floor);
+    const type_samples = try pickTypeSamples(allocator, placement, zone_floor);
+    defer allocator.free(type_samples);
 
     // The building's effective query mix — derived from whichever sensor
     // types actually got placed (each contributes its own canonical
@@ -643,44 +355,108 @@ pub fn main(init: std.process.Init) !void {
     const query_mix = try deriveQueryMix(allocator, placement);
     defer allocator.free(query_mix);
 
+    // Collect all distinct sensor types for deriveSimDays.
+    var placed_types: std.ArrayList(sb.SensorType) = .empty;
+    defer placed_types.deinit(allocator);
+    for (type_samples) |ts| try placed_types.append(allocator, ts.sensor_type);
+
+    const sim_days = sim.deriveSimDays(placed_types.items);
+    const checkpoints = try sim.deriveCheckpoints(allocator, sim_days);
+    defer allocator.free(checkpoints);
+
+    const scale_label = scaleLabel(args.bim_path);
+    const seed: u64 = 42;
+
+    std.debug.print("  Sim duration: {d} days ({d:.1} years)\n", .{ sim_days, @as(f64, @floatFromInt(sim_days)) / 365.0 });
+    std.debug.print("  Checkpoints: {d} — ", .{checkpoints.len});
+    for (checkpoints, 0..) |cp, i| {
+        if (i > 0) std.debug.print(", ", .{});
+        std.debug.print("{s} (day {d})", .{ cp.label, cp.sim_day });
+    }
+    std.debug.print("\n", .{});
+    std.debug.print("  Seed: {d}\n", .{seed});
+    std.debug.print("  Backends: {d}\n", .{runner.backends.len});
+
+    std.debug.print("\n[4/6] Running live day-zero simulation...\n", .{});
+
     var rows: std.ArrayList(report.RunRow) = .empty;
     defer rows.deinit(allocator);
     var type_rows: std.ArrayList(report.RunRow) = .empty;
     defer type_rows.deinit(allocator);
+    var growth: std.ArrayList(sim.GrowthPoint) = .empty;
+    defer growth.deinit(allocator);
+    var sim_stats: std.ArrayList(sim.SimStats) = .empty;
+    defer sim_stats.deinit(allocator);
+    var type_volumes: std.ArrayList(sim.TypeVolume) = .empty;
+    defer type_volumes.deinit(allocator);
+    var type_quality: std.ArrayList(sim.TypeQuality) = .empty;
+    defer type_quality.deinit(allocator);
 
-    const scale_label = scaleLabel(args.bim_path);
+    // The output dir doubles as home for the simulation's replay cache
+    // (generated stream spilled once, replayed by backends 2..N — see
+    // simulateAllBackends), so it must exist before the simulation, not
+    // just before report writing. The cache is deleted right after the
+    // simulation; failure to delete is a warning, not a run failure.
+    const cwd = std.Io.Dir.cwd();
+    cwd.createDirPath(io, args.output_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+    var out_dir = try cwd.openDir(io, args.output_dir, .{});
+    defer out_dir.close(io);
 
-    inline for (runner.backends) |b| {
-        try benchProfile(
-            b,
-            isSupported(b),
-            allocator,
-            io,
-            readings,
-            placement.locations,
-            zone_floor,
-            query_mix,
-            overall_samples,
-            type_samples,
-            scale_label,
-            &rows,
-            &type_rows,
-        );
-    }
+    defer out_dir.deleteFile(io, sim.REPLAY_FILE_NAME) catch |err| {
+        std.debug.print("  warning: could not delete {s}/{s}: {s}\n", .{ args.output_dir, sim.REPLAY_FILE_NAME, @errorName(err) });
+    };
 
-    const recommendation = try report.recommendBackend(allocator, rows.items, scale_label, query_mix);
-    defer allocator.free(recommendation.scores);
+    try sim.simulateAllBackends(
+        allocator,
+        io,
+        out_dir,
+        placement.sensors,
+        placement.locations,
+        zone_floor,
+        query_mix,
+        overall_sample,
+        type_samples,
+        scale_label,
+        seed,
+        checkpoints,
+        &rows,
+        &type_rows,
+        &growth,
+        &sim_stats,
+        &type_volumes,
+        &type_quality,
+    );
+
+    std.debug.print("\n[5/6] Computing recommendations...\n", .{});
+    const compound = try report.recommendCompound(allocator, rows.items, scale_label, query_mix, &full_retention_names);
+    defer allocator.free(compound.realtime.scores);
+    defer allocator.free(compound.historical.scores);
 
     std.debug.print("\n=== Recommendation ({s}) ===\n", .{scale_label});
+    std.debug.print("Real-time track (latest_* queries — all backends compete):\n", .{});
     std.debug.print("{s:<15} {s:>10} {s:>12}\n", .{ "Backend", "Score", "Coverage" });
-    for (recommendation.scores) |s| {
+    for (compound.realtime.scores) |s| {
         std.debug.print("{s:<15} {d:>10.3} {d:>11.0}%\n", .{ s.backend, s.score, s.coverage * 100 });
     }
-    std.debug.print("Winner: {s} (lowest weighted median across this building's query mix; 1.0 = won every query)\n", .{recommendation.winner});
+    std.debug.print("Real-time winner: {s}\n\n", .{compound.realtime.winner});
 
-    var type_recommendations: std.ArrayList(TypeRecommendation) = .empty;
+    std.debug.print("Historical track (aggregation/historical/spatial/anomaly — full-retention backends only):\n", .{});
+    std.debug.print("{s:<15} {s:>10} {s:>12}\n", .{ "Backend", "Score", "Coverage" });
+    for (compound.historical.scores) |s| {
+        std.debug.print("{s:<15} {d:>10.3} {d:>11.0}%\n", .{ s.backend, s.score, s.coverage * 100 });
+    }
+    std.debug.print("Historical winner: {s}\n", .{compound.historical.winner});
+    std.debug.print("\nDeployment combo: {s} (live) + {s} (historical)\n", .{ compound.realtime.winner, compound.historical.winner });
+
+    var type_recommendations: std.ArrayList(report.TypeRecommendation) = .empty;
     defer {
-        for (type_recommendations.items) |tr| allocator.free(tr.rec.scores);
+        for (type_recommendations.items) |tr| {
+            allocator.free(tr.compound.realtime.scores);
+            allocator.free(tr.compound.historical.scores);
+        }
         type_recommendations.deinit(allocator);
     }
 
@@ -688,23 +464,30 @@ pub fn main(init: std.process.Init) !void {
         // Each type's OWN type-scoped queries — not a shared building-wide
         // filter — since different types can care about different query
         // patterns (occupancy's relevant_queries differ from vibration's).
-        const type_scoped_mix = try filterTypeScoped(allocator, synthetic.profileFor(ts.sensor_type).relevant_queries);
+        const type_scoped_mix = try sim.filterTypeScoped(allocator, synthetic.profileFor(ts.sensor_type).relevant_queries);
         defer allocator.free(type_scoped_mix);
         if (type_scoped_mix.len == 0) continue;
 
-        const rec = try report.recommendBackend(allocator, type_rows.items, @tagName(ts.sensor_type), type_scoped_mix);
-        try type_recommendations.append(allocator, .{ .sensor_type = ts.sensor_type, .rec = rec });
+        const tc = try report.recommendCompound(allocator, type_rows.items, @tagName(ts.sensor_type), type_scoped_mix, &full_retention_names);
+        try type_recommendations.append(allocator, .{ .sensor_type = ts.sensor_type, .compound = tc });
     }
 
     if (type_recommendations.items.len > 0) {
         std.debug.print("\n=== Recommendation by Sensor Type ({s}) ===\n", .{scale_label});
         for (type_recommendations.items) |tr| {
-            std.debug.print("{s:<14} winner: {s}\n", .{ @tagName(tr.sensor_type), tr.rec.winner });
+            if (tr.compound.realtime.scores.len > 0 and tr.compound.historical.scores.len > 0) {
+                std.debug.print("{s:<14} live: {s} | historical: {s}\n", .{ @tagName(tr.sensor_type), tr.compound.realtime.winner, tr.compound.historical.winner });
+            } else if (tr.compound.historical.scores.len > 0) {
+                std.debug.print("{s:<14} historical: {s}\n", .{ @tagName(tr.sensor_type), tr.compound.historical.winner });
+            } else if (tr.compound.realtime.scores.len > 0) {
+                std.debug.print("{s:<14} live: {s}\n", .{ @tagName(tr.sensor_type), tr.compound.realtime.winner });
+            }
         }
     }
 
-    try writeRecommendationReport(allocator, io, args.output_dir, args.bim_path, scale_label, model, placement, recommendation, rows.items, type_recommendations.items);
-    std.debug.print("Wrote recommendation.md to {s}/\n", .{args.output_dir});
+    std.debug.print("\n[6/6] Writing reports...\n", .{});
+    try writeRecommendationReport(allocator, io, args.output_dir, args.bim_path, scale_label, model, placement, compound, rows.items, type_recommendations.items, growth.items, sim_stats.items, type_volumes.items, type_quality.items);
+    std.debug.print("  Wrote recommendation.md + recommendation.html + simulation.json to {s}/\n", .{args.output_dir});
 
     const sd = try buildSchematicData(allocator, model, placement, zone_floor);
     defer allocator.free(sd.sensors);
@@ -713,9 +496,9 @@ pub fn main(init: std.process.Init) !void {
     var title_buf: [512]u8 = undefined;
     const title = try std.fmt.bufPrint(&title_buf, "{s} ({d} sensors)", .{ args.bim_path, placement.sensors.len });
     try schematic.writeSchematic(allocator, io, args.output_dir, title, sd.sensors, sd.zones);
-    std.debug.print("Wrote schematic.svg to {s}/\n", .{args.output_dir});
+    std.debug.print("  Wrote schematic.svg to {s}/\n", .{args.output_dir});
 
-    std.debug.print("\nTotal run time: {d:.1}s\n", .{elapsedSeconds(io, run_start)});
+    std.debug.print("\nDone. Total run time: {d:.1}s\n", .{elapsedSeconds(io, run_start)});
 }
 
 fn countSensorsByType(sensors: []const placer.SensorMetadata) [9]u32 {
@@ -732,9 +515,13 @@ fn writeRecommendationReport(
     scale_label: []const u8,
     model: ifc.ParsedModel,
     placement: placer.Placement,
-    recommendation: report.Recommendation,
+    compound: report.CompoundRecommendation,
     rows: []const report.RunRow,
-    type_recommendations: []const TypeRecommendation,
+    type_recommendations: []const report.TypeRecommendation,
+    growth: []const sim.GrowthPoint,
+    sim_stats: []const sim.SimStats,
+    type_volumes: []const sim.TypeVolume,
+    type_quality: []const sim.TypeQuality,
 ) !void {
     var md: std.ArrayList(u8) = .empty;
     defer md.deinit(allocator);
@@ -745,6 +532,48 @@ fn writeRecommendationReport(
     try md.print(allocator, "- Elements: {d} | Zones: {d} | Equipment: {d} | Sensors placed: {d}\n\n", .{
         model.building_elements.len, model.zones.len, model.equipment.len, placement.sensors.len,
     });
+
+    try md.print(allocator, "## Verdict\n\n", .{});
+    try md.print(allocator, "**Use `{s}` for live/latest-value queries.**\n\n", .{compound.realtime.winner});
+    try md.print(allocator, "**Use `{s}` for everything else** (history, aggregates, anomalies).\n\n", .{compound.historical.winner});
+
+    if (compound.historical.scores.len > 1) {
+        const hist_margin = compound.historical.scores[1].score / compound.historical.scores[0].score;
+        if (report.isCloseRace(compound.historical.scores)) {
+            try md.print(allocator, "The historical-query race is close: `{s}` vs `{s}` (within 15%) — treat this " ++
+                "specific ranking as a near-tie, not a confident win; single-shot microsecond-scale timing is " ++
+                "sensitive to run-to-run noise at this margin (CLAUDE.md §3.4).\n\n", .{
+                compound.historical.scores[0].backend,
+                compound.historical.scores[1].backend,
+            });
+        } else {
+            try md.print(allocator, "`{s}` wins historical queries by **{d:.1}x** over the next-best backend " ++
+                "(`{s}`) — a decisive, noise-proof margin.\n\n", .{
+                compound.historical.winner,
+                hist_margin,
+                compound.historical.scores[1].backend,
+            });
+        }
+    }
+
+    if (compound.realtime.scores.len > 1) {
+        const rt_margin = compound.realtime.scores[1].score / compound.realtime.scores[0].score;
+        if (report.isCloseRace(compound.realtime.scores)) {
+            try md.print(allocator, "The live-query race is close: `{s}` vs `{s}` (within 15%) — treat this " ++
+                "specific ranking as a near-tie, not a confident win; single-shot microsecond-scale timing is " ++
+                "sensitive to run-to-run noise at this margin (CLAUDE.md §3.4).\n\n", .{
+                compound.realtime.scores[0].backend,
+                compound.realtime.scores[1].backend,
+            });
+        } else {
+            try md.print(allocator, "`{s}` wins live queries by **{d:.1}x** over the next-best backend " ++
+                "(`{s}`) — a clear margin.\n\n", .{
+                compound.realtime.winner,
+                rt_margin,
+                compound.realtime.scores[1].backend,
+            });
+        }
+    }
 
     try md.print(allocator, "## Sensors placed, by type\n\n", .{});
     try md.print(allocator, "Density, sampling rate, and retention all come from each type's own canonical " ++
@@ -757,56 +586,182 @@ fn writeRecommendationReport(
         if (c > 0) try md.print(allocator, "| {s} | {d} | {d} days |\n", .{ @tagName(t), c, synthetic.profileFor(t).retention_days });
     }
 
+    var sensor_type_counts: std.ArrayList(report.SensorTypeCount) = .empty;
+    defer sensor_type_counts.deinit(allocator);
+    for (all_types) |t| {
+        const c = counts[@intFromEnum(t)];
+        if (c > 0) try sensor_type_counts.append(allocator, .{
+            .name = @tagName(t),
+            .count = c,
+            .retention_days = synthetic.profileFor(t).retention_days,
+        });
+    }
+
     try md.print(allocator, "\n> Honesty headline: relative rankings are reliable; absolute numbers are approximate (CLAUDE.md §6).\n\n", .{});
 
-    try md.print(allocator, "## Recommendation\n\n", .{});
-    try md.print(allocator, "Score = weighted average of (this backend's median / the per-query winner's median) across " ++
-        "the building's effective query mix — the union of relevant_queries across every sensor type actually " ++
-        "placed (see synthetic/generator.zig). **1.00 = won every weighted query; higher is worse.** Coverage below " ++
-        "100% means the backend has no data for one or more weighted queries.\n\n", .{});
-    try md.print(allocator, "| Backend | Score | Coverage |\n|---|---:|---:|\n", .{});
-    for (recommendation.scores) |s| {
-        try md.print(allocator, "| {s} | {d:.3} | {d:.0}% |\n", .{ s.backend, s.score, s.coverage * 100 });
+    {
+        var storey_count: u32 = 0;
+        var space_count: u32 = 0;
+        for (model.zones) |z| switch (z.zone_type) {
+            .storey => storey_count += 1,
+            .space => space_count += 1,
+        };
+        if (space_count == 0 and storey_count > 0) {
+            try md.print(allocator, "> **Data-quality note:** this IFC file has {d} `IfcBuildingStorey` " ++
+                "entit{s} but zero `IfcSpace` entities. Comfort/IAQ sensors (temperature, humidity, occupancy, " ++
+                "CO2, air_quality) attach only to `IfcSpace` elements, so none were placed — this is likely a " ++
+                "discipline-specific export (e.g. furniture/MEP-only) detached from the architectural model " ++
+                "that would normally carry room boundaries, not a placement bug.\n\n", .{
+                storey_count, if (storey_count == 1) "y" else "ies",
+            });
+        }
     }
-    try md.print(allocator, "\n**Winner: {s}**\n\n", .{recommendation.winner});
+
+    try md.print(allocator, "## Recommendation\n\n", .{});
+    try md.print(allocator, "Recommendations are **compound** — split into two independently-won tracks, because no single backend " ++
+        "should serve both a tiny live cache's workload and a full-history store's workload:\n\n", .{});
+    try md.print(allocator, "1. **Real-time track** (`latest_single`, `latest_zone`, `latest_by_type`) — all backends compete; " ++
+        "the count-capped real-time cache (RingBuffer, 10 readings/sensor) legitimately wins here.\n", .{});
+    try md.print(allocator, "2. **Historical track** (aggregation, historical rollups, spatial, anomaly) — only full-retention " ++
+        "backends compete; the real-time cache is excluded because it evicts data these queries need.\n\n", .{});
+    try md.print(allocator, "Score = weighted average of (this backend's median / the per-query winner's median) across " ++
+        "that track's query mix. **1.00 = won every weighted query; higher is worse.** Coverage below 100% means " ++
+        "the backend has no data for one or more weighted queries.\n\n", .{});
+
+    try md.print(allocator, "### Real-time track\n\n", .{});
+    try md.print(allocator, "| Backend | Score | Coverage |\n|---|---:|---:|\n", .{});
+    for (compound.realtime.scores) |s| {
+        try md.print(allocator, "| {s} | {d:.2} | {d:.0}% |\n", .{ s.backend, s.score, s.coverage * 100 });
+    }
+    try md.print(allocator, "\n**Real-time winner: {s}**\n\n", .{compound.realtime.winner});
+
+    try md.print(allocator, "### Historical track\n\n", .{});
+    try md.print(allocator, "| Backend | Score | Coverage |\n|---|---:|---:|\n", .{});
+    for (compound.historical.scores) |s| {
+        try md.print(allocator, "| {s} | {d:.2} | {d:.0}% |\n", .{ s.backend, s.score, s.coverage * 100 });
+    }
+    try md.print(allocator, "\n**Historical winner: {s}**\n\n", .{compound.historical.winner});
+
+    try md.print(allocator, "**Deployment combo: {s} (live) + {s} (historical)**\n\n", .{ compound.realtime.winner, compound.historical.winner });
 
     if (type_recommendations.len > 0) {
+        var placed_type_count: u32 = 0;
+        for (counts) |c| {
+            if (c > 0) placed_type_count += 1;
+        }
+
         try md.print(allocator, "## Recommendation by Sensor Type\n\n", .{});
-        try md.print(allocator, "Same scoring rule as above, but scoped to one sensor type at a time. For each of the " ++
-            "{d} sensor types actually placed in this building, every timed call cycles to the next of up to {d} " ++
-            "real sensors of that type (repeating from the start if fewer than {d} were placed) instead of repeating " ++
-            "one fixed sensor — closer to a real deployment, which queries many different sensors of a type rather " ++
-            "than the same one. Scores only the query patterns in that type's own canonical relevant_queries that " ++
-            "take a sensor type as an argument (`latest_by_type`, `avg_zone_type`, `floor_stats`, " ++
-            "`daily_zone_rollup`, `anomalies` — whichever are relevant for this specific type). A type's winner can " ++
-            "differ from the building-wide winner above if that type's relevant queries behave differently.\n\n", .{
-            type_recommendations.len, TYPE_SAMPLE_CAP, TYPE_SAMPLE_CAP,
+        try md.print(allocator, "Same scoring rule as above, but scoped to one sensor type at a time. Of the " ++
+            "{d} sensor types actually placed in this building, {d} have at least one type-scoped query in their " ++
+            "canonical relevant_queries and are scored below; each is measured once against a real placed sensor " ++
+            "of that exact type, over its full independently-generated dataset. Scores only the query patterns in " ++
+            "that type's own canonical relevant_queries that take a sensor type as an argument (`latest_by_type`, " ++
+            "`avg_zone_type`, `floor_stats`, `daily_zone_rollup`, `anomalies` — whichever are relevant for this " ++
+            "specific type). A type's winner can differ from the building-wide winner above if that type's " ++
+            "relevant queries behave differently.\n\n", .{
+            placed_type_count,
+            type_recommendations.len,
         });
         for (type_recommendations) |tr| {
-            try md.print(allocator, "**{s}** — winner: **{s}**\n\n", .{ @tagName(tr.sensor_type), tr.rec.winner });
-            if (tr.rec.scores.len > 0) {
+            if (tr.compound.realtime.scores.len > 0 and tr.compound.historical.scores.len > 0) {
+                try md.print(allocator, "**{s}** — live: **{s}** | historical: **{s}**\n\n", .{ @tagName(tr.sensor_type), tr.compound.realtime.winner, tr.compound.historical.winner });
+            } else if (tr.compound.historical.scores.len > 0) {
+                try md.print(allocator, "**{s}** — historical: **{s}**\n\n", .{ @tagName(tr.sensor_type), tr.compound.historical.winner });
+            } else if (tr.compound.realtime.scores.len > 0) {
+                try md.print(allocator, "**{s}** — live: **{s}**\n\n", .{ @tagName(tr.sensor_type), tr.compound.realtime.winner });
+            }
+            if (tr.compound.realtime.scores.len > 0) {
+                try md.print(allocator, "Real-time:\n\n", .{});
                 try md.print(allocator, "| Backend | Score | Coverage |\n|---|---:|---:|\n", .{});
-                for (tr.rec.scores) |s| {
-                    try md.print(allocator, "| {s} | {d:.3} | {d:.0}% |\n", .{ s.backend, s.score, s.coverage * 100 });
+                for (tr.compound.realtime.scores) |s| {
+                    try md.print(allocator, "| {s} | {d:.2} | {d:.0}% |\n", .{ s.backend, s.score, s.coverage * 100 });
+                }
+                try md.print(allocator, "\n", .{});
+            }
+            if (tr.compound.historical.scores.len > 0) {
+                try md.print(allocator, "Historical:\n\n", .{});
+                try md.print(allocator, "| Backend | Score | Coverage |\n|---|---:|---:|\n", .{});
+                for (tr.compound.historical.scores) |s| {
+                    try md.print(allocator, "| {s} | {d:.2} | {d:.0}% |\n", .{ s.backend, s.score, s.coverage * 100 });
                 }
                 try md.print(allocator, "\n", .{});
             }
         }
     }
 
+    try md.print(allocator, "<details>\n<summary><strong>Per-query latency detail</strong> (all backends × this building's actual query mix)</summary>\n\n", .{});
     try md.print(allocator, "## Per-query latency (this building's actual query mix)\n\n", .{});
-    try md.print(allocator, "| Query | Backend | Median µs | p95 µs | Memory (KB) |\n|---|---|---:|---:|---:|\n", .{});
+    try md.print(allocator, "| Query | Backend | Median | p95 | Memory (KB) |\n|---|---|---:|---:|---:|\n", .{});
     for (rows) |r| {
-        try md.print(allocator, "| {s} | {s} | {d:.1} | {d:.1} | {d:.1} |\n", .{
-            r.query,
-            r.backend,
-            @as(f64, @floatFromInt(r.stats.median_ns)) / 1000.0,
-            @as(f64, @floatFromInt(r.stats.p95_ns)) / 1000.0,
+        try md.print(allocator, "| {s} | {s} | ", .{ r.query, r.backend });
+        try report.writeScaledUs(&md, allocator, @as(f64, @floatFromInt(r.stats.median_ns)) / 1000.0, true);
+        try md.print(allocator, " | ", .{});
+        try report.writeScaledUs(&md, allocator, @as(f64, @floatFromInt(r.stats.p95_ns)) / 1000.0, true);
+        try md.print(allocator, " | {d:.1} |\n", .{
             @as(f64, @floatFromInt(r.memory_bytes)) / 1024.0,
         });
     }
 
-    try md.print(allocator, "\nSee `schematic.svg` in this directory for a floor-by-floor map of placed sensors.\n", .{});
+    // Explicit per-query winner — the direct answer to "which backend for
+    // this query behavior": for each query pattern this building actually
+    // runs, the single fastest backend at steady state, not left for the
+    // reader to eyeball out of the raw latency table above. Same grouping
+    // logic the internal regression-suite report already uses
+    // (report.writeReports), reused rather than reimplemented. Non-real-time
+    // queries only admit full-retention backends — same eligibility rule the
+    // compound recommendation applies, so a count-capped cache that scanned
+    // 200x less data can't be presented as a "winner" (see writeWinners's
+    // doc comment).
+    try md.print(allocator, "\n### Per-query winner (lowest median)\n\n", .{});
+    try md.print(allocator, "For queries outside the real-time family, only full-retention backends compete " ++
+        "(same rule as the recommendation tracks above) — the real-time cache holds a fraction " ++
+        "of the data those queries need, so its latency on them is not comparable.\n\n", .{});
+    try md.print(allocator, "| Query | Winner | Median | Runner-up | Median | Speedup |\n", .{});
+    try md.print(allocator, "|---|---|---:|---|---:|---:|\n", .{});
+    try report.writeWinners(&md, allocator, rows, scale_label, &full_retention_names, true);
+    try md.print(allocator, "\n</details>\n\n", .{});
+
+    try md.print(allocator, "See `schematic.svg` in this directory for a floor-by-floor map of placed sensors.\n\n", .{});
+
+    // Cost estimate — cloud-equivalent $/year per backend + naive vs optimised
+    const all_backend_names = comptime blk: {
+        var names: [runner.backends.len][]const u8 = undefined;
+        for (runner.backends, 0..) |b, i| names[i] = b.name;
+        break :blk names;
+    };
+    // Real-time queries are ~3 of 12 patterns; estimate their fraction of
+    // total query volume (latest_* are high-frequency, ~1/sec each, while
+    // historical/aggregate are ~1/min — so real-time is the majority of
+    // total query count).
+    const realtime_query_fraction = 0.7;
+
+    const cost_estimates = try cost_model.estimateAll(allocator, rows, &all_backend_names, cost_model.DEFAULT_WORKLOAD, cost_model.DEFAULT_PRICING);
+    defer allocator.free(cost_estimates);
+    var cost_rows: std.ArrayList(report.CostRow) = .empty;
+    defer cost_rows.deinit(allocator);
+    for (cost_estimates) |e| {
+        try cost_rows.append(allocator, .{
+            .backend = e.backend,
+            .storage_gb = e.storage_tb * 1024.0,
+            .storage_cost_year = e.storage_cost_year,
+            .query_cost_year = e.query_cost_year,
+            .total_cost_year = e.total_cost_year,
+        });
+    }
+    const naive_cost = cost_model.naiveTotalCost(rows, &all_backend_names, cost_model.DEFAULT_WORKLOAD, cost_model.DEFAULT_PRICING);
+    const optimised_cost = cost_model.optimisedCost(rows, compound.realtime.winner, compound.historical.winner, realtime_query_fraction, cost_model.DEFAULT_WORKLOAD, cost_model.DEFAULT_PRICING);
+
+    try cost_model.writeCostSection(
+        &md,
+        allocator,
+        rows,
+        &all_backend_names,
+        compound.realtime.winner,
+        compound.historical.winner,
+        realtime_query_fraction,
+        cost_model.DEFAULT_WORKLOAD,
+        cost_model.DEFAULT_PRICING,
+    );
 
     const cwd = std.Io.Dir.cwd();
     cwd.createDirPath(io, output_dir) catch |err| switch (err) {
@@ -815,5 +770,31 @@ fn writeRecommendationReport(
     };
     var dir = try cwd.openDir(io, output_dir, .{});
     defer dir.close(io);
+    try md.print(allocator, "<details>\n<summary><strong>Growth curve detail</strong> (latency at every checkpoint from day 1 to steady state)</summary>\n\n", .{});
+    try report.writeGrowthSection(&md, allocator, growth);
+    try md.print(allocator, "\n</details>\n\n", .{});
+
+    try md.print(allocator, "<details>\n<summary><strong>Simulation summary</strong> (compression, eviction, and data-quality stats)</summary>\n\n", .{});
+    try report.writeSimSection(&md, allocator, sim_stats, type_volumes, type_quality);
+    try md.print(allocator, "\n</details>\n\n", .{});
+
     try dir.writeFile(io, .{ .sub_path = "recommendation.md", .data = md.items });
+    try report.writeBuildingHtmlReport(
+        allocator,
+        io,
+        &dir,
+        bim_path,
+        scale_label,
+        sensor_type_counts.items,
+        compound,
+        type_recommendations,
+        rows,
+        &full_retention_names,
+        growth,
+        sim_stats,
+        cost_rows.items,
+        naive_cost,
+        optimised_cost,
+    );
+    try report.writeSimJson(allocator, io, &dir, sim_stats, growth, type_volumes, type_quality);
 }

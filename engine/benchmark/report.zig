@@ -9,6 +9,7 @@ const std = @import("std");
 const metrics = @import("../ecs/systems/metrics_system.zig");
 const fixtures = @import("dataset.zig");
 const queries = @import("queries.zig");
+const sb = @import("../ecs/storage/storage_backend.zig");
 
 /// One latency-table row, decoupled from how it's rendered.
 pub const RunRow = struct {
@@ -52,29 +53,136 @@ pub const BackendScore = struct {
     coverage: f64,
 };
 
-pub const Recommendation = struct {
+/// One track of a compound recommendation — scoped to one query family
+/// group (real-time vs. everything else) and possibly to a restricted set of
+/// eligible backends. Caller frees `scores`.
+pub const TrackRecommendation = struct {
     scores: []BackendScore, // sorted ascending by score (best first)
     winner: []const u8,
 };
 
-/// Weight every query in `query_mix` by its declared importance and
-/// rank every backend present in `rows` at `scale` by how close it comes to
-/// the per-query winner across that weighted mix. `query_mix` is whatever
-/// the caller derived it to be — main.zig builds it from the union of
-/// `relevant_queries` across whichever sensor types actually got placed
-/// (synthetic/generator.zig's per-type canonical table), not a
-/// building-profile guess. Caller owns `result.scores` (free with
-/// `allocator`).
-pub fn recommendBackend(
+/// A building (or per-type) recommendation split into two independently-won
+/// tracks, because no single backend should be forced to serve both a tiny
+/// live cache's workload and a full-history store's workload:
+/// - `realtime`: the `real_time` query family (latest_*), scored across ALL
+///   backends — the tiny real-time cache legitimately competes here.
+/// - `historical`: every other family (aggregation/historical/spatial/
+///   anomaly), scored across ONLY the full-retention backends. A count-
+///   capped cache is excluded outright rather than being allowed to "win"
+///   by timing a query against the handful of readings it kept.
+/// The real deployment answer is the pair: "<realtime.winner> for live
+/// queries + <historical.winner> for everything else." Caller frees both
+/// `.scores` slices.
+pub const CompoundRecommendation = struct {
+    realtime: TrackRecommendation,
+    historical: TrackRecommendation,
+};
+
+/// Auto-scaled human-readable duration — µs below 1000µs, ms below
+/// 100_000µs (100ms), s otherwise. Used everywhere a raw query latency is
+/// displayed; never applied to scores/coverage/ratios (those stay as
+/// plain numbers). See docs/superpowers/specs/2026-07-06-recommendation-
+/// report-readability-design.md.
+pub const ScaledDuration = struct { value: f64, unit: []const u8 };
+
+pub fn scaleMicros(us: f64) ScaledDuration {
+    if (us < 1000.0) return .{ .value = us, .unit = "µs" };
+    if (us < 100_000.0) return .{ .value = us / 1000.0, .unit = "ms" };
+    return .{ .value = us / 1_000_000.0, .unit = "s" };
+}
+
+/// Writes a raw microsecond value to `w`. `scaled = false` preserves the
+/// exact legacy "N.N" plain-µs formatting (used by the zig build bench
+/// regression suite, which must stay byte-identical); `scaled = true` runs
+/// it through scaleMicros first (used by the per-building recommendation
+/// report). µs values keep 1 decimal; ms/s values use 2.
+pub fn writeScaledUs(w: *std.ArrayList(u8), allocator: std.mem.Allocator, us: f64, scaled: bool) !void {
+    if (!scaled) {
+        try w.print(allocator, "{d:.1}", .{us});
+        return;
+    }
+    const d = scaleMicros(us);
+    if (std.mem.eql(u8, d.unit, "µs")) {
+        try w.print(allocator, "{d:.1}{s}", .{ d.value, d.unit });
+    } else {
+        try w.print(allocator, "{d:.2}{s}", .{ d.value, d.unit });
+    }
+}
+
+/// One backend ranking scoped to a single sensor type — same shape as the
+/// building-level CompoundRecommendation, filtered down to that type's own
+/// type-scoped queries. Moved here (from main.zig) so both the markdown
+/// assembly in main.zig and writeBuildingHtmlReport below can share one
+/// definition.
+pub const TypeRecommendation = struct {
+    sensor_type: sb.SensorType,
+    compound: CompoundRecommendation,
+};
+
+/// One row of the "Sensors placed, by type" table — plain data, no
+/// dependency on synthetic/generator.zig's SensorProfile so this file's
+/// import graph stays as-is.
+pub const SensorTypeCount = struct {
+    name: []const u8,
+    count: u32,
+    retention_days: u32,
+};
+
+/// One row of the cost-estimate table — mirrors cost_model.CostEstimate's
+/// printed fields without importing cost_model.zig here (cost_model.zig
+/// already imports report.zig for RunRow, so importing it back would be a
+/// circular dependency; main.zig maps cost_model.CostEstimate values into
+/// this type instead).
+pub const CostRow = struct {
+    backend: []const u8,
+    storage_gb: f64,
+    storage_cost_year: f64,
+    query_cost_year: f64,
+    total_cost_year: f64,
+};
+
+/// How much each unit of *uncovered* query weight counts against a backend
+/// in `scoreBackends`'s score (1.0 = as good as tying the per-query
+/// winner; higher is worse). Set above the this/winner ratios functioning
+/// backends realistically reach (~1-3x) so a coverage gap reliably outweighs
+/// mere slowness: a backend that can't answer a weighted query at all (it
+/// evicted that type's data, or doesn't support that rollup) should rank
+/// below one that answers it slowly. Not researched — a deliberate,
+/// disclosed policy choice (CLAUDE.md §6 honesty).
+const UNCOVERED_QUERY_PENALTY: f64 = 4.0;
+
+/// True if `name` appears in `eligible`. Used to restrict a track to a
+/// subset of backends (e.g. the historical track excludes the count-capped
+/// real-time cache).
+fn backendEligible(eligible: ?[]const []const u8, name: []const u8) bool {
+    const list = eligible orelse return true; // null = every backend is eligible
+    for (list) |n| {
+        if (std.mem.eql(u8, n, name)) return true;
+    }
+    return false;
+}
+
+/// Core scorer behind both `recommendBackend` and `recommendCompound`. Ranks
+/// every backend present in `rows` at `scale` over the weighted `query_mix`,
+/// returning scores sorted ascending (best first; caller frees the slice).
+/// When `eligible` is non-null, backends outside that set are excluded
+/// entirely — not just from the ranking, but also from each query's
+/// per-query winner, so an ineligible-but-artificially-fast backend can't
+/// distort the eligible backends' ratios. `eligible == null` considers all.
+fn scoreBackends(
     allocator: std.mem.Allocator,
     rows: []const RunRow,
     scale: []const u8,
     query_mix: []const queries.QueryWeight,
-) !Recommendation {
+    eligible: ?[]const []const u8,
+) ![]BackendScore {
+    if (query_mix.len == 0) return &[_]BackendScore{};
+
     var backend_names: std.ArrayList([]const u8) = .empty;
     defer backend_names.deinit(allocator);
     for (rows) |r| {
         if (!std.mem.eql(u8, r.scale, scale)) continue;
+        if (!backendEligible(eligible, r.backend)) continue;
         var seen = false;
         for (backend_names.items) |b| {
             if (std.mem.eql(u8, b, r.backend)) {
@@ -102,6 +210,7 @@ pub fn recommendBackend(
             for (rows) |r| {
                 if (!std.mem.eql(u8, r.scale, scale)) continue;
                 if (!std.mem.eql(u8, r.query, qname)) continue;
+                if (!backendEligible(eligible, r.backend)) continue;
                 if (winner_median == null or r.stats.median_ns < winner_median.?) {
                     winner_median = r.stats.median_ns;
                 }
@@ -119,7 +228,18 @@ pub fn recommendBackend(
         }
 
         const coverage: f64 = if (total_weight > 0) covered_weight / total_weight else 0;
-        const score: f64 = if (covered_weight > 0) weighted_sum / covered_weight else std.math.inf(f64);
+        // Penalize coverage gaps instead of silently scoring a backend only
+        // over the queries it happens to cover. The denominator is the FULL
+        // weighted mix, and each uncovered unit of weight is charged
+        // UNCOVERED_QUERY_PENALTY rather than dropped from the average — so a
+        // backend missing data for a weighted query can't win by omission. A
+        // backend with zero coverage stays +inf (worst possible), so it never
+        // edges out one that actually returns data.
+        const uncovered_weight = total_weight - covered_weight;
+        const score: f64 = if (covered_weight <= 0)
+            std.math.inf(f64)
+        else
+            (weighted_sum + UNCOVERED_QUERY_PENALTY * uncovered_weight) / total_weight;
 
         try scores.append(allocator, .{ .backend = backend, .score = score, .coverage = coverage });
     }
@@ -130,11 +250,72 @@ pub fn recommendBackend(
             return a.score < b.score;
         }
     }.lt);
+    return owned;
+}
+
+/// Split `query_mix` by query family and rank each track independently (see
+/// `CompoundRecommendation`): the `real_time` family across all backends,
+/// everything else across only `full_retention_backends`. `full_retention_
+/// backends` is the set of backend names eligible for the historical track
+/// (i.e. every deployment backend except the count-capped real-time cache);
+/// pass it straight from `runner.supported_backends`' names. Caller frees
+/// both returned `.scores` slices.
+pub fn recommendCompound(
+    allocator: std.mem.Allocator,
+    rows: []const RunRow,
+    scale: []const u8,
+    query_mix: []const queries.QueryWeight,
+    full_retention_backends: []const []const u8,
+) !CompoundRecommendation {
+    var realtime_mix: std.ArrayList(queries.QueryWeight) = .empty;
+    defer realtime_mix.deinit(allocator);
+    var historical_mix: std.ArrayList(queries.QueryWeight) = .empty;
+    defer historical_mix.deinit(allocator);
+
+    for (query_mix) |qw| {
+        if (queries.familyOf(qw.query) == .real_time) {
+            try realtime_mix.append(allocator, qw);
+        } else {
+            try historical_mix.append(allocator, qw);
+        }
+    }
+
+    const rt_scores = try scoreBackends(allocator, rows, scale, realtime_mix.items, null);
+    errdefer allocator.free(rt_scores);
+    const hist_scores = try scoreBackends(allocator, rows, scale, historical_mix.items, full_retention_backends);
 
     return .{
-        .scores = owned,
-        .winner = if (owned.len > 0) owned[0].backend else "none",
+        .realtime = .{
+            .scores = rt_scores,
+            .winner = if (rt_scores.len > 0) rt_scores[0].backend else "none",
+        },
+        .historical = .{
+            .scores = hist_scores,
+            .winner = if (hist_scores.len > 0) hist_scores[0].backend else "none",
+        },
     };
+}
+
+/// A track's top two backends count as a "close race" when within this
+/// fraction of each other — a disclosed, deliberate policy constant (not
+/// researched), same spirit as UNCOVERED_QUERY_PENALTY above. Motivated by
+/// an observed case: three consecutive runs of the same 32-sensor office
+/// building (identical seed, identical code) produced three different
+/// real-time-track winners between two backends whose scores sat within
+/// ~10% of each other on two of those three runs, while a >30x-margin
+/// track never reordered across the same three runs.
+pub const CLOSE_RACE_THRESHOLD: f64 = 0.15;
+
+/// True when `scores` (sorted ascending — best first, the shape
+/// TrackRecommendation.scores is already in) has a winner and runner-up
+/// within CLOSE_RACE_THRESHOLD of each other. Fewer than 2 scores is never
+/// a close race (nothing to compare against).
+pub fn isCloseRace(scores: []const BackendScore) bool {
+    if (scores.len < 2) return false;
+    const winner = scores[0].score;
+    const runner_up = scores[1].score;
+    if (winner <= 0) return false;
+    return (runner_up - winner) / winner <= CLOSE_RACE_THRESHOLD;
 }
 
 /// Write `latency.md`, `latency.json`, and `benchmark.html` under
@@ -195,12 +376,12 @@ pub fn writeReports(
         }
 
         try md.print(allocator, "\n### Per-query winner (lowest median)\n\n", .{});
-        try md.print(allocator, "Expected/Match come from the storage×query matrix (data, not code — see report.zig's " ++
-            "EXPECTED_WINNERS). They flag disagreement between measured results and textbook expectation; they do " ++
-            "NOT skip any benchmark run (CLAUDE.md §6: measured answers, not assumptions).\n\n", .{});
-        try md.print(allocator, "| Query | Winner | Median µs | Runner-up | Median µs | Speedup | Expected | Match |\n", .{});
-        try md.print(allocator, "|---|---|---:|---|---:|---:|---|---|\n", .{});
-        try writeWinners(&md, allocator, rows, ds.name);
+        try md.print(allocator, "| Query | Winner | Median µs | Runner-up | Median µs | Speedup |\n", .{});
+        try md.print(allocator, "|---|---|---:|---|---:|---:|\n", .{});
+        // null eligibility: the internal regression fixture is small enough
+        // that no backend evicts — every backend genuinely holds the full
+        // dataset, so all comparisons here are apples-to-apples already.
+        try writeWinners(&md, allocator, rows, ds.name, null, false);
 
         try md.print(allocator, "\n", .{});
     }
@@ -423,7 +604,7 @@ fn writeHtmlReport(
                 try html.print(allocator, "            {d:.2} µs\n", .{result.median_us});
                 try html.print(allocator, "          </div>\n", .{});
                 try html.print(allocator, "        </div>\n", .{});
-                try html.print(allocator, "        <div style=\"color:var(--text-dim);font-family:monospace;font-size:11px;text-align:right\">{s}</div>\n", .{ if (is_winner) "★ winner" else "" });
+                try html.print(allocator, "        <div style=\"color:var(--text-dim);font-family:monospace;font-size:11px;text-align:right\">{s}</div>\n", .{if (is_winner) "★ winner" else ""});
                 try html.print(allocator, "      </div>\n", .{});
             }
 
@@ -455,67 +636,39 @@ fn writeHtmlReport(
     try dir.writeFile(io, .{ .sub_path = "benchmark.html", .data = html.items });
 }
 
-// ---------------------------------------------------------------------------
-// Expected-winner matrix — data, not code (CLAUDE.md §3.5). This encodes
-// the storage×query matrix knowledge (Time-Series/Columnar/Hierarchical/
-// RingBuffer only — Lake/Parquet isn't a backend this platform implements,
-// and AoS/SoA are excluded from deployment recommendations, see runner.zig's
-// `backends` doc comment).
-//
-// This table is NOT used to skip benchmarking any query×backend combo —
-// CLAUDE.md §1/§6 requires measured answers, not assumed ones. It is only
-// used to flag when a measured result *disagrees* with the textbook
-// expectation, which is the most useful signal this tool can produce: it
-// tells you when your implementation (or this project's specific data
-// shape) doesn't behave the way the generic matrix predicts.
-// ---------------------------------------------------------------------------
-const ExpectedWinner = struct {
-    query: []const u8,
-    backends: []const []const u8,
-};
-
-const EXPECTED_WINNERS = [_]ExpectedWinner{
-    .{ .query = "query_latest_single", .backends = &.{"RingBuffer"} },
-    .{ .query = "query_latest_zone", .backends = &.{"Hierarchical"} },
-    .{ .query = "query_avg_window", .backends = &.{ "TimeSeries", "Columnar" } },
-    .{ .query = "query_avg_zone_type", .backends = &.{ "TimeSeries", "Columnar" } },
-    .{ .query = "query_floor_stats", .backends = &.{"Columnar"} },
-    .{ .query = "query_hourly_rollup", .backends = &.{"Columnar"} },
-    .{ .query = "query_daily_zone_rollup", .backends = &.{"Columnar"} },
-    .{ .query = "query_spatial_radius", .backends = &.{"Hierarchical"} },
-    .{ .query = "query_zone_hierarchy", .backends = &.{"Hierarchical"} },
-    .{ .query = "query_anomalies", .backends = &.{ "TimeSeries", "RingBuffer" } },
-    .{ .query = "query_threshold_breach", .backends = &.{"RingBuffer"} },
-};
-
-fn expectedWinnersFor(query: []const u8) ?[]const []const u8 {
-    for (EXPECTED_WINNERS) |e| {
-        if (std.mem.eql(u8, e.query, query)) return e.backends;
+/// QueryName for a display-name string (RunRow.query stores the display
+/// name), or null for an unrecognized name. Reverse of queryNameStr.
+fn queryNameFromStr(name: []const u8) ?queries.QueryName {
+    inline for (std.enums.values(queries.QueryName)) |q| {
+        if (std.mem.eql(u8, queryNameStr(q), name)) return q;
     }
     return null;
 }
 
-/// null = no expectation recorded for this query (e.g. query_latest_by_type
-/// isn't in the source matrix). true/false = measured winner does/doesn't
-/// appear in the expected set.
-fn matchesExpected(query: []const u8, actual_backend: []const u8) ?bool {
-    const expected = expectedWinnersFor(query) orelse return null;
-    for (expected) |b| {
-        if (std.mem.eql(u8, b, actual_backend)) return true;
-    }
-    return false;
-}
-
-fn printExpectedList(w: *std.ArrayList(u8), allocator: std.mem.Allocator, backends_list: []const []const u8) !void {
-    for (backends_list, 0..) |b, i| {
-        if (i > 0) try w.print(allocator, "/", .{});
-        try w.print(allocator, "{s}", .{b});
-    }
-}
-
 /// For each unique query within a given scale, find the backend with the
-/// lowest median latency and the runner-up; emit a Markdown row.
-fn writeWinners(w: *std.ArrayList(u8), allocator: std.mem.Allocator, rows: []const RunRow, scale: []const u8) !void {
+/// lowest median latency and the runner-up; emit a Markdown row. Exported
+/// (not just used by writeReports' internal regression-suite report) so
+/// main.zig's live-simulation recommendation.md can surface the same
+/// per-query winner table instead of leaving the reader to eyeball the raw
+/// per-query latency rows.
+///
+/// `historical_eligible`, when non-null, applies the SAME eligibility rule
+/// recommendCompound's historical track already applies to scoring: for any
+/// query outside the `real_time` family, only backends in that list compete
+/// for the winner/runner-up slots. Without this, the count-capped real-time
+/// cache (RingBuffer, 10 readings/sensor) showed up as the 171x "winner" of
+/// query_anomalies in a real house run — it had scanned a ~200x smaller
+/// dataset than every other backend, an incomparable measurement presented
+/// as a win. Pass null only when every backend genuinely holds the full
+/// dataset (e.g. the internal regression suite's small no-eviction fixture).
+pub fn writeWinners(
+    w: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    rows: []const RunRow,
+    scale: []const u8,
+    historical_eligible: ?[]const []const u8,
+    scaled_units: bool,
+) !void {
     var seen: std.ArrayList([]const u8) = .empty;
     defer seen.deinit(allocator);
 
@@ -532,183 +685,605 @@ fn writeWinners(w: *std.ArrayList(u8), allocator: std.mem.Allocator, rows: []con
         if (already) continue;
         try seen.append(allocator, r.query);
 
-        var best_idx: ?usize = null;
-        var second_idx: ?usize = null;
-        for (rows, 0..) |candidate, i| {
-            if (!std.mem.eql(u8, candidate.scale, scale)) continue;
-            if (!std.mem.eql(u8, candidate.query, r.query)) continue;
-            if (best_idx == null or candidate.stats.median_ns < rows[best_idx.?].stats.median_ns) {
-                second_idx = best_idx;
-                best_idx = i;
-            } else if (second_idx == null or candidate.stats.median_ns < rows[second_idx.?].stats.median_ns) {
-                second_idx = i;
-            }
-        }
+        const pair = findWinnerAndRunnerUp(rows, scale, r.query, historical_eligible) orelse continue;
+        const best_us = @as(f64, @floatFromInt(pair.winner.stats.median_ns)) / 1000.0;
 
-        if (best_idx) |bi| {
-            const best = rows[bi];
-            const best_us = @as(f64, @floatFromInt(best.stats.median_ns)) / 1000.0;
+        try w.print(allocator, "| {s} | **{s}** | ", .{ r.query, pair.winner.backend });
+        try writeScaledUs(w, allocator, best_us, scaled_units);
 
-            const expected = expectedWinnersFor(r.query);
-            const match = matchesExpected(r.query, best.backend);
-            const match_str: []const u8 = if (match) |m| (if (m) "matches" else "contradicts") else "—";
-
-            if (second_idx) |si| {
-                const second = rows[si];
-                const second_us = @as(f64, @floatFromInt(second.stats.median_ns)) / 1000.0;
-                const speedup = if (best.stats.median_ns > 0)
-                    @as(f64, @floatFromInt(second.stats.median_ns)) /
-                        @as(f64, @floatFromInt(best.stats.median_ns))
-                else
-                    0.0;
-                try w.print(allocator, "| {s} | **{s}** | {d:.1} | {s} | {d:.1} | {d:.2}× | ", .{
-                    r.query, best.backend, best_us, second.backend, second_us, speedup,
-                });
-            } else {
-                try w.print(allocator, "| {s} | **{s}** | {d:.1} | — | — | — | ", .{
-                    r.query, best.backend, best_us,
-                });
-            }
-
-            if (expected) |e| {
-                try printExpectedList(w, allocator, e);
-            } else {
-                try w.print(allocator, "—", .{});
-            }
-            try w.print(allocator, " | {s} |\n", .{match_str});
+        if (pair.runner_up) |second| {
+            const second_us = @as(f64, @floatFromInt(second.stats.median_ns)) / 1000.0;
+            const speedup = if (pair.winner.stats.median_ns > 0)
+                @as(f64, @floatFromInt(second.stats.median_ns)) /
+                    @as(f64, @floatFromInt(pair.winner.stats.median_ns))
+            else
+                0.0;
+            try w.print(allocator, " | {s} | ", .{second.backend});
+            try writeScaledUs(w, allocator, second_us, scaled_units);
+            try w.print(allocator, " | {d:.2}× |\n", .{speedup});
+        } else {
+            try w.print(allocator, " | — | — | — |\n", .{});
         }
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tests — recommendBackend (AGENT.md Phase 5.2: query_mix-weighted scoring).
-// ---------------------------------------------------------------------------
+/// Result of scanning `rows` for one query's fastest backend (winner) and
+/// second-fastest (runner-up) at `scale`, respecting the same eligibility
+/// rule scoreBackends/recommendCompound apply (non-real-time queries only
+/// admit `historical_eligible` backends when it's non-null). Shared by
+/// writeWinners (Markdown) and writeWinnersHtml (HTML) below so the two
+/// renderers can't drift on selection logic while each still emits its own
+/// cell format. Returns null when no eligible backend has data for this
+/// query.
+const WinnerPair = struct {
+    winner: RunRow,
+    runner_up: ?RunRow,
+};
 
-const testing = std.testing;
+fn findWinnerAndRunnerUp(
+    rows: []const RunRow,
+    scale: []const u8,
+    query: []const u8,
+    historical_eligible: ?[]const []const u8,
+) ?WinnerPair {
+    const rowEligible = struct {
+        fn check(eligible: ?[]const []const u8, query_name: []const u8, backend: []const u8) bool {
+            const list = eligible orelse return true;
+            const q = queryNameFromStr(query_name) orelse return true;
+            if (queries.familyOf(q) == .real_time) return true;
+            return backendEligible(list, backend);
+        }
+    }.check;
 
-fn testRow(scale: []const u8, query: []const u8, backend: []const u8, median_ns: i64) RunRow {
+    var best_idx: ?usize = null;
+    var second_idx: ?usize = null;
+    for (rows, 0..) |candidate, i| {
+        if (!std.mem.eql(u8, candidate.scale, scale)) continue;
+        if (!std.mem.eql(u8, candidate.query, query)) continue;
+        if (!rowEligible(historical_eligible, candidate.query, candidate.backend)) continue;
+        if (best_idx == null or candidate.stats.median_ns < rows[best_idx.?].stats.median_ns) {
+            second_idx = best_idx;
+            best_idx = i;
+        } else if (second_idx == null or candidate.stats.median_ns < rows[second_idx.?].stats.median_ns) {
+            second_idx = i;
+        }
+    }
+
+    const bi = best_idx orelse return null;
     return .{
-        .scale = scale,
-        .query = query,
-        .backend = backend,
-        .memory_bytes = 0,
-        .stats = .{
-            .iterations = 25,
-            .median_ns = median_ns,
-            .p95_ns = median_ns,
-            .p99_ns = median_ns,
-            .min_ns = median_ns,
-            .max_ns = median_ns,
-            .mean_ns = median_ns,
-            .total_ns = median_ns * 25,
-        },
+        .winner = rows[bi],
+        .runner_up = if (second_idx) |si| rows[si] else null,
     };
 }
 
-test "recommendBackend: weighting toward a backend's strong query picks it as winner" {
-    const rows = [_]RunRow{
-        testRow("Small", "query_threshold_breach", "A", 10),
-        testRow("Small", "query_threshold_breach", "B", 100),
-        testRow("Small", "query_daily_zone_rollup", "A", 100),
-        testRow("Small", "query_daily_zone_rollup", "B", 10),
-    };
 
-    const hot_mix = [_]queries.QueryWeight{
-        .{ .query = .threshold_breach, .weight = 10.0, .hot = true },
-        .{ .query = .daily_zone_rollup, .weight = 1.0, .hot = false },
-    };
+// ---------------------------------------------------------------------------
+// Growth curve + simulation JSON — latency vs building age, and machine-
+// readable sim stats for downstream tooling.
+// ---------------------------------------------------------------------------
 
-    const rec = try recommendBackend(testing.allocator, &rows, "Small", &hot_mix);
-    defer testing.allocator.free(rec.scores);
-    try testing.expectEqualStrings("A", rec.winner);
+const sim_mod = @import("simulation.zig");
+
+/// Write a "Latency vs Building Age" section to the markdown report,
+/// showing how each query's median latency grows as the building
+/// accumulates data from day 1 to steady state.
+pub fn writeGrowthSection(
+    md: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    growth: []const sim_mod.GrowthPoint,
+) !void {
+    if (growth.len == 0) return;
+
+    try md.print(allocator, "\n## Latency vs Building Age (Growth Curve)\n\n", .{});
+    try md.print(allocator, "Each row is one query's median latency at one checkpoint in the " ++
+        "building's simulated lifetime — from day 1 (near-empty) to steady state " ++
+        "(retention-full, actively evicting). This shows whether a backend's query " ++
+        "latency is constant (O(1) access) or grows with data volume.\n\n", .{});
+
+    try md.print(allocator, "| Checkpoint | Day | Backend | Query | Median | Live readings | Memory (MB) |\n", .{});
+    try md.print(allocator, "|---|---:|---|---|---:|---:|---:|\n", .{});
+    for (growth) |g| {
+        try md.print(allocator, "| {s} | {d} | {s} | {s} | ", .{ g.label, g.sim_day, g.backend, g.query });
+        try writeScaledUs(md, allocator, @as(f64, @floatFromInt(g.median_ns)) / 1000.0, true);
+        try md.print(allocator, " | {d} | {d:.1} |\n", .{
+            g.reading_count,
+            @as(f64, @floatFromInt(g.memory_bytes)) / (1024.0 * 1024.0),
+        });
+    }
 }
 
-test "recommendBackend: swapping the weights flips the winner" {
-    const rows = [_]RunRow{
-        testRow("Small", "query_threshold_breach", "A", 10),
-        testRow("Small", "query_threshold_breach", "B", 100),
-        testRow("Small", "query_daily_zone_rollup", "A", 100),
-        testRow("Small", "query_daily_zone_rollup", "B", 10),
-    };
+/// Write a "Simulation Summary" section to the markdown report with
+/// per-backend compression ratios, data volume, and prune statistics.
+pub fn writeSimSection(
+    md: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    sim_stats: []const sim_mod.SimStats,
+    type_volumes: []const sim_mod.TypeVolume,
+    type_quality: []const sim_mod.TypeQuality,
+) !void {
+    if (sim_stats.len == 0) return;
 
-    const cold_mix = [_]queries.QueryWeight{
-        .{ .query = .threshold_breach, .weight = 1.0, .hot = true },
-        .{ .query = .daily_zone_rollup, .weight = 10.0, .hot = false },
-    };
+    try md.print(allocator, "\n## Simulation Summary\n\n", .{});
+    try md.print(allocator, "Per-backend wall-time cost of the live day-zero simulation " ++
+        "(simulated time / wall time = compression ratio), data volume, and prune activity.\n\n", .{});
 
-    const rec = try recommendBackend(testing.allocator, &rows, "Small", &cold_mix);
-    defer testing.allocator.free(rec.scores);
-    try testing.expectEqualStrings("B", rec.winner);
-}
+    try md.print(allocator, "| Backend | Sim days | Wall time (s) | Compression | Generated | Evicted | Prune calls | Stream time (s) | Prune time (s) |\n", .{});
+    try md.print(allocator, "|---|---:|---:|---:|---:|---:|---:|---:|---:|\n", .{});
+    const day_ms: i64 = 24 * 60 * 60 * 1000;
+    for (sim_stats) |s| {
+        const sim_days = @divTrunc(s.sim_ms, day_ms);
+        const wall_s = @as(f64, @floatFromInt(s.wall_ns)) / 1e9;
+        const ingest_s = @as(f64, @floatFromInt(s.ingest_ns)) / 1e9;
+        const prune_s = @as(f64, @floatFromInt(s.prune_ns)) / 1e9;
+        try md.print(allocator, "| {s} | {d} | {d:.1} | {d:.0}× | {d} | {d} | {d} | {d:.1} | {d:.1} |\n", .{
+            s.backend, sim_days, wall_s, s.compressionRatio(), s.generated, s.evicted, s.prune_calls, ingest_s, prune_s,
+        });
+    }
 
-test "recommendBackend: a backend missing data for a weighted query gets partial coverage, not a crash" {
-    const rows = [_]RunRow{
-        testRow("Small", "query_threshold_breach", "A", 10),
-        testRow("Small", "query_threshold_breach", "B", 20),
-        testRow("Small", "query_daily_zone_rollup", "A", 50),
-        // B has no row for query_daily_zone_rollup — e.g. RingBuffer
-        // excluded from historical rollups in runner.zig's real data.
-    };
+    if (type_volumes.len > 0) {
+        try md.print(allocator, "\n### Steady-state data volume by sensor type\n\n", .{});
+        try md.print(allocator, "| Sensor type | Readings | Bytes (MB) |\n|---|---:|---:|\n", .{});
+        for (type_volumes) |tv| {
+            try md.print(allocator, "| {s} | {d} | {d:.1} |\n", .{
+                @tagName(tv.sensor_type),
+                tv.reading_count,
+                @as(f64, @floatFromInt(tv.bytes)) / (1024.0 * 1024.0),
+            });
+        }
+    }
 
-    const mix = [_]queries.QueryWeight{
-        .{ .query = .threshold_breach, .weight = 1.0, .hot = true },
-        .{ .query = .daily_zone_rollup, .weight = 1.0, .hot = false },
-    };
-
-    const rec = try recommendBackend(testing.allocator, &rows, "Small", &mix);
-    defer testing.allocator.free(rec.scores);
-
-    try testing.expectEqual(@as(usize, 2), rec.scores.len);
-    for (rec.scores) |s| {
-        if (std.mem.eql(u8, s.backend, "A")) {
-            try testing.expectApproxEqAbs(@as(f64, 1.0), s.coverage, 1e-9);
-        } else if (std.mem.eql(u8, s.backend, "B")) {
-            try testing.expectApproxEqAbs(@as(f64, 0.5), s.coverage, 1e-9);
+    if (type_quality.len > 0) {
+        try md.print(allocator, "\n### Ingest data quality by sensor type\n\n", .{});
+        try md.print(allocator, "Readings rejected at ingest (ingest_system.shouldAccept) for being outside the " ++
+            "sensor type's physical bounds — real gateway behavior for a physically-impossible value, not a " ++
+            "backend-specific difference (identical across every backend, since rejection happens once per " ++
+            "reading before any backend ever sees it).\n\n", .{});
+        try md.print(allocator, "| Sensor type | Generated | Rejected | Rejection rate |\n|---|---:|---:|---:|\n", .{});
+        for (type_quality) |tq| {
+            const rate: f64 = if (tq.generated > 0)
+                @as(f64, @floatFromInt(tq.rejected)) / @as(f64, @floatFromInt(tq.generated)) * 100.0
+            else
+                0.0;
+            try md.print(allocator, "| {s} | {d} | {d} | {d:.3}% |\n", .{
+                @tagName(tq.sensor_type), tq.generated, tq.rejected, rate,
+            });
         }
     }
 }
 
-test "recommendBackend: no rows at the requested scale returns an empty, non-crashing result" {
-    const rows = [_]RunRow{
-        testRow("Large", "query_threshold_breach", "A", 10),
-    };
-    const mix = [_]queries.QueryWeight{
-        .{ .query = .threshold_breach, .weight = 1.0, .hot = true },
-    };
+/// Write machine-readable simulation data as JSON to `simulation.json` in
+/// the output directory. Contains per-backend sim stats, growth points,
+/// and type volumes — everything an external tool needs to plot the growth
+/// curve or compare backends' simulation efficiency.
+pub fn writeSimJson(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir: *std.Io.Dir,
+    sim_stats: []const sim_mod.SimStats,
+    growth: []const sim_mod.GrowthPoint,
+    type_volumes: []const sim_mod.TypeVolume,
+    type_quality: []const sim_mod.TypeQuality,
+) !void {
+    var json: std.ArrayList(u8) = .empty;
+    defer json.deinit(allocator);
 
-    const rec = try recommendBackend(testing.allocator, &rows, "Small", &mix);
-    defer testing.allocator.free(rec.scores);
+    try json.print(allocator, "{{\n", .{});
 
-    try testing.expectEqual(@as(usize, 0), rec.scores.len);
-    try testing.expectEqualStrings("none", rec.winner);
+    // sim_stats
+    try json.print(allocator, "  \"sim_stats\": [\n", .{});
+    const day_ms: i64 = 24 * 60 * 60 * 1000;
+    for (sim_stats, 0..) |s, i| {
+        const sim_days = @divTrunc(s.sim_ms, day_ms);
+        try json.print(allocator, "    {{\n", .{});
+        try json.print(allocator, "      \"backend\": \"{s}\",\n", .{s.backend});
+        try json.print(allocator, "      \"sim_days\": {d},\n", .{sim_days});
+        try json.print(allocator, "      \"wall_ns\": {d},\n", .{s.wall_ns});
+        try json.print(allocator, "      \"compression_ratio\": {d:.1},\n", .{s.compressionRatio()});
+        try json.print(allocator, "      \"generated\": {d},\n", .{s.generated});
+        try json.print(allocator, "      \"ingested\": {d},\n", .{s.ingested});
+        try json.print(allocator, "      \"evicted\": {d},\n", .{s.evicted});
+        try json.print(allocator, "      \"prune_calls\": {d},\n", .{s.prune_calls});
+        try json.print(allocator, "      \"ingest_ns\": {d},\n", .{s.ingest_ns});
+        try json.print(allocator, "      \"prune_ns\": {d}\n", .{s.prune_ns});
+        try json.print(allocator, "    }}{s}\n", .{if (i + 1 < sim_stats.len) "," else ""});
+    }
+    try json.print(allocator, "  ],\n", .{});
+
+    // growth_points
+    try json.print(allocator, "  \"growth_points\": [\n", .{});
+    for (growth, 0..) |g, i| {
+        try json.print(allocator, "    {{\n", .{});
+        try json.print(allocator, "      \"sim_day\": {d},\n", .{g.sim_day});
+        try json.print(allocator, "      \"label\": \"{s}\",\n", .{g.label});
+        try json.print(allocator, "      \"backend\": \"{s}\",\n", .{g.backend});
+        try json.print(allocator, "      \"query\": \"{s}\",\n", .{g.query});
+        try json.print(allocator, "      \"median_ns\": {d},\n", .{g.median_ns});
+        try json.print(allocator, "      \"memory_bytes\": {d},\n", .{g.memory_bytes});
+        try json.print(allocator, "      \"live_bytes\": {d},\n", .{g.live_bytes});
+        try json.print(allocator, "      \"reading_count\": {d}\n", .{g.reading_count});
+        try json.print(allocator, "    }}{s}\n", .{if (i + 1 < growth.len) "," else ""});
+    }
+    try json.print(allocator, "  ],\n", .{});
+
+    // type_volumes
+    try json.print(allocator, "  \"type_volumes\": [\n", .{});
+    for (type_volumes, 0..) |tv, i| {
+        try json.print(allocator, "    {{\n", .{});
+        try json.print(allocator, "      \"sensor_type\": \"{s}\",\n", .{@tagName(tv.sensor_type)});
+        try json.print(allocator, "      \"reading_count\": {d},\n", .{tv.reading_count});
+        try json.print(allocator, "      \"bytes\": {d}\n", .{tv.bytes});
+        try json.print(allocator, "    }}{s}\n", .{if (i + 1 < type_volumes.len) "," else ""});
+    }
+    try json.print(allocator, "  ],\n", .{});
+
+    // type_quality
+    try json.print(allocator, "  \"type_quality\": [\n", .{});
+    for (type_quality, 0..) |tq, i| {
+        try json.print(allocator, "    {{\n", .{});
+        try json.print(allocator, "      \"sensor_type\": \"{s}\",\n", .{@tagName(tq.sensor_type)});
+        try json.print(allocator, "      \"generated\": {d},\n", .{tq.generated});
+        try json.print(allocator, "      \"rejected\": {d}\n", .{tq.rejected});
+        try json.print(allocator, "    }}{s}\n", .{if (i + 1 < type_quality.len) "," else ""});
+    }
+    try json.print(allocator, "  ]\n", .{});
+    try json.print(allocator, "}}\n", .{});
+
+    try dir.writeFile(io, .{ .sub_path = "simulation.json", .data = json.items });
 }
 
-test "recommendBackend: a real per-type query mix resolves against real query_specs names to a clear winner" {
-    // Exercises queryNameStr's mapping against every QueryName a real
-    // canonical per-type table weights (synthetic/generator.zig's
-    // STRUCTURAL_QUERIES — equipment-health type, exercises
-    // anomalies/threshold_breach/avg_zone_type), with rows shaped like a
-    // real runner.zig run (every weighted query name present, for two
-    // backends).
-    const structural_mix = [_]queries.QueryWeight{
-        .{ .query = .latest_single, .weight = 2.0, .hot = true },
-        .{ .query = .avg_zone_type, .weight = 2.0, .hot = false },
-        .{ .query = .daily_zone_rollup, .weight = 2.0, .hot = false },
-        .{ .query = .anomalies, .weight = 5.0, .hot = true },
-        .{ .query = .threshold_breach, .weight = 4.0, .hot = true },
-        .{ .query = .spatial_radius, .weight = 2.0, .hot = true },
+test "scaleMicros: stays microseconds below 1000, switches to ms then s at each threshold" {
+    const under = scaleMicros(43.2);
+    try std.testing.expectApproxEqAbs(@as(f64, 43.2), under.value, 0.001);
+    try std.testing.expectEqualStrings("µs", under.unit);
+
+    const ms = scaleMicros(7437.7);
+    try std.testing.expectApproxEqAbs(@as(f64, 7.4377), ms.value, 0.0001);
+    try std.testing.expectEqualStrings("ms", ms.unit);
+
+    const s = scaleMicros(582859.8);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.5828598), s.value, 0.0000001);
+    try std.testing.expectEqualStrings("s", s.unit);
+
+    // Boundary: exactly 1000µs is the first value that becomes ms, not µs.
+    const boundary = scaleMicros(1000.0);
+    try std.testing.expectEqualStrings("ms", boundary.unit);
+
+    // Boundary: 100_000µs (100ms) is the ms/s threshold — corrected mid-implementation
+    // from an originally-drafted 1_000_000; pin it against future drift.
+    const just_under_s = scaleMicros(99_999.0);
+    try std.testing.expectEqualStrings("ms", just_under_s.unit);
+
+    const at_s = scaleMicros(100_000.0);
+    try std.testing.expectEqualStrings("s", at_s.unit);
+}
+
+test "isCloseRace: within threshold is close, beyond it is not, fewer than 2 scores is never close" {
+    const close = [_]BackendScore{
+        .{ .backend = "A", .score = 1.000, .coverage = 1.0 },
+        .{ .backend = "B", .score = 1.100, .coverage = 1.0 },
     };
-    var rows: std.ArrayList(RunRow) = .empty;
-    defer rows.deinit(testing.allocator);
-    for (structural_mix) |qw| {
-        try rows.append(testing.allocator, testRow("Small", queryNameStr(qw.query), "TimeSeries", 50));
-        try rows.append(testing.allocator, testRow("Small", queryNameStr(qw.query), "Columnar", 100));
+    try std.testing.expect(isCloseRace(&close));
+
+    const far = [_]BackendScore{
+        .{ .backend = "A", .score = 1.000, .coverage = 1.0 },
+        .{ .backend = "B", .score = 1.318, .coverage = 1.0 },
+    };
+    try std.testing.expect(!isCloseRace(&far));
+
+    // Boundary: exactly CLOSE_RACE_THRESHOLD (15%) is still a close race
+    // (`<=`). 0.15 is not exactly representable in binary, so a decimal
+    // literal near it (e.g. winner=1.000/runner_up=1.150) does NOT reliably
+    // land on CLOSE_RACE_THRESHOLD bit-for-bit — verified: that pair's ratio
+    // lands 3 ULPs below it, meaning such a test can't distinguish `<=` from
+    // `<`. winner=10.0/runner_up=11.5 does land exactly: 11.5-10.0=1.5 is
+    // exact (both operands exactly representable in binary; Sterbenz's
+    // lemma also guarantees the subtraction itself is exact), and
+    // 1.5/10.0's correctly-rounded result happens to be the identical
+    // double as the `0.15` literal used to define CLOSE_RACE_THRESHOLD. The
+    // sanity check below proves this bit-exactness rather than assuming it.
+    const winner_score: f64 = 10.0;
+    const runner_up_score: f64 = 11.5;
+    const ratio = (runner_up_score - winner_score) / winner_score;
+    try std.testing.expectEqual(CLOSE_RACE_THRESHOLD, ratio);
+
+    const boundary = [_]BackendScore{
+        .{ .backend = "A", .score = winner_score, .coverage = 1.0 },
+        .{ .backend = "B", .score = runner_up_score, .coverage = 1.0 },
+    };
+    try std.testing.expect(isCloseRace(&boundary));
+
+    // One ULP further from winner than the exact-boundary case — proves the
+    // comparison doesn't drift past the intended threshold.
+    const just_beyond_score = std.math.nextAfter(f64, runner_up_score, std.math.inf(f64));
+    const just_beyond = [_]BackendScore{
+        .{ .backend = "A", .score = winner_score, .coverage = 1.0 },
+        .{ .backend = "B", .score = just_beyond_score, .coverage = 1.0 },
+    };
+    try std.testing.expect(!isCloseRace(&just_beyond));
+
+    const single = [_]BackendScore{
+        .{ .backend = "A", .score = 1.000, .coverage = 1.0 },
+    };
+    try std.testing.expect(!isCloseRace(&single));
+
+    const empty = [_]BackendScore{};
+    try std.testing.expect(!isCloseRace(&empty));
+}
+
+// `zig build bench` (bench_main.zig -> runner.run) is currently broken
+// independent of this change — runner.run was removed from runner.zig in an
+// earlier commit (predates this file's scaled_units work) without updating
+// its one caller, so the regression-suite CLI path can't be exercised
+// end-to-end right now. This test exercises writeWinners directly instead,
+// pinning the exact legacy "N.N" plain-µs Markdown writeReports depends on
+// (scaled_units = false) so any future change to writeScaledUs or this
+// function's formatting can't silently drift the regression-suite output.
+test "writeWinners: scaled_units=false reproduces the exact legacy plain-µs format" {
+    const allocator = std.testing.allocator;
+    const stats = struct {
+        fn make(median_ns: i64) metrics.LatencyStats {
+            return .{
+                .iterations = 1,
+                .median_ns = median_ns,
+                .p95_ns = median_ns,
+                .p99_ns = median_ns,
+                .min_ns = median_ns,
+                .max_ns = median_ns,
+                .mean_ns = median_ns,
+                .total_ns = median_ns,
+            };
+        }
+    }.make;
+
+    const rows = [_]RunRow{
+        .{ .scale = "S", .query = "Q1", .backend = "A", .memory_bytes = 0, .stats = stats(1000) },
+        .{ .scale = "S", .query = "Q1", .backend = "B", .memory_bytes = 0, .stats = stats(3000) },
+        .{ .scale = "S", .query = "Q2", .backend = "C", .memory_bytes = 0, .stats = stats(500) },
+    };
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+
+    try writeWinners(&buf, allocator, &rows, "S", null, false);
+
+    try std.testing.expectEqualStrings(
+        "| Q1 | **A** | 1.0 | B | 3.0 | 3.00× |\n" ++
+            "| Q2 | **C** | 0.5 | — | — | — |\n",
+        buf.items,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Self-contained HTML dashboard for one per-building `dt --bim` run —
+// mirrors recommendation.md's section order (verdict first, then supporting
+// detail, heaviest tables collapsed behind <details>). Plain HTML/CSS only:
+// no JS, no external requests, no charting library — same hand-rolled-
+// static-asset spirit as schematic.zig's SVG output. Distinct from
+// writeHtmlReport above (the zig build bench regression-suite dashboard);
+// this function is never called from writeReports.
+// ---------------------------------------------------------------------------
+
+pub fn writeBuildingHtmlReport(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir: *std.Io.Dir,
+    bim_path: []const u8,
+    scale_label: []const u8,
+    sensor_type_counts: []const SensorTypeCount,
+    compound: CompoundRecommendation,
+    type_recommendations: []const TypeRecommendation,
+    rows: []const RunRow,
+    full_retention_names: []const []const u8,
+    growth: []const sim_mod.GrowthPoint,
+    sim_stats: []const sim_mod.SimStats,
+    cost_rows: []const CostRow,
+    naive_cost: f64,
+    optimised_cost: f64,
+) !void {
+    var html: std.ArrayList(u8) = .empty;
+    defer html.deinit(allocator);
+
+    try html.print(allocator, "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n", .{});
+    try html.print(allocator, "<meta charset=\"UTF-8\" />\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" />\n", .{});
+    try html.print(allocator, "<title>{s} — Storage Recommendation</title>\n", .{scale_label});
+    try html.print(allocator, "<style>\n", .{});
+    try html.print(allocator, "  :root {{ --bg:#0f1419; --panel:#161c24; --panel-2:#1d2530; --border:#2a3441; --text:#e6edf3; --text-dim:#8b97a6; --accent:#4ea8de; --green:#4ade80; --gold:#f0b429; }}\n", .{});
+    try html.print(allocator, "  * {{ box-sizing:border-box; margin:0; padding:0; }}\n", .{});
+    try html.print(allocator, "  body {{ font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif; background:var(--bg); color:var(--text); line-height:1.55; padding:32px 20px 80px; }}\n", .{});
+    try html.print(allocator, "  .container {{ max-width:960px; margin:0 auto; }}\n", .{});
+    try html.print(allocator, "  h1 {{ font-size:26px; font-weight:700; }}\n  h2 {{ font-size:18px; margin:28px 0 10px; }}\n", .{});
+    try html.print(allocator, "  .subtitle {{ color:var(--text-dim); margin-top:6px; font-size:13px; word-break:break-all; }}\n", .{});
+    try html.print(allocator, "  .verdict {{ background:var(--panel); border:1px solid var(--border); border-left:4px solid var(--accent); border-radius:8px; padding:20px 24px; margin:20px 0; }}\n", .{});
+    try html.print(allocator, "  .verdict p {{ margin-top:8px; }}\n  .verdict strong.win {{ color:var(--green); }}\n", .{});
+    try html.print(allocator, "  .caveat {{ color:var(--gold); }}\n", .{});
+    try html.print(allocator, "  table {{ width:100%; border-collapse:collapse; font-size:13px; background:var(--panel); border:1px solid var(--border); border-radius:8px; overflow:hidden; }}\n", .{});
+    try html.print(allocator, "  th, td {{ padding:8px 12px; text-align:left; border-bottom:1px solid var(--border); }}\n", .{});
+    try html.print(allocator, "  th {{ background:var(--panel-2); color:var(--text-dim); font-weight:500; font-size:11px; text-transform:uppercase; }}\n", .{});
+    try html.print(allocator, "  .bar-track {{ background:var(--panel-2); height:16px; border-radius:4px; overflow:hidden; min-width:120px; }}\n", .{});
+    try html.print(allocator, "  .bar-fill {{ height:100%; background:var(--accent); }}\n", .{});
+    try html.print(allocator, "  .bar-fill.winner {{ background:var(--green); }}\n", .{});
+    try html.print(allocator, "  details {{ background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:12px 16px; margin:16px 0; }}\n", .{});
+    try html.print(allocator, "  summary {{ cursor:pointer; font-weight:600; padding:4px 0; }}\n", .{});
+    try html.print(allocator, "  .scroll {{ overflow-x:auto; }}\n", .{});
+    try html.print(allocator, "  footer {{ margin-top:40px; color:var(--text-dim); font-size:12px; text-align:center; }}\n", .{});
+    try html.print(allocator, "</style>\n</head>\n<body>\n<div class=\"container\">\n", .{});
+
+    try html.print(allocator, "<h1>{s}</h1>\n", .{scale_label});
+    try html.print(allocator, "<div class=\"subtitle\">Source: {s}</div>\n", .{bim_path});
+
+    try html.print(allocator, "<div class=\"verdict\">\n", .{});
+    try html.print(allocator, "<p>Use <strong class=\"win\">{s}</strong> for live/latest-value queries.</p>\n", .{compound.realtime.winner});
+    try html.print(allocator, "<p>Use <strong class=\"win\">{s}</strong> for everything else (history, aggregates, anomalies).</p>\n", .{compound.historical.winner});
+    if (compound.historical.scores.len > 1) {
+        const hist_margin = compound.historical.scores[1].score / compound.historical.scores[0].score;
+        if (isCloseRace(compound.historical.scores)) {
+            try html.print(allocator, "<p class=\"caveat\">The historical-query race is close: {s} vs {s} (within 15%) — treat this ranking as a near-tie, not a confident win.</p>\n", .{
+                compound.historical.scores[0].backend, compound.historical.scores[1].backend,
+            });
+        } else {
+            try html.print(allocator, "<p>{s} wins historical queries by <strong>{d:.1}x</strong> over {s} — a decisive, noise-proof margin.</p>\n", .{
+                compound.historical.winner, hist_margin, compound.historical.scores[1].backend,
+            });
+        }
+    }
+    if (compound.realtime.scores.len > 1) {
+        const rt_margin = compound.realtime.scores[1].score / compound.realtime.scores[0].score;
+        if (isCloseRace(compound.realtime.scores)) {
+            try html.print(allocator, "<p class=\"caveat\">The live-query race is close: {s} vs {s} (within 15%) — treat this ranking as a near-tie, not a confident win.</p>\n", .{
+                compound.realtime.scores[0].backend, compound.realtime.scores[1].backend,
+            });
+        } else {
+            try html.print(allocator, "<p>{s} wins live queries by <strong>{d:.1}x</strong> over {s} — a clear margin.</p>\n", .{
+                compound.realtime.winner, rt_margin, compound.realtime.scores[1].backend,
+            });
+        }
+    }
+    try html.print(allocator, "</div>\n", .{});
+
+    try html.print(allocator, "<h2>Sensors placed, by type</h2>\n<div class=\"scroll\"><table>\n", .{});
+    try html.print(allocator, "<tr><th>Sensor type</th><th>Count</th><th>Retention</th></tr>\n", .{});
+    for (sensor_type_counts) |stc| {
+        try html.print(allocator, "<tr><td>{s}</td><td>{d}</td><td>{d} days</td></tr>\n", .{ stc.name, stc.count, stc.retention_days });
+    }
+    try html.print(allocator, "</table></div>\n", .{});
+
+    try html.print(allocator, "<h2>Recommendation detail</h2>\n", .{});
+    try writeScoreTableHtml(&html, allocator, "Real-time track", compound.realtime.scores);
+    try writeScoreTableHtml(&html, allocator, "Historical track", compound.historical.scores);
+
+    if (type_recommendations.len > 0) {
+        try html.print(allocator, "<h2>Recommendation by sensor type</h2>\n", .{});
+        for (type_recommendations) |tr| {
+            try html.print(allocator, "<h3 style=\"font-size:15px;margin:16px 0 6px\">{s}</h3>\n", .{@tagName(tr.sensor_type)});
+            if (tr.compound.realtime.scores.len > 0) try writeScoreTableHtml(&html, allocator, "Real-time", tr.compound.realtime.scores);
+            if (tr.compound.historical.scores.len > 0) try writeScoreTableHtml(&html, allocator, "Historical", tr.compound.historical.scores);
+        }
     }
 
-    const rec = try recommendBackend(testing.allocator, rows.items, "Small", &structural_mix);
-    defer testing.allocator.free(rec.scores);
+    try html.print(allocator, "<details>\n<summary>Per-query latency detail</summary>\n", .{});
+    try html.print(allocator, "<div class=\"scroll\"><table>\n<tr><th>Query</th><th>Backend</th><th>Median</th><th>p95</th><th>Memory (KB)</th></tr>\n", .{});
+    for (rows) |r| {
+        try html.print(allocator, "<tr><td>{s}</td><td>{s}</td><td>", .{ r.query, r.backend });
+        try writeScaledUs(&html, allocator, @as(f64, @floatFromInt(r.stats.median_ns)) / 1000.0, true);
+        try html.print(allocator, "</td><td>", .{});
+        try writeScaledUs(&html, allocator, @as(f64, @floatFromInt(r.stats.p95_ns)) / 1000.0, true);
+        try html.print(allocator, "</td><td>{d:.1}</td></tr>\n", .{@as(f64, @floatFromInt(r.memory_bytes)) / 1024.0});
+    }
+    try html.print(allocator, "</table></div>\n", .{});
+    try html.print(allocator, "<h3 style=\"font-size:14px;margin:16px 0 6px\">Per-query winner (lowest median)</h3>\n", .{});
+    try html.print(allocator, "<div class=\"scroll\"><table>\n<tr><th>Query</th><th>Winner</th><th>Median</th><th>Runner-up</th><th>Median</th><th>Speedup</th></tr>\n", .{});
+    try writeWinnersHtml(&html, allocator, rows, scale_label, full_retention_names);
+    try html.print(allocator, "</table></div>\n</details>\n", .{});
 
-    try testing.expectEqualStrings("TimeSeries", rec.winner);
-    try testing.expectEqual(@as(usize, 2), rec.scores.len);
-    try testing.expectApproxEqAbs(@as(f64, 1.0), rec.scores[0].coverage, 1e-9);
+    try html.print(allocator, "<h2>Cost estimate (cloud-equivalent)</h2>\n", .{});
+    try html.print(allocator, "<div class=\"scroll\"><table>\n<tr><th>Backend</th><th>Storage (GB)</th><th>Storage $/yr</th><th>Query $/yr</th><th>Total $/yr</th></tr>\n", .{});
+    for (cost_rows) |c| {
+        try html.print(allocator, "<tr><td>{s}</td><td>{d:.1}</td><td>${d:.0}</td><td>${d:.0}</td><td><strong>${d:.0}</strong></td></tr>\n", .{
+            c.backend, c.storage_gb, c.storage_cost_year, c.query_cost_year, c.total_cost_year,
+        });
+    }
+    try html.print(allocator, "</table></div>\n", .{});
+    const savings = naive_cost - optimised_cost;
+    const savings_pct: f64 = if (naive_cost > 0) (savings / naive_cost) * 100.0 else 0.0;
+    try html.print(allocator, "<p style=\"margin-top:10px\">Naive (all backends): <strong>${d:.0}/yr</strong> vs Optimised: <strong class=\"win\">${d:.0}/yr</strong> — savings of ${d:.0}/yr ({d:.0}%).</p>\n", .{
+        naive_cost, optimised_cost, savings, savings_pct,
+    });
+
+    try html.print(allocator, "<details>\n<summary>Growth curve detail (latency at every checkpoint from day 1 to steady state)</summary>\n", .{});
+    try html.print(allocator, "<div class=\"scroll\"><table>\n<tr><th>Checkpoint</th><th>Day</th><th>Backend</th><th>Query</th><th>Median</th><th>Live readings</th><th>Memory (MB)</th></tr>\n", .{});
+    for (growth) |g| {
+        try html.print(allocator, "<tr><td>{s}</td><td>{d}</td><td>{s}</td><td>{s}</td><td>", .{ g.label, g.sim_day, g.backend, g.query });
+        try writeScaledUs(&html, allocator, @as(f64, @floatFromInt(g.median_ns)) / 1000.0, true);
+        try html.print(allocator, "</td><td>{d}</td><td>{d:.1}</td></tr>\n", .{
+            g.reading_count, @as(f64, @floatFromInt(g.memory_bytes)) / (1024.0 * 1024.0),
+        });
+    }
+    try html.print(allocator, "</table></div>\n</details>\n", .{});
+
+    try html.print(allocator, "<details>\n<summary>Simulation summary (compression, eviction, and data-quality stats)</summary>\n", .{});
+    try html.print(allocator, "<div class=\"scroll\"><table>\n<tr><th>Backend</th><th>Sim days</th><th>Wall time (s)</th><th>Compression</th><th>Generated</th><th>Evicted</th></tr>\n", .{});
+    const day_ms: i64 = 24 * 60 * 60 * 1000;
+    for (sim_stats) |s| {
+        const sim_days = @divTrunc(s.sim_ms, day_ms);
+        const wall_s = @as(f64, @floatFromInt(s.wall_ns)) / 1e9;
+        try html.print(allocator, "<tr><td>{s}</td><td>{d}</td><td>{d:.1}</td><td>{d:.0}×</td><td>{d}</td><td>{d}</td></tr>\n", .{
+            s.backend, sim_days, wall_s, s.compressionRatio(), s.generated, s.evicted,
+        });
+    }
+    try html.print(allocator, "</table></div>\n</details>\n", .{});
+
+    try html.print(allocator, "<footer>Digital Twin recommendation for {s} · relative rankings are reliable, absolute numbers are approximate (CLAUDE.md §6)</footer>\n", .{scale_label});
+    try html.print(allocator, "</div>\n</body>\n</html>\n", .{});
+
+    try dir.writeFile(io, .{ .sub_path = "recommendation.html", .data = html.items });
+}
+
+/// One score table (with a proportional bar meter per row, winner
+/// highlighted) for the HTML dashboard. `scores` must be sorted ascending
+/// by score (best first) — the shape TrackRecommendation.scores is already
+/// in. Bar width is `best_score / this_score` (winner = 100%, since lower
+/// scores are better).
+fn writeScoreTableHtml(
+    html: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    title: []const u8,
+    scores: []const BackendScore,
+) !void {
+    if (scores.len == 0) return;
+    try html.print(allocator, "<h3 style=\"font-size:14px;margin:14px 0 6px\">{s}</h3>\n", .{title});
+    try html.print(allocator, "<div class=\"scroll\"><table>\n<tr><th>Backend</th><th>Score</th><th>Coverage</th><th></th></tr>\n", .{});
+    const best = scores[0].score;
+    for (scores, 0..) |s, i| {
+        const bar_pct: f64 = if (s.score > 0) @min((best / s.score) * 100.0, 100.0) else 0.0;
+        const winner_class: []const u8 = if (i == 0) " winner" else "";
+        try html.print(allocator, "<tr><td>{s}</td><td>{d:.2}</td><td>{d:.0}%</td><td><div class=\"bar-track\"><div class=\"bar-fill{s}\" style=\"width:{d:.1}%\"></div></div></td></tr>\n", .{
+            s.backend, s.score, s.coverage * 100, winner_class, bar_pct,
+        });
+    }
+    try html.print(allocator, "</table></div>\n", .{});
+}
+
+/// HTML-table equivalent of writeWinners above — same findWinnerAndRunnerUp
+/// selection helper, rendered as <tr> rows instead of Markdown pipes.
+fn writeWinnersHtml(
+    html: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    rows: []const RunRow,
+    scale: []const u8,
+    historical_eligible: ?[]const []const u8,
+) !void {
+    var seen: std.ArrayList([]const u8) = .empty;
+    defer seen.deinit(allocator);
+
+    for (rows) |r| {
+        if (!std.mem.eql(u8, r.scale, scale)) continue;
+        var already = false;
+        for (seen.items) |s| {
+            if (std.mem.eql(u8, s, r.query)) {
+                already = true;
+                break;
+            }
+        }
+        if (already) continue;
+        try seen.append(allocator, r.query);
+
+        const pair = findWinnerAndRunnerUp(rows, scale, r.query, historical_eligible) orelse continue;
+        const best_us = @as(f64, @floatFromInt(pair.winner.stats.median_ns)) / 1000.0;
+
+        try html.print(allocator, "<tr><td>{s}</td><td><strong>{s}</strong></td><td>", .{ r.query, pair.winner.backend });
+        try writeScaledUs(html, allocator, best_us, true);
+        try html.print(allocator, "</td>", .{});
+        if (pair.runner_up) |second| {
+            const second_us = @as(f64, @floatFromInt(second.stats.median_ns)) / 1000.0;
+            const speedup = if (pair.winner.stats.median_ns > 0)
+                @as(f64, @floatFromInt(second.stats.median_ns)) / @as(f64, @floatFromInt(pair.winner.stats.median_ns))
+            else
+                0.0;
+            try html.print(allocator, "<td>{s}</td><td>", .{second.backend});
+            try writeScaledUs(html, allocator, second_us, true);
+            try html.print(allocator, "</td><td>{d:.2}×</td></tr>\n", .{speedup});
+        } else {
+            try html.print(allocator, "<td>—</td><td>—</td><td>—</td></tr>\n", .{});
+        }
+    }
 }

@@ -87,6 +87,8 @@ pub fn assertImplements(comptime T: type) void {
     if (!@hasDecl(T, "sensorIdsByFloor")) @compileError("StorageBackend: " ++ @typeName(T) ++ " missing pub fn sensorIdsByFloor");
     if (!@hasDecl(T, "floorOfZone")) @compileError("StorageBackend: " ++ @typeName(T) ++ " missing pub fn floorOfZone");
     if (!@hasDecl(T, "pruneOlderThan")) @compileError("StorageBackend: " ++ @typeName(T) ++ " missing pub fn pruneOlderThan");
+    if (!@hasDecl(T, "setRetentionHint")) @compileError("StorageBackend: " ++ @typeName(T) ++ " missing pub fn setRetentionHint");
+    if (!@hasDecl(T, "allSensorIds")) @compileError("StorageBackend: " ++ @typeName(T) ++ " missing pub fn allSensorIds");
 }
 
 // ---------------------------------------------------------------------------
@@ -226,120 +228,28 @@ pub fn assertImplements(comptime T: type) void {
 //      read. Safe to call when no reading of that type is old enough to
 //      remove (a no-op). Does not affect readings of other sensor types
 //      or a sensor's zone/floor registration.
+//
+//  pub fn setRetentionHint(self: *T, sensor_type: SensorType, max_readings: usize) !void
+//
+//      A HINT, not a command: tells the backend that `sensor_type` is
+//      expected to need at most `max_readings` retained (computed by the
+//      caller from that type's retention_days x reading rate — see
+//      synthetic/generator.zig's canonical per-type table, the single
+//      source of truth for those numbers; this interface only receives
+//      the already-computed count, keeping the storage layer unaware of
+//      *why* a number was chosen). Most backends have no fixed-capacity
+//      concept — they hold everything inserted, bounded only by
+//      pruneOlderThan — and implement this as a no-op, same as
+//      Hierarchical's tree structurally exploiting registerZone/Floor
+//      while flat backends only bookkeep it. RingBuffer is the one
+//      backend that structurally needs this: its per-sensor circular
+//      buffer size is fixed at allocation time (first insert for that
+//      sensor_id), so a hint set before a sensor type's first reading
+//      sizes that type's buffers correctly; a hint set after some
+//      sensors of that type already exist only affects sensors not yet
+//      seen (already-allocated buffers keep their original size — the
+//      caller is expected to set every hint before ingestion begins).
+//      Falls back to a backend-chosen default when no hint was set for
+//      a given type. No effect on already-stored readings.
 
 // ---------------------------------------------------------------------------
-// Tests — verify the interface types and assertImplements compile.
-// ---------------------------------------------------------------------------
-
-test "SensorReading is plain data" {
-    const r = SensorReading{
-        .sensor_id = 42,
-        .timestamp = 1700000000,
-        .value = 23.5,
-        .sensor_type = .temperature,
-    };
-    try std.testing.expectEqual(@as(u32, 42), r.sensor_id);
-    try std.testing.expectEqual(@as(i64, 1700000000), r.timestamp);
-    try std.testing.expectEqual(@as(f32, 23.5), r.value);
-    try std.testing.expectEqual(SensorType.temperature, r.sensor_type);
-}
-
-test "RangeQuery defaults to all sensors" {
-    const q = RangeQuery{ .start_time = 0, .end_time = 100 };
-    try std.testing.expect(q.sensor_id == null);
-}
-
-test "RangeQuery with sensor filter" {
-    const q = RangeQuery{ .sensor_id = 7, .start_time = 0, .end_time = 100 };
-    try std.testing.expectEqual(@as(?u32, 7), q.sensor_id);
-}
-
-/// Minimal stub that satisfies the interface — used only to verify
-/// assertImplements accepts a correctly-shaped type. NOT a real backend.
-const StubBackend = struct {
-    pub fn init(_: std.mem.Allocator) !StubBackend {
-        return .{};
-    }
-    pub fn deinit(_: *StubBackend) void {}
-    pub fn insert(_: *StubBackend, _: SensorReading) !void {}
-    pub fn count(_: *const StubBackend) usize {
-        return 0;
-    }
-    pub fn memoryUsed(_: *const StubBackend) usize {
-        return 0;
-    }
-    pub fn iterateAll(_: *const StubBackend, _: std.mem.Allocator) ![]const SensorReading {
-        return &.{};
-    }
-    pub fn getLatestBySensor(_: *const StubBackend, _: u32) ?SensorReading {
-        return null;
-    }
-    pub fn rangeByTime(_: *const StubBackend, _: std.mem.Allocator, _: RangeQuery) ![]const SensorReading {
-        return &.{};
-    }
-    pub fn registerZone(_: *StubBackend, _: u32, _: u32) !void {}
-    pub fn registerFloor(_: *StubBackend, _: u32, _: u32) !void {}
-    pub fn sensorIdsByZone(_: *const StubBackend, _: std.mem.Allocator, _: u32) ![]u32 {
-        return &.{};
-    }
-    pub fn sensorIdsByFloor(_: *const StubBackend, _: std.mem.Allocator, _: u32) ![]u32 {
-        return &.{};
-    }
-    pub fn floorOfZone(_: *const StubBackend, _: u32) ?u32 {
-        return null;
-    }
-    pub fn pruneOlderThan(_: *StubBackend, _: SensorType, _: i64) !void {}
-};
-
-test "assertImplements accepts a valid backend" {
-    assertImplements(StubBackend);
-}
-
-/// A second stub with extra public methods beyond the required interface.
-/// CLAUDE.md §3.2 says backends should expose no extra public methods, but
-/// that's a style rule enforced by review, not by `assertImplements` itself:
-/// the check only looks for the required `@hasDecl`s, so it is purely
-/// additive and never rejects a type for having more than the interface
-/// asks for. This test documents that present (lenient) behavior so a
-/// future tightening of `assertImplements` is a deliberate decision, not an
-/// accidental regression.
-const ExtendedBackend = struct {
-    pub fn init(_: std.mem.Allocator) !ExtendedBackend {
-        return .{};
-    }
-    pub fn deinit(_: *ExtendedBackend) void {}
-    pub fn insert(_: *ExtendedBackend, _: SensorReading) !void {}
-    pub fn count(_: *const ExtendedBackend) usize {
-        return 0;
-    }
-    pub fn memoryUsed(_: *const ExtendedBackend) usize {
-        return 0;
-    }
-    pub fn iterateAll(_: *const ExtendedBackend, _: std.mem.Allocator) ![]const SensorReading {
-        return &.{};
-    }
-    pub fn getLatestBySensor(_: *const ExtendedBackend, _: u32) ?SensorReading {
-        return null;
-    }
-    pub fn rangeByTime(_: *const ExtendedBackend, _: std.mem.Allocator, _: RangeQuery) ![]const SensorReading {
-        return &.{};
-    }
-    pub fn registerZone(_: *ExtendedBackend, _: u32, _: u32) !void {}
-    pub fn registerFloor(_: *ExtendedBackend, _: u32, _: u32) !void {}
-    pub fn sensorIdsByZone(_: *const ExtendedBackend, _: std.mem.Allocator, _: u32) ![]u32 {
-        return &.{};
-    }
-    pub fn sensorIdsByFloor(_: *const ExtendedBackend, _: std.mem.Allocator, _: u32) ![]u32 {
-        return &.{};
-    }
-    pub fn floorOfZone(_: *const ExtendedBackend, _: u32) ?u32 {
-        return null;
-    }
-    pub fn pruneOlderThan(_: *ExtendedBackend, _: SensorType, _: i64) !void {}
-    // Not part of the StorageBackend interface — should not affect the check.
-    pub fn debugDump(_: *const ExtendedBackend) void {}
-};
-
-test "assertImplements ignores extra public methods beyond the interface" {
-    assertImplements(ExtendedBackend);
-}

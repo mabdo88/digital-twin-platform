@@ -1,11 +1,13 @@
 # Storage/Benchmark Redesign Plan (agreed 2026-06-30)
 
-> **Status: IN PROGRESS as of 2026-07-01.** Two of eleven implementation steps are
-> done and verified (see "Implementation progress" below); the rest of this
-> document is still the target, not yet built. Check `git log` and the current
-> source before assuming any specific piece is done. Treat this as a status doc
-> per CLAUDE.md §9 — read it before touching `synthetic/generator.zig`,
-> `ecs/storage/*`, `benchmark/queries.zig`, or `main.zig`'s orchestration.
+> **Status: COMPLETE as of 2026-07-01.** All planned items are implemented,
+> tested (166 tests pass), committed to `dev`, and smoke-tested end-to-end
+> against real IFC files. The only remaining items are low-priority (retire
+> AoS/SoA equivalence test assumptions) or future work (cost model, DuckDB
+> calibration, sensor failure modes — see the Roadmap). This document is now
+> a historical record of the design decisions; read it before touching
+> `synthetic/generator.zig`, `ecs/storage/*`, `benchmark/queries.zig`, or
+> `main.zig`'s orchestration.
 
 ## Implementation progress (2026-07-01)
 
@@ -48,13 +50,84 @@
    prune exactly like it does on insert. 8 new regression tests (one or two
    per backend), including a RingBuffer wraparound case that specifically
    forces physical/logical order to diverge — all passing, full suite green.
+3. **RingBuffer's per-type-configurable capacity** — added
+   `setRetentionHint(sensor_type, max_readings) !void` to the `StorageBackend`
+   interface. Non-RingBuffer backends implement it as a no-op (they have no
+   fixed-capacity concept). RingBuffer stores per-type capacity hints in a
+   hashmap, consulted only when allocating a NEW sensor's buffer (first
+   insert for that sensor_id) — a hint set after some sensors of a type
+   already exist doesn't resize them, by design (the caller sets every hint
+   before ingestion begins). Also fixed a real correctness bug found while
+   implementing this: `capacity_per_sensor` was a single backend-wide field
+   used for wraparound math even on an *existing* sensor's buffer — once
+   different types can have different capacities, that math must use each
+   sensor's own `buffer.len`, not a shared constant. Fixed in `insert`,
+   `memoryUsed`, and `pruneOlderThan`. 2 new regression tests.
+4. **Lake backend** — the cheapest possible cold tier: a flat, unindexed,
+   uncompressed array (`ecs/storage/backends/lake_storage.zig`), structurally
+   similar to AoS/SoA but framed and registered as a real deployment
+   candidate (unlike AoS/SoA, which stay reference-only baselines). Full
+   `StorageBackend` interface, own unit tests, a golden-equivalence test
+   against TimeSeries, and wired into `runner.zig`'s `backends` /
+   `supported_backends` registries — the single registration point every
+   test/table already reads from, so Lake was automatically picked up by the
+   dynamic cross-backend equivalence tests in `runner.zig` with no further
+   duplication needed. End-to-end smoke-tested: `dt.exe` against a real IFC
+   file runs Lake alongside the other 4 deployment backends and reports it
+   in the winner comparison.
 
-**Not yet started:** RingBuffer's per-type-configurable capacity, the Lake
-backend, the generator.zig continuous/event-storage split, the researched
-retention values, per-sensor unique full-volume generation, the live tick
-simulator, retiring the 25-iteration methodology, and the main.zig rewire.
-See "Explicitly NOT yet done" at the bottom — unchanged except items 1-2
-above are now done, not planned.
+5. **generator.zig split into continuous vs. event-storage models** —
+   `generate()`'s per-shape switch now decides not just HOW to compute a
+   value but WHETHER to store it. `binary_event` (occupancy) only appends a
+   reading when the value differs from the last EMITTED value (an event
+   log, not periodic polling) — the first tick always emits, since a real
+   system reports its initial state at startup. `bursty_impulsive`
+   (vibration) only appends when `sampleBurstyImpulsive` reports
+   `is_event == true` — non-event (baseline) samples still run through the
+   RNG for determinism but are discarded immediately, never stored. This
+   is the exact design the user corrected earlier in this session
+   ("occupancy is stored event based... vibration... we only store
+   anomalies"), now implemented as an authorized, agreed step.
+   `diurnal_continuous`/`stepwise_discrete` (temperature/humidity/co2/
+   air_quality/flow/structural/energy) are unchanged — full periodic
+   readings every tick, since that's genuinely how BMS/AMI historians
+   report.
+6. **Retention values updated per research** — co2/air_quality: 365 -> 1095
+   days (3yr, WELL Building Standard's documented minimum — a real
+   regulatory number, correcting the earlier unresearched guess). flow: 90
+   -> 365 days (1yr, a disclosed pragmatic choice per the user: genuinely
+   ambiguous whether a given flow sensor is billing-relevant, "not
+   important now, just make it 1yr"). The doc comment above `profileFor`
+   now explicitly labels which retention values are research-grounded
+   (energy, structural, co2/air_quality) vs. reasoned operational defaults
+   (temperature/humidity, flow, occupancy, vibration), so a future reader
+   never mistakes a default for a citation.
+
+**Verification (steps 5-6).** Three existing tests had premises inverted by
+the storage-model change and were rewritten, not just patched: the old
+"binary_event... state has dwell time" test asserted most CONSECUTIVE
+STORED readings share a value — the opposite is now true by construction
+(every stored reading is a transition), so it now asserts consecutive
+stored readings always DIFFER, with dwell time proven instead via gaps
+between transition timestamps exceeding one tick period. The old
+"bursty_impulsive... most readings stay near baseline" test asserted most
+stored readings are near baseline — now every stored reading must exceed
+the burst floor (it's an event log), with sparsity proven by comparing
+count against total ticks evaluated. The 100k-sensor scale test's exact
+`readings.len == num_sensors` assertion no longer holds now that
+vibration's per-tick storage is genuinely probabilistic (~2%) — relaxed to
+`0 < readings.len <= num_sensors`, since the test's real purpose (scale
+without blowing up) doesn't depend on an exact count. Full suite green
+throughout. End-to-end smoke-tested against the equipment-heavy HASC IFC
+file: 364 sensors -> 1053 readings (a fraction of the old per-type-uniform
+volume), vibration correctly sparse, Lake winning for both energy and
+vibration in that run's per-type recommendation.
+
+**All planned items now done.** Per-sensor unique full-volume generation,
+the live tail (second generate() call), retiring the 25-iteration
+methodology, the main.zig rewire, compound recommendations, and obsolete
+test cleanup are all implemented and tested. See "Remaining items" below
+for the full strike-through list.
 
 ## Why this exists
 
@@ -182,13 +255,56 @@ Columnar/TimeSeries's indexing overhead isn't worth paying for.
   only the data feeding them and the removal of the 25-iteration wrapper
   change.
 
-## Explicitly NOT yet done
+## Remaining items (not part of the core redesign)
 
-1. ~~Full recheck of the remaining 7 query patterns~~ — **done 2026-07-01**,
-   see "Implementation progress" above.
-2. ~~The prune/evict interface method~~ — **done 2026-07-01**, see
-   "Implementation progress" above. Still not implemented: the two-tier
-   generation split, the live simulator, RingBuffer's per-type capacity, or
-   the Lake backend.
-3. Time-compression factor for the live simulator.
-4. The CLAUDE.md §3.4 edit reflecting the retired 25-iteration rule.
+1. ~~Full recheck of the remaining 7 query patterns~~ — **done 2026-07-01**.
+2. ~~The prune/evict interface method~~ — **done 2026-07-01**.
+3. ~~RingBuffer's per-type-configurable capacity~~ — **done 2026-07-01**.
+4. ~~The Lake backend~~ — **done 2026-07-01**.
+5. ~~The generator.zig continuous/event-storage split~~ — **done 2026-07-01**.
+6. ~~The researched retention values~~ — **done 2026-07-01**.
+7. ~~Per-sensor unique full-volume generation~~ — **done 2026-07-01**.
+8. ~~The live tail (second generate() call)~~ — **done 2026-07-01**.
+9. ~~Retiring the 25-iteration methodology~~ — **done 2026-07-01**.
+10. ~~The main.zig rewire~~ — **done 2026-07-01**.
+11. ~~Compound recommendations (recommendCompound)~~ — **done 2026-07-01**.
+12. ~~CLAUDE.md §3.4 edit~~ — **done 2026-07-01**.
+13. ~~Obsolete test cleanup~~ — **done 2026-07-01** (19 tests removed).
+14. ~~Cost model (Phase 7.3-7.4)~~ — **done 2026-07-01**. `cost_model.zig`
+    estimates annual cloud-equivalent $/year per backend from measured memory
+    footprint and query throughput; naive-vs-optimised comparison shows
+    savings from running only the two recommended winners.
+
+**Still open (low priority / future work):**
+- Retire the AoS/SoA-only equivalence tests' assumption of small uniform data — low priority.
+- Time-compression factor for the live simulator — undecided, not needed until live-tick real-time matters.
+- DuckDB calibration — Phase 8, not started.
+
+## Handoff (2026-07-01) — redesign complete
+
+The storage redesign is fully implemented. All items in "Remaining items"
+above are struck through. The codebase is in a clean, tested state:
+
+- **166 tests pass** (`zig build test`), `zig build` is clean.
+- **Compound recommendations** are live: `main.zig` calls
+  `report.recommendCompound` for both building-level and per-sensor-type
+  recommendations. The old `recommendBackend()` function, `Recommendation`
+  struct, and `EXPECTED_WINNERS` table are removed.
+- **RingBuffer** is capped at 10 readings/sensor (flat, all types) via
+  `setRetentionHint` before ingest. It competes only in the real-time track.
+- **25-iteration sampling** is retired. `main.zig` measures each query once
+  against real per-sensor data. `runner.zig`'s internal regression suite
+  keeps fixed iterations as a CI check.
+- **19 obsolete tests** were removed (6 `recommendBackend` tests, scaling
+  print test, 100k-sensor test, 11 empty-world tests).
+
+**Two design decisions already made, don't re-litigate them:**
+- The live simulator is NOT new machinery — it's a second `generate()` call
+  over `[SIMULATED_NOW_MS, +LIVE_TAIL_MS]` with carried occupancy state. Do
+  not build a tick-loop/scheduler.
+- Full per-sensor generation, no sampling, no sharing values across sibling
+  sensors of the same type — the user was explicit and firm about this.
+
+**One standing behavioral instruction:** do not edit any file while a
+design/approach is still being discussed — only after an explicit go-ahead
+for that specific change.

@@ -1,4 +1,4 @@
-// Test root for BIM/IFC module tests.
+// Test entry point for the BIM/IFC module family.
 // Placed at engine/ level so components.zig can import ../ecs/storage/* for
 // the shared SensorType enum — same module-path reason benchmark_test.zig
 // and metrics_test.zig live here.

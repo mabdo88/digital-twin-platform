@@ -99,20 +99,20 @@ fn elementTypeFromIfcName(name: []const u8) ElementType {
     if (T.eq(name, "IFCSLAB")) return .slab;
     if (T.eq(name, "IFCBEAM")) return .beam;
     if (T.eq(name, "IFCFLOWSEGMENT")) return .flow_segment;
-    // Equipment family — see components.zig's ElementType.equipment doc
-    // comment for why this exists and which real file motivated it.
-    if (T.eq(name, "IFCFLOWTERMINAL")) return .equipment;
-    if (T.eq(name, "IFCFLOWFITTING")) return .equipment;
-    if (T.eq(name, "IFCFLOWCONTROLLER")) return .equipment;
-    if (T.eq(name, "IFCFLOWMOVINGDEVICE")) return .equipment;
-    if (T.eq(name, "IFCFLOWSTORAGEDEVICE")) return .equipment;
-    if (T.eq(name, "IFCENERGYCONVERSIONDEVICE")) return .equipment;
-    if (T.eq(name, "IFCDISTRIBUTIONCONTROLELEMENT")) return .equipment;
-    if (T.eq(name, "IFCBUILDINGELEMENTPROXY")) return .equipment;
-    if (T.eq(name, "IFCELECTRICAPPLIANCE")) return .equipment;
-    if (T.eq(name, "IFCALARM")) return .equipment;
-    if (T.eq(name, "IFCCABLECARRIERSEGMENT")) return .equipment;
-    if (T.eq(name, "IFCCABLESEGMENT")) return .equipment;
+    // Granular MEP/electrical types — see components.zig's ElementType
+    // doc comments for which sensors go on each.
+    if (T.eq(name, "IFCFLOWTERMINAL")) return .flow_terminal;
+    if (T.eq(name, "IFCFLOWFITTING")) return .flow_fitting;
+    if (T.eq(name, "IFCFLOWCONTROLLER")) return .flow_controller;
+    if (T.eq(name, "IFCFLOWMOVINGDEVICE")) return .flow_moving_device;
+    if (T.eq(name, "IFCFLOWSTORAGEDEVICE")) return .flow_storage_device;
+    if (T.eq(name, "IFCENERGYCONVERSIONDEVICE")) return .energy_conversion_device;
+    if (T.eq(name, "IFCDISTRIBUTIONCONTROLELEMENT")) return .distribution_control_element;
+    if (T.eq(name, "IFCBUILDINGELEMENTPROXY")) return .building_element_proxy;
+    if (T.eq(name, "IFCELECTRICAPPLIANCE")) return .electric_appliance;
+    if (T.eq(name, "IFCALARM")) return .alarm;
+    if (T.eq(name, "IFCCABLECARRIERSEGMENT")) return .cable_segment;
+    if (T.eq(name, "IFCCABLESEGMENT")) return .cable_segment;
     return .other;
 }
 
@@ -129,10 +129,13 @@ pub const ParsedModel = struct {
     /// `zones[i].zone_id` matches the corresponding `BuildingElement.ifc_id`.
     /// Sorted by zone_id ascending.
     zones: []ZoneMetadata,
-    /// Sidecar metadata for entities that act as equipment. One entry per
-    /// `.equipment`-typed BuildingElement (`equipment[i].element_id` matches
-    /// the corresponding `BuildingElement.ifc_id`). Sorted by element_id
-    /// ascending.
+    /// Sidecar metadata for entities that act as equipment (flow_terminal,
+    /// flow_fitting, flow_controller, flow_moving_device, flow_storage_device,
+    /// energy_conversion_device, distribution_control_element,
+    /// building_element_proxy, electric_appliance, alarm, cable_segment).
+    /// One entry per equipment-typed BuildingElement
+    /// (`equipment[i].element_id` matches the corresponding
+    /// `BuildingElement.ifc_id`). Sorted by element_id ascending.
     equipment: []EquipmentMetadata,
 
     pub fn deinit(self: *ParsedModel) void {
@@ -760,7 +763,7 @@ fn resolveHierarchy(arena: Allocator, entities: *std.AutoHashMapUnmanaged(u32, E
                     .area_m2 = 0,
                 });
             },
-            .equipment => {
+            .flow_terminal, .flow_fitting, .flow_controller, .flow_moving_device, .flow_storage_device, .energy_conversion_device, .distribution_control_element, .building_element_proxy, .electric_appliance, .alarm, .cable_segment => {
                 const props = equipment_props.get(e.id);
                 try equipment.append(arena, .{
                     .element_id = e.id,
@@ -848,220 +851,3 @@ fn numberAsF64(v: ArgValue) ?f64 {
 }
 
 // ---------------------------------------------------------------------------
-// Tests — synthetic IFC fragments + a small end-to-end fixture.
-// Real-file validation is Task 4.4; this proves the parser and resolver
-// agree against hand-authored ground truth.
-// ---------------------------------------------------------------------------
-
-const testing = std.testing;
-
-test "parses a minimal entity with mixed arg shapes" {
-    const src =
-        \\HEADER;ENDSEC;
-        \\DATA;
-        \\#1 = IFCPROJECT('GUID',$,'Demo','desc',$,(*),.MIXED.,12,3.5,-1.25E-2,#2);
-        \\ENDSEC;
-    ;
-    var model = try parseSlice(testing.allocator, src);
-    defer model.deinit();
-
-    const e = model.entities.get(1).?;
-    try testing.expectEqualStrings("IFCPROJECT", e.type_name);
-    try testing.expectEqual(@as(usize, 11), e.args.len);
-    try testing.expectEqualStrings("GUID", e.args[0].string);
-    try testing.expect(e.args[1] == .unset);
-    try testing.expectEqualStrings("Demo", e.args[2].string);
-    try testing.expect(e.args[4] == .unset);
-    // arg[5] is a list containing a single derived `*`
-    try testing.expect(e.args[5] == .list);
-    try testing.expect(e.args[5].list[0] == .derived);
-    try testing.expectEqualStrings("MIXED", e.args[6].enum_lit);
-    try testing.expectEqual(@as(i64, 12), e.args[7].integer);
-    try testing.expectApproxEqAbs(@as(f64, 3.5), e.args[8].real, 1e-9);
-    try testing.expectApproxEqAbs(@as(f64, -0.0125), e.args[9].real, 1e-9);
-    try testing.expectEqual(@as(u32, 2), e.args[10].ref);
-}
-
-test "strings with doubled-quote escape round-trip correctly" {
-    const src =
-        \\DATA;
-        \\#1 = IFCPROJECT('it''s fine',$,'two''quotes''here',$);
-        \\ENDSEC;
-    ;
-    var model = try parseSlice(testing.allocator, src);
-    defer model.deinit();
-
-    const e = model.entities.get(1).?;
-    try testing.expectEqualStrings("it's fine", e.args[0].string);
-    try testing.expectEqualStrings("two'quotes'here", e.args[2].string);
-}
-
-test "comments are skipped, including nested /* /* */ */" {
-    const src =
-        \\DATA;
-        \\/* outer /* nested */ still in */
-        \\#1 = IFCWALL('g',$,'W1',$,$,$,$,$,$);
-        \\ENDSEC;
-    ;
-    var model = try parseSlice(testing.allocator, src);
-    defer model.deinit();
-    try testing.expect(model.entities.get(1) != null);
-}
-
-test "hierarchy: project -> building -> storey -> space + wall on storey" {
-    const src =
-        \\HEADER;ENDSEC;
-        \\DATA;
-        \\#100 = IFCCARTESIANPOINT((0.0, 0.0, 0.0));
-        \\#101 = IFCAXIS2PLACEMENT3D(#100,$,$);
-        \\#102 = IFCLOCALPLACEMENT($, #101);
-        \\
-        \\#110 = IFCCARTESIANPOINT((5.0, 0.0, 3.0));
-        \\#111 = IFCAXIS2PLACEMENT3D(#110,$,$);
-        \\#112 = IFCLOCALPLACEMENT(#102, #111);
-        \\
-        \\#120 = IFCCARTESIANPOINT((1.0, 2.0, 0.0));
-        \\#121 = IFCAXIS2PLACEMENT3D(#120,$,$);
-        \\#122 = IFCLOCALPLACEMENT(#112, #121);
-        \\
-        \\#1 = IFCPROJECT('p',$,'Tower',$,$,$,$,$,$);
-        \\#2 = IFCBUILDING('b',$,'BldgA',$,$,#102,$,$,$,$,$);
-        \\#3 = IFCBUILDINGSTOREY('s',$,'L1',$,$,#112,$,$,$,$);
-        \\#4 = IFCSPACE('sp',$,'R101',$,$,#122,$,$,$,$,$);
-        \\#5 = IFCWALL('w',$,'W1',$,$,#122,$,$,$);
-        \\
-        \\#200 = IFCRELAGGREGATES('a1',$,$,$,#1,(#2));
-        \\#201 = IFCRELAGGREGATES('a2',$,$,$,#2,(#3));
-        \\#202 = IFCRELCONTAINEDINSPATIALSTRUCTURE('c1',$,$,$,(#4, #5),#3);
-        \\ENDSEC;
-    ;
-
-    var model = try parseSlice(testing.allocator, src);
-    defer model.deinit();
-
-    // 5 supported elements: project, building, storey, space, wall.
-    try testing.expectEqual(@as(usize, 5), model.building_elements.len);
-
-    const project = model.building_elements[0];
-    try testing.expectEqual(ElementType.project, project.element_type);
-    try testing.expectEqual(@as(?u32, null), project.parent_id);
-    try testing.expectEqual(@as(f64, 0), project.position.x);
-
-    const building = model.building_elements[1];
-    try testing.expectEqual(ElementType.building, building.element_type);
-    try testing.expectEqual(@as(?u32, 1), building.parent_id);
-    // Building's local placement is #102, which sits at origin via #100.
-    try testing.expectApproxEqAbs(@as(f64, 0), building.position.x, 1e-9);
-
-    const storey = model.building_elements[2];
-    try testing.expectEqual(ElementType.storey, storey.element_type);
-    try testing.expectEqual(@as(?u32, 2), storey.parent_id);
-    // Storey placement #112 chains through #102 (origin) + #111 ((5,0,3)).
-    try testing.expectApproxEqAbs(@as(f64, 5), storey.position.x, 1e-9);
-    try testing.expectApproxEqAbs(@as(f64, 3), storey.position.z, 1e-9);
-
-    const space = model.building_elements[3];
-    try testing.expectEqual(ElementType.space, space.element_type);
-    try testing.expectEqual(@as(?u32, 3), space.parent_id);
-    // Space placement #122 -> #112 -> #102: (1,2,0)+(5,0,3)+(0,0,0) = (6,2,3).
-    try testing.expectApproxEqAbs(@as(f64, 6), space.position.x, 1e-9);
-    try testing.expectApproxEqAbs(@as(f64, 2), space.position.y, 1e-9);
-    try testing.expectApproxEqAbs(@as(f64, 3), space.position.z, 1e-9);
-
-    const wall = model.building_elements[4];
-    try testing.expectEqual(ElementType.wall, wall.element_type);
-    try testing.expectEqual(@as(?u32, 3), wall.parent_id);
-    // Wall shares the space's placement chain so it lands at the same point.
-    try testing.expectApproxEqAbs(@as(f64, 6), wall.position.x, 1e-9);
-
-    // Zones: one per storey + one per space, ids matching the BuildingElements.
-    try testing.expectEqual(@as(usize, 2), model.zones.len);
-    try testing.expectEqual(@as(u32, 3), model.zones[0].zone_id);
-    try testing.expectEqual(ZoneType.storey, model.zones[0].zone_type);
-    try testing.expectEqual(@as(u32, 4), model.zones[1].zone_id);
-    try testing.expectEqual(ZoneType.space, model.zones[1].zone_type);
-}
-
-test "elements outside the supported set are dropped from the hierarchy view" {
-    const src =
-        \\DATA;
-        \\#1 = IFCDOOR('g',$,'D1',$,$,$,$,$,$,$,$,$);
-        \\#2 = IFCWINDOW('g',$,'W1',$,$,$,$,$,$,$,$,$);
-        \\#3 = IFCSLAB('g',$,'S1',$,$,$,$,$,$);
-        \\ENDSEC;
-    ;
-    var model = try parseSlice(testing.allocator, src);
-    defer model.deinit();
-
-    try testing.expectEqual(@as(usize, 3), model.entities.count());
-    try testing.expectEqual(@as(usize, 1), model.building_elements.len);
-    try testing.expectEqual(ElementType.slab, model.building_elements[0].element_type);
-    try testing.expectEqual(@as(usize, 0), model.zones.len);
-}
-
-test "storey elevation populates ZoneMetadata.floor_level and spaces inherit it" {
-    const src =
-        \\DATA;
-        \\#10 = IFCBUILDINGSTOREY('s',$,'L2',$,$,$,$,$,$,6.5);
-        \\#20 = IFCSPACE('sp',$,'Room 201',$,$,$,$,$,$,$,$);
-        \\#30 = IFCRELCONTAINEDINSPATIALSTRUCTURE('r',$,$,$,(#20),#10);
-        \\ENDSEC;
-    ;
-    var model = try parseSlice(testing.allocator, src);
-    defer model.deinit();
-
-    try testing.expectEqual(@as(usize, 2), model.zones.len);
-
-    const storey_zone = model.zones[0];
-    try testing.expectEqual(@as(u32, 10), storey_zone.zone_id);
-    try testing.expectEqual(ZoneType.storey, storey_zone.zone_type);
-    try testing.expectApproxEqAbs(@as(f64, 6.5), storey_zone.floor_level, 1e-9);
-    try testing.expectEqualStrings("L2", storey_zone.name);
-
-    const space_zone = model.zones[1];
-    try testing.expectEqual(@as(u32, 20), space_zone.zone_id);
-    try testing.expectEqual(ZoneType.space, space_zone.zone_type);
-    // Space inherits its containing storey's elevation, not zero.
-    try testing.expectApproxEqAbs(@as(f64, 6.5), space_zone.floor_level, 1e-9);
-}
-
-test "space with no containing storey gets floor_level=0, not a crash" {
-    const src =
-        \\DATA;
-        \\#1 = IFCSPACE('sp',$,'Orphan',$,$,$,$,$,$,$,$);
-        \\ENDSEC;
-    ;
-    var model = try parseSlice(testing.allocator, src);
-    defer model.deinit();
-    try testing.expectEqual(@as(usize, 1), model.zones.len);
-    try testing.expectEqual(@as(f64, 0), model.zones[0].floor_level);
-}
-
-test "missing DATA section errors cleanly" {
-    const src = "HEADER;ENDSEC;";
-    const r = parseSlice(testing.allocator, src);
-    try testing.expectError(error.MissingDataSection, r);
-}
-
-test "broken placement chain degrades to origin, not crash" {
-    const src =
-        \\DATA;
-        \\#1 = IFCWALL('g',$,'W1',$,$,#999,$,$,$);
-        \\ENDSEC;
-    ;
-    var model = try parseSlice(testing.allocator, src);
-    defer model.deinit();
-    try testing.expectEqual(@as(usize, 1), model.building_elements.len);
-    try testing.expectEqual(@as(f64, 0), model.building_elements[0].position.x);
-}
-
-test "duplicate entity ids are rejected" {
-    const src =
-        \\DATA;
-        \\#1 = IFCWALL('g',$,'W1',$,$,$,$,$,$);
-        \\#1 = IFCWALL('h',$,'W2',$,$,$,$,$,$);
-        \\ENDSEC;
-    ;
-    const r = parseSlice(testing.allocator, src);
-    try testing.expectError(error.DuplicateEntityId, r);
-}

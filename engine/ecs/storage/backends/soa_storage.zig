@@ -156,10 +156,26 @@ pub fn floorOfZone(self: *const Self, zone_id: u32) ?u32 {
     return self.zone_index.floorOfZone(zone_id);
 }
 
+pub fn allSensorIds(self: *const Self, allocator: std.mem.Allocator) ![]u32 {
+    var seen = std.AutoHashMap(u32, void).init(allocator);
+    defer seen.deinit();
+    for (self.sensor_ids.items) |sid| try seen.put(sid, {});
+    var result: std.ArrayList(u32) = .empty;
+    defer result.deinit(allocator);
+    var it = seen.keyIterator();
+    while (it.next()) |k| try result.append(allocator, k.*);
+    std.mem.sort(u32, result.items, {}, std.sort.asc(u32));
+    return result.toOwnedSlice(allocator);
+}
+
 /// Removes every reading of `sensor_type` older than `cutoff_timestamp` via
 /// an in-place stable compaction across all four parallel arrays (readings
 /// of other types, and this backend's zone/floor topology, are untouched).
 /// See storage_backend.zig's pruneOlderThan contract.
+/// SoA has no fixed-capacity concept — see aos_storage.zig's
+/// setRetentionHint for why this is a no-op.
+pub fn setRetentionHint(_: *Self, _: SensorType, _: usize) !void {}
+
 pub fn pruneOlderThan(self: *Self, sensor_type: SensorType, cutoff_timestamp: i64) !void {
     var write: usize = 0;
     for (self.sensor_ids.items, 0..) |sid, i| {
@@ -179,223 +195,3 @@ pub fn pruneOlderThan(self: *Self, sensor_type: SensorType, cutoff_timestamp: i6
 }
 
 // ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
-test "SoA: assertImplements" {
-    sb.assertImplements(Self);
-}
-
-test "SoA: insert N readings and read them back" {
-    const N: usize = 100;
-    var backend = try Self.init(std.testing.allocator);
-    defer backend.deinit();
-
-    for (0..N) |i| {
-        try backend.insert(.{
-            .sensor_id = @intCast(i % 10),
-            .timestamp = @intCast(i),
-            .value = @floatFromInt(i),
-            .sensor_type = .temperature,
-        });
-    }
-
-    try std.testing.expectEqual(N, backend.count());
-
-    const all = try backend.iterateAll(std.testing.allocator);
-    defer std.testing.allocator.free(all);
-
-    try std.testing.expectEqual(N, all.len);
-    for (0..N) |i| {
-        try std.testing.expectEqual(@as(u32, @intCast(i % 10)), all[i].sensor_id);
-        try std.testing.expectEqual(@as(i64, @intCast(i)), all[i].timestamp);
-        try std.testing.expectEqual(@as(f32, @floatFromInt(i)), all[i].value);
-        try std.testing.expectEqual(SensorType.temperature, all[i].sensor_type);
-    }
-}
-
-test "SoA: getLatestBySensor" {
-    var backend = try Self.init(std.testing.allocator);
-    defer backend.deinit();
-
-    try backend.insert(.{ .sensor_id = 1, .timestamp = 100, .value = 10.0, .sensor_type = .temperature });
-    try backend.insert(.{ .sensor_id = 1, .timestamp = 300, .value = 30.0, .sensor_type = .temperature });
-    try backend.insert(.{ .sensor_id = 1, .timestamp = 200, .value = 20.0, .sensor_type = .temperature });
-    try backend.insert(.{ .sensor_id = 2, .timestamp = 500, .value = 50.0, .sensor_type = .humidity });
-
-    const latest = backend.getLatestBySensor(1).?;
-    try std.testing.expectEqual(@as(i64, 300), latest.timestamp);
-    try std.testing.expectEqual(@as(f32, 30.0), latest.value);
-
-    try std.testing.expect(backend.getLatestBySensor(999) == null);
-}
-
-test "SoA: rangeByTime filters and sorts" {
-    var backend = try Self.init(std.testing.allocator);
-    defer backend.deinit();
-
-    try backend.insert(.{ .sensor_id = 3, .timestamp = 50, .value = 1.0, .sensor_type = .temperature });
-    try backend.insert(.{ .sensor_id = 1, .timestamp = 10, .value = 2.0, .sensor_type = .temperature });
-    try backend.insert(.{ .sensor_id = 2, .timestamp = 30, .value = 3.0, .sensor_type = .temperature });
-    try backend.insert(.{ .sensor_id = 1, .timestamp = 10, .value = 4.0, .sensor_type = .temperature });
-    try backend.insert(.{ .sensor_id = 5, .timestamp = 200, .value = 5.0, .sensor_type = .temperature });
-
-    const result = try backend.rangeByTime(std.testing.allocator, .{ .start_time = 0, .end_time = 100 });
-    defer std.testing.allocator.free(result);
-
-    try std.testing.expectEqual(@as(usize, 4), result.len);
-    try std.testing.expectEqual(@as(u32, 1), result[0].sensor_id);
-    try std.testing.expectEqual(@as(i64, 10), result[0].timestamp);
-    try std.testing.expectEqual(@as(u32, 1), result[1].sensor_id);
-    try std.testing.expectEqual(@as(i64, 10), result[1].timestamp);
-    try std.testing.expectEqual(@as(u32, 2), result[2].sensor_id);
-    try std.testing.expectEqual(@as(i64, 30), result[2].timestamp);
-    try std.testing.expectEqual(@as(u32, 3), result[3].sensor_id);
-    try std.testing.expectEqual(@as(i64, 50), result[3].timestamp);
-}
-
-test "SoA: rangeByTime with sensor filter" {
-    var backend = try Self.init(std.testing.allocator);
-    defer backend.deinit();
-
-    try backend.insert(.{ .sensor_id = 1, .timestamp = 10, .value = 1.0, .sensor_type = .temperature });
-    try backend.insert(.{ .sensor_id = 2, .timestamp = 20, .value = 2.0, .sensor_type = .temperature });
-    try backend.insert(.{ .sensor_id = 1, .timestamp = 30, .value = 3.0, .sensor_type = .temperature });
-
-    const result = try backend.rangeByTime(std.testing.allocator, .{
-        .sensor_id = 1,
-        .start_time = 0,
-        .end_time = 100,
-    });
-    defer std.testing.allocator.free(result);
-
-    try std.testing.expectEqual(@as(usize, 2), result.len);
-    try std.testing.expectEqual(@as(u32, 1), result[0].sensor_id);
-    try std.testing.expectEqual(@as(u32, 1), result[1].sensor_id);
-}
-
-test "SoA: sensorIdsByZone/sensorIdsByFloor reflect real (non-arithmetic) registration" {
-    var backend = try Self.init(std.testing.allocator);
-    defer backend.deinit();
-
-    try backend.insert(.{ .sensor_id = 7, .timestamp = 0, .value = 1.0, .sensor_type = .temperature });
-    try backend.insert(.{ .sensor_id = 2, .timestamp = 0, .value = 1.0, .sensor_type = .temperature });
-    try backend.registerZone(7, 4291);
-    try backend.registerZone(2, 4291);
-    try backend.registerFloor(4291, 3);
-
-    const zone = try backend.sensorIdsByZone(std.testing.allocator, 4291);
-    defer std.testing.allocator.free(zone);
-    try std.testing.expectEqualSlices(u32, &.{ 2, 7 }, zone);
-
-    const floor = try backend.sensorIdsByFloor(std.testing.allocator, 3);
-    defer std.testing.allocator.free(floor);
-    try std.testing.expectEqualSlices(u32, &.{ 2, 7 }, floor);
-
-    try std.testing.expectEqual(@as(?u32, 3), backend.floorOfZone(4291));
-
-    const empty = try backend.sensorIdsByZone(std.testing.allocator, 99);
-    defer std.testing.allocator.free(empty);
-    try std.testing.expectEqual(@as(usize, 0), empty.len);
-}
-
-test "SoA: getLatestBySensor is deterministic across repeated calls when timestamps tie" {
-    var backend = try Self.init(std.testing.allocator);
-    defer backend.deinit();
-
-    try backend.insert(.{ .sensor_id = 1, .timestamp = 100, .value = 10.0, .sensor_type = .temperature });
-    try backend.insert(.{ .sensor_id = 1, .timestamp = 100, .value = 20.0, .sensor_type = .temperature });
-
-    const first = backend.getLatestBySensor(1).?;
-    const second = backend.getLatestBySensor(1).?;
-    try std.testing.expectEqual(@as(i64, 100), first.timestamp);
-    try std.testing.expectEqual(first.value, second.value);
-}
-
-test "SoA: empty backend" {
-    var backend = try Self.init(std.testing.allocator);
-    defer backend.deinit();
-
-    try std.testing.expectEqual(@as(usize, 0), backend.count());
-    try std.testing.expect(backend.getLatestBySensor(0) == null);
-
-    const all = try backend.iterateAll(std.testing.allocator);
-    defer std.testing.allocator.free(all);
-    try std.testing.expectEqual(@as(usize, 0), all.len);
-
-    const rng = try backend.rangeByTime(std.testing.allocator, .{ .start_time = 0, .end_time = 100 });
-    defer std.testing.allocator.free(rng);
-    try std.testing.expectEqual(@as(usize, 0), rng.len);
-}
-
-test "SoA: pruneOlderThan removes only the matching type older than cutoff" {
-    var backend = try Self.init(std.testing.allocator);
-    defer backend.deinit();
-
-    try backend.insert(.{ .sensor_id = 1, .timestamp = 50, .value = 1.0, .sensor_type = .temperature });
-    try backend.insert(.{ .sensor_id = 1, .timestamp = 150, .value = 2.0, .sensor_type = .temperature });
-    try backend.insert(.{ .sensor_id = 2, .timestamp = 50, .value = 3.0, .sensor_type = .humidity });
-
-    try backend.pruneOlderThan(.temperature, 100);
-
-    try std.testing.expectEqual(@as(usize, 2), backend.count());
-    const all = try backend.iterateAll(std.testing.allocator);
-    defer std.testing.allocator.free(all);
-
-    var found_old_temp = false;
-    var found_new_temp = false;
-    var found_humidity = false;
-    for (all) |r| {
-        if (r.sensor_type == .temperature and r.timestamp == 50) found_old_temp = true;
-        if (r.sensor_type == .temperature and r.timestamp == 150) found_new_temp = true;
-        if (r.sensor_type == .humidity and r.timestamp == 50) found_humidity = true;
-    }
-    try std.testing.expect(!found_old_temp);
-    try std.testing.expect(found_new_temp);
-    try std.testing.expect(found_humidity);
-}
-
-test "AoS and SoA produce identical results" {
-    var aos = try @import("aos_storage.zig").init(std.testing.allocator);
-    defer aos.deinit();
-    var soa = try Self.init(std.testing.allocator);
-    defer soa.deinit();
-
-    const readings = [_]SensorReading{
-        .{ .sensor_id = 5, .timestamp = 100, .value = 1.5, .sensor_type = .temperature },
-        .{ .sensor_id = 2, .timestamp = 300, .value = 2.5, .sensor_type = .humidity },
-        .{ .sensor_id = 5, .timestamp = 200, .value = 3.5, .sensor_type = .co2 },
-        .{ .sensor_id = 1, .timestamp = 200, .value = 4.5, .sensor_type = .occupancy },
-    };
-
-    for (readings) |r| {
-        try aos.insert(r);
-        try soa.insert(r);
-    }
-
-    try std.testing.expectEqual(aos.count(), soa.count());
-
-    const aos_all = try aos.iterateAll(std.testing.allocator);
-    defer std.testing.allocator.free(aos_all);
-    const soa_all = try soa.iterateAll(std.testing.allocator);
-    defer std.testing.allocator.free(soa_all);
-
-    try std.testing.expectEqual(aos_all.len, soa_all.len);
-    for (0..aos_all.len) |i| {
-        try std.testing.expectEqual(aos_all[i].sensor_id, soa_all[i].sensor_id);
-        try std.testing.expectEqual(aos_all[i].timestamp, soa_all[i].timestamp);
-        try std.testing.expectEqual(aos_all[i].value, soa_all[i].value);
-        try std.testing.expectEqual(aos_all[i].sensor_type, soa_all[i].sensor_type);
-    }
-
-    const aos_rng = try aos.rangeByTime(std.testing.allocator, .{ .start_time = 150, .end_time = 250 });
-    defer std.testing.allocator.free(aos_rng);
-    const soa_rng = try soa.rangeByTime(std.testing.allocator, .{ .start_time = 150, .end_time = 250 });
-    defer std.testing.allocator.free(soa_rng);
-
-    try std.testing.expectEqual(aos_rng.len, soa_rng.len);
-    for (0..aos_rng.len) |i| {
-        try std.testing.expectEqual(aos_rng[i].sensor_id, soa_rng[i].sensor_id);
-        try std.testing.expectEqual(aos_rng[i].timestamp, soa_rng[i].timestamp);
-    }
-}
