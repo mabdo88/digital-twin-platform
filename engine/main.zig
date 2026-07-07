@@ -648,7 +648,7 @@ fn writeRecommendationReport(
         "of the data those queries need, so its latency on them is not comparable.\n\n", .{});
     try md.print(allocator, "| Query | Winner | Median µs | Runner-up | Median µs | Speedup |\n", .{});
     try md.print(allocator, "|---|---|---:|---|---:|---:|\n", .{});
-    try report.writeWinners(&md, allocator, rows, scale_label, &full_retention_names);
+    try report.writeWinners(&md, allocator, rows, scale_label, &full_retention_names, false);
 
     try md.print(allocator, "\nSee `schematic.svg` in this directory for a floor-by-floor map of placed sensors.\n", .{});
 

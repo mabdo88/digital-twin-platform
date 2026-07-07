@@ -348,7 +348,7 @@ pub fn writeReports(
         // null eligibility: the internal regression fixture is small enough
         // that no backend evicts — every backend genuinely holds the full
         // dataset, so all comparisons here are apples-to-apples already.
-        try writeWinners(&md, allocator, rows, ds.name, null);
+        try writeWinners(&md, allocator, rows, ds.name, null, false);
 
         try md.print(allocator, "\n", .{});
     }
@@ -634,6 +634,7 @@ pub fn writeWinners(
     rows: []const RunRow,
     scale: []const u8,
     historical_eligible: ?[]const []const u8,
+    scaled_units: bool,
 ) !void {
     const rowEligible = struct {
         fn check(eligible: ?[]const []const u8, query_name: []const u8, backend: []const u8) bool {
@@ -677,6 +678,9 @@ pub fn writeWinners(
             const best = rows[bi];
             const best_us = @as(f64, @floatFromInt(best.stats.median_ns)) / 1000.0;
 
+            try w.print(allocator, "| {s} | **{s}** | ", .{ r.query, best.backend });
+            try writeScaledUs(w, allocator, best_us, scaled_units);
+
             if (second_idx) |si| {
                 const second = rows[si];
                 const second_us = @as(f64, @floatFromInt(second.stats.median_ns)) / 1000.0;
@@ -685,13 +689,11 @@ pub fn writeWinners(
                         @as(f64, @floatFromInt(best.stats.median_ns))
                 else
                     0.0;
-                try w.print(allocator, "| {s} | **{s}** | {d:.1} | {s} | {d:.1} | {d:.2}× |\n", .{
-                    r.query, best.backend, best_us, second.backend, second_us, speedup,
-                });
+                try w.print(allocator, " | {s} | ", .{second.backend});
+                try writeScaledUs(w, allocator, second_us, scaled_units);
+                try w.print(allocator, " | {d:.2}× |\n", .{speedup});
             } else {
-                try w.print(allocator, "| {s} | **{s}** | {d:.1} | — | — | — |\n", .{
-                    r.query, best.backend, best_us,
-                });
+                try w.print(allocator, " | — | — | — |\n", .{});
             }
         }
     }
@@ -944,4 +946,47 @@ test "isCloseRace: within threshold is close, beyond it is not, fewer than 2 sco
 
     const empty = [_]BackendScore{};
     try std.testing.expect(!isCloseRace(&empty));
+}
+
+// `zig build bench` (bench_main.zig -> runner.run) is currently broken
+// independent of this change — runner.run was removed from runner.zig in an
+// earlier commit (predates this file's scaled_units work) without updating
+// its one caller, so the regression-suite CLI path can't be exercised
+// end-to-end right now. This test exercises writeWinners directly instead,
+// pinning the exact legacy "N.N" plain-µs Markdown writeReports depends on
+// (scaled_units = false) so any future change to writeScaledUs or this
+// function's formatting can't silently drift the regression-suite output.
+test "writeWinners: scaled_units=false reproduces the exact legacy plain-µs format" {
+    const allocator = std.testing.allocator;
+    const stats = struct {
+        fn make(median_ns: i64) metrics.LatencyStats {
+            return .{
+                .iterations = 1,
+                .median_ns = median_ns,
+                .p95_ns = median_ns,
+                .p99_ns = median_ns,
+                .min_ns = median_ns,
+                .max_ns = median_ns,
+                .mean_ns = median_ns,
+                .total_ns = median_ns,
+            };
+        }
+    }.make;
+
+    const rows = [_]RunRow{
+        .{ .scale = "S", .query = "Q1", .backend = "A", .memory_bytes = 0, .stats = stats(1000) },
+        .{ .scale = "S", .query = "Q1", .backend = "B", .memory_bytes = 0, .stats = stats(3000) },
+        .{ .scale = "S", .query = "Q2", .backend = "C", .memory_bytes = 0, .stats = stats(500) },
+    };
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+
+    try writeWinners(&buf, allocator, &rows, "S", null, false);
+
+    try std.testing.expectEqualStrings(
+        "| Q1 | **A** | 1.0 | B | 3.0 | 3.00× |\n" ++
+            "| Q2 | **C** | 0.5 | — | — | — |\n",
+        buf.items,
+    );
 }
