@@ -77,6 +77,37 @@ pub const CompoundRecommendation = struct {
     historical: TrackRecommendation,
 };
 
+/// Auto-scaled human-readable duration — µs below 1000µs, ms below
+/// 1_000_000µs, s otherwise. Used everywhere a raw query latency is
+/// displayed; never applied to scores/coverage/ratios (those stay as
+/// plain numbers). See docs/superpowers/specs/2026-07-06-recommendation-
+/// report-readability-design.md.
+pub const ScaledDuration = struct { value: f64, unit: []const u8 };
+
+pub fn scaleMicros(us: f64) ScaledDuration {
+    if (us < 1000.0) return .{ .value = us, .unit = "µs" };
+    if (us < 100_000.0) return .{ .value = us / 1000.0, .unit = "ms" };
+    return .{ .value = us / 1_000_000.0, .unit = "s" };
+}
+
+/// Writes a raw microsecond value to `w`. `scaled = false` preserves the
+/// exact legacy "N.N" plain-µs formatting (used by the zig build bench
+/// regression suite, which must stay byte-identical); `scaled = true` runs
+/// it through scaleMicros first (used by the per-building recommendation
+/// report). µs values keep 1 decimal; ms/s values use 2.
+pub fn writeScaledUs(w: *std.ArrayList(u8), allocator: std.mem.Allocator, us: f64, scaled: bool) !void {
+    if (!scaled) {
+        try w.print(allocator, "{d:.1}", .{us});
+        return;
+    }
+    const d = scaleMicros(us);
+    if (std.mem.eql(u8, d.unit, "µs")) {
+        try w.print(allocator, "{d:.1}{s}", .{ d.value, d.unit });
+    } else {
+        try w.print(allocator, "{d:.2}{s}", .{ d.value, d.unit });
+    }
+}
+
 /// How much each unit of *uncovered* query weight counts against a backend
 /// in `scoreBackends`'s score (1.0 = as good as tying the per-query
 /// winner; higher is worse). Set above the this/winner ratios functioning
@@ -820,4 +851,22 @@ pub fn writeSimJson(
     try json.print(allocator, "}}\n", .{});
 
     try dir.writeFile(io, .{ .sub_path = "simulation.json", .data = json.items });
+}
+
+test "scaleMicros: stays microseconds below 1000, switches to ms then s at each threshold" {
+    const under = scaleMicros(43.2);
+    try std.testing.expectApproxEqAbs(@as(f64, 43.2), under.value, 0.001);
+    try std.testing.expectEqualStrings("µs", under.unit);
+
+    const ms = scaleMicros(7437.7);
+    try std.testing.expectApproxEqAbs(@as(f64, 7.4377), ms.value, 0.0001);
+    try std.testing.expectEqualStrings("ms", ms.unit);
+
+    const s = scaleMicros(582859.8);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.5828598), s.value, 0.0000001);
+    try std.testing.expectEqualStrings("s", s.unit);
+
+    // Boundary: exactly 1000µs is the first value that becomes ms, not µs.
+    const boundary = scaleMicros(1000.0);
+    try std.testing.expectEqualStrings("ms", boundary.unit);
 }
