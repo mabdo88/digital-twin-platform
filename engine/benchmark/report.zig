@@ -21,8 +21,9 @@ pub const RunRow = struct {
 };
 
 /// Maps a queries.QueryName to the exact query-name string runner.zig's
-/// query_specs use.
-fn queryNameStr(qn: queries.QueryName) []const u8 {
+/// query_specs use. Exported so runner.zig's `run` can build RunRow.query
+/// values without a second hand-maintained copy of this switch.
+pub fn queryNameStr(qn: queries.QueryName) []const u8 {
     return switch (qn) {
         .avg_window => "query_avg_window",
         .avg_zone_type => "query_avg_zone_type",
@@ -89,6 +90,43 @@ pub fn scaleMicros(us: f64) ScaledDuration {
     if (us < 1000.0) return .{ .value = us, .unit = "µs" };
     if (us < 100_000.0) return .{ .value = us / 1000.0, .unit = "ms" };
     return .{ .value = us / 1_000_000.0, .unit = "s" };
+}
+
+/// Escapes the 5 XML predefined entities so untrusted text — IFC zone/room
+/// names, source file paths, none of it validated or under this platform's
+/// control — can't break the structure of generated markup it's embedded
+/// in (a bare `&` or `<` from a vendor-exported name is enough to produce
+/// invalid SVG/HTML). The same five entities are valid in both XML and
+/// HTML, so this one helper covers schematic.zig's SVG output and this
+/// file's HTML report. Caller frees the returned slice.
+pub fn escapeXml(allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    for (text) |c| {
+        switch (c) {
+            '&' => try out.appendSlice(allocator, "&amp;"),
+            '<' => try out.appendSlice(allocator, "&lt;"),
+            '>' => try out.appendSlice(allocator, "&gt;"),
+            '"' => try out.appendSlice(allocator, "&quot;"),
+            '\'' => try out.appendSlice(allocator, "&apos;"),
+            else => try out.append(allocator, c),
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+test "escapeXml: escapes the 5 XML predefined entities, leaves other text untouched" {
+    const allocator = std.testing.allocator;
+    const escaped = try escapeXml(allocator, "M&E Room <Lab> \"East\" O'Brien");
+    defer allocator.free(escaped);
+    try std.testing.expectEqualStrings("M&amp;E Room &lt;Lab&gt; &quot;East&quot; O&apos;Brien", escaped);
+}
+
+test "escapeXml: text with nothing to escape is returned unchanged" {
+    const allocator = std.testing.allocator;
+    const escaped = try escapeXml(allocator, "Room 204");
+    defer allocator.free(escaped);
+    try std.testing.expectEqualStrings("Room 204", escaped);
 }
 
 /// Writes a raw microsecond value to `w`. `scaled = false` preserves the
@@ -160,6 +198,49 @@ fn backendEligible(eligible: ?[]const []const u8, name: []const u8) bool {
         if (std.mem.eql(u8, n, name)) return true;
     }
     return false;
+}
+
+/// Every distinct `RunRow.backend` across `rows`, first-seen order, deduped —
+/// scale-independent (unlike scoreBackends' own per-scale dedup above), for
+/// callers that need the full backend roster the regression suite actually
+/// benchmarked. Caller frees with `allocator`.
+///
+/// Exists so the report header/chip/color-legend can't drift from a
+/// hardcoded backend list again: `writeHtmlReport`'s `backend_names` used
+/// to be a fixed 4-entry array that silently excluded any backend added to
+/// runner.zig's registry afterward (missed "Lake" for a while — it rendered
+/// with the "unknown backend" gray fallback and was omitted from the
+/// subtitle/chip counts and text, even though its rows were in the table).
+pub fn uniqueBackends(allocator: std.mem.Allocator, rows: []const RunRow) ![][]const u8 {
+    var names: std.ArrayList([]const u8) = .empty;
+    errdefer names.deinit(allocator);
+    for (rows) |r| {
+        var seen = false;
+        for (names.items) |n| {
+            if (std.mem.eql(u8, n, r.backend)) {
+                seen = true;
+                break;
+            }
+        }
+        if (!seen) try names.append(allocator, r.backend);
+    }
+    return names.toOwnedSlice(allocator);
+}
+
+/// Chart color palette for the HTML dashboard's per-backend bars, assigned
+/// by a backend's position in `uniqueBackends` output rather than by name —
+/// any number of backends up to this palette's length gets a real color;
+/// beyond that (or for a name not in `roster`, which shouldn't happen when
+/// `roster` itself came from the same rows) it falls back to gray.
+pub const BACKEND_COLOR_PALETTE = [_][]const u8{
+    "#f0b429", "#a78bfa", "#fb923c", "#f472b6", "#4ade80", "#4ea8de", "#f87171",
+};
+
+fn colorForBackend(roster: []const []const u8, name: []const u8) []const u8 {
+    for (roster, 0..) |n, i| {
+        if (std.mem.eql(u8, n, name)) return BACKEND_COLOR_PALETTE[i % BACKEND_COLOR_PALETTE.len];
+    }
+    return "#999";
 }
 
 /// Core scorer behind both `recommendBackend` and `recommendCompound`. Ranks
@@ -348,7 +429,12 @@ pub fn writeReports(
             ds.name, ds.num_sensors, ds.readings_per_sensor, total, ds.iterations,
         });
     }
-    try md.print(allocator, "- Backends: TimeSeries, Columnar, Hierarchical, RingBuffer\n", .{});
+    const backend_roster = try uniqueBackends(allocator, rows);
+    defer allocator.free(backend_roster);
+    try md.print(allocator, "- Backends: ", .{});
+    for (backend_roster, 0..) |b, i| {
+        try md.print(allocator, "{s}{s}", .{ b, if (i + 1 < backend_roster.len) ", " else "\n" });
+    }
     try md.print(allocator, "- Historical rollups (Q7, Q8) exclude RingBuffer (evicts old data).\n\n", .{});
 
     try md.print(allocator, "> Honesty headline: **relative rankings are reliable; absolute numbers are approximate.**\n\n", .{});
@@ -471,8 +557,8 @@ fn writeHtmlReport(
         if (!found) try unique_scales.append(allocator, r.scale);
     }
 
-    const backend_names = [_][]const u8{ "TimeSeries", "Columnar", "Hierarchical", "RingBuffer" };
-    const backend_colors = [_][]const u8{ "#f0b429", "#a78bfa", "#fb923c", "#f472b6" };
+    const backend_roster = try uniqueBackends(allocator, rows);
+    defer allocator.free(backend_roster);
 
     try html.print(allocator, "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n", .{});
     try html.print(allocator, "<meta charset=\"UTF-8\" />\n", .{});
@@ -513,11 +599,15 @@ fn writeHtmlReport(
     // Header
     try html.print(allocator, "<header>\n", .{});
     try html.print(allocator, "<h1>Digital Twin <span class=\"accent\">Multi-Scale Benchmark</span></h1>\n", .{});
-    try html.print(allocator, "<div class=\"subtitle\">{d} specialized backends · {d} scales · pick by workload, not by average</div>\n", .{ backend_names.len, unique_scales.items.len });
+    try html.print(allocator, "<div class=\"subtitle\">{d} specialized backends · {d} scales · pick by workload, not by average</div>\n", .{ backend_roster.len, unique_scales.items.len });
     try html.print(allocator, "<div class=\"meta-row\">\n", .{});
     try html.print(allocator, "<span class=\"chip\"><strong>Iterations</strong>25 / measurement</span>\n", .{});
     try html.print(allocator, "<span class=\"chip\"><strong>Seed</strong>{d}</span>\n", .{fixtures.SEED});
-    try html.print(allocator, "<span class=\"chip\"><strong>Backends</strong>{d} (TimeSeries, Columnar, Hierarchical, RingBuffer)</span>\n", .{backend_names.len});
+    try html.print(allocator, "<span class=\"chip\"><strong>Backends</strong>{d} (", .{backend_roster.len});
+    for (backend_roster, 0..) |b, i| {
+        try html.print(allocator, "{s}{s}", .{ b, if (i + 1 < backend_roster.len) ", " else "" });
+    }
+    try html.print(allocator, ")</span>\n", .{});
     try html.print(allocator, "<span class=\"chip\"><strong>Queries</strong>{d}</span>\n", .{unique_queries.items.len});
     try html.print(allocator, "<span class=\"chip\"><strong>Scales</strong>{d}</span>\n", .{unique_scales.items.len});
     try html.print(allocator, "</div>\n", .{});
@@ -568,13 +658,7 @@ fn writeHtmlReport(
             for (rows) |r| {
                 if (std.mem.eql(u8, r.scale, scale) and std.mem.eql(u8, r.query, query)) {
                     const median_us = @as(f64, @floatFromInt(r.stats.median_ns)) / 1000.0;
-                    var color: []const u8 = "#999";
-                    for (backend_names, backend_colors) |name, col| {
-                        if (std.mem.eql(u8, r.backend, name)) {
-                            color = col;
-                            break;
-                        }
-                    }
+                    const color = colorForBackend(backend_roster, r.backend);
                     try query_results.append(allocator, .{ .backend = r.backend, .median_us = median_us, .color = color });
                 }
             }
@@ -1010,14 +1094,12 @@ test "isCloseRace: within threshold is close, beyond it is not, fewer than 2 sco
     try std.testing.expect(!isCloseRace(&empty));
 }
 
-// `zig build bench` (bench_main.zig -> runner.run) is currently broken
-// independent of this change — runner.run was removed from runner.zig in an
-// earlier commit (predates this file's scaled_units work) without updating
-// its one caller, so the regression-suite CLI path can't be exercised
-// end-to-end right now. This test exercises writeWinners directly instead,
-// pinning the exact legacy "N.N" plain-µs Markdown writeReports depends on
-// (scaled_units = false) so any future change to writeScaledUs or this
-// function's formatting can't silently drift the regression-suite output.
+// This test exercises writeWinners directly (rather than through the full
+// `zig build bench` -> runner.run -> writeReports path, covered end-to-end
+// by runner.zig's own test) so it can pin the exact legacy "N.N" plain-µs
+// Markdown format (scaled_units = false) writeReports depends on — any
+// future change to writeScaledUs or this function's formatting can't
+// silently drift the regression-suite output.
 test "writeWinners: scaled_units=false reproduces the exact legacy plain-µs format" {
     const allocator = std.testing.allocator;
     const stats = struct {
@@ -1053,6 +1135,46 @@ test "writeWinners: scaled_units=false reproduces the exact legacy plain-µs for
     );
 }
 
+test "uniqueBackends: dedups while preserving first-seen order, independent of scale" {
+    const allocator = std.testing.allocator;
+    const zero_stats: metrics.LatencyStats = .{
+        .iterations = 0,
+        .median_ns = 0,
+        .p95_ns = 0,
+        .p99_ns = 0,
+        .min_ns = 0,
+        .max_ns = 0,
+        .mean_ns = 0,
+        .total_ns = 0,
+    };
+    const rows = [_]RunRow{
+        .{ .scale = "S", .query = "Q1", .backend = "TimeSeries", .memory_bytes = 0, .stats = zero_stats },
+        .{ .scale = "S", .query = "Q1", .backend = "Lake", .memory_bytes = 0, .stats = zero_stats },
+        .{ .scale = "M", .query = "Q1", .backend = "TimeSeries", .memory_bytes = 0, .stats = zero_stats },
+        .{ .scale = "S", .query = "Q2", .backend = "Columnar", .memory_bytes = 0, .stats = zero_stats },
+    };
+
+    const names = try uniqueBackends(allocator, &rows);
+    defer allocator.free(names);
+
+    try std.testing.expectEqual(@as(usize, 3), names.len);
+    try std.testing.expectEqualStrings("TimeSeries", names[0]);
+    try std.testing.expectEqualStrings("Lake", names[1]);
+    try std.testing.expectEqualStrings("Columnar", names[2]);
+}
+
+test "colorForBackend: assigns a real color by position past the old 4-entry palette boundary" {
+    // 5 backends — one more than the hardcoded 4-entry array this replaces
+    // used to support; the 5th (Lake) always fell back to the "unknown" gray.
+    const backends = [_][]const u8{ "TimeSeries", "Columnar", "Hierarchical", "RingBuffer", "Lake" };
+
+    const lake_color = colorForBackend(&backends, "Lake");
+    try std.testing.expect(!std.mem.eql(u8, lake_color, "#999"));
+    try std.testing.expectEqualStrings(BACKEND_COLOR_PALETTE[4 % BACKEND_COLOR_PALETTE.len], lake_color);
+
+    try std.testing.expectEqualStrings("#999", colorForBackend(&backends, "Unknown"));
+}
+
 // ---------------------------------------------------------------------------
 // Self-contained HTML dashboard for one per-building `dt --bim` run —
 // mirrors recommendation.md's section order (verdict first, then supporting
@@ -1083,9 +1205,17 @@ pub fn writeBuildingHtmlReport(
     var html: std.ArrayList(u8) = .empty;
     defer html.deinit(allocator);
 
+    // scale_label/bim_path are vendor-controlled (an IFC filename stem) —
+    // escape once, reuse everywhere below, so a name containing &, <, >,
+    // etc. can't break this generated HTML's structure.
+    const escaped_scale_label = try escapeXml(allocator, scale_label);
+    defer allocator.free(escaped_scale_label);
+    const escaped_bim_path = try escapeXml(allocator, bim_path);
+    defer allocator.free(escaped_bim_path);
+
     try html.print(allocator, "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n", .{});
     try html.print(allocator, "<meta charset=\"UTF-8\" />\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" />\n", .{});
-    try html.print(allocator, "<title>{s} — Storage Recommendation</title>\n", .{scale_label});
+    try html.print(allocator, "<title>{s} — Storage Recommendation</title>\n", .{escaped_scale_label});
     try html.print(allocator, "<style>\n", .{});
     try html.print(allocator, "  :root {{ --bg:#0f1419; --panel:#161c24; --panel-2:#1d2530; --border:#2a3441; --text:#e6edf3; --text-dim:#8b97a6; --accent:#4ea8de; --green:#4ade80; --gold:#f0b429; }}\n", .{});
     try html.print(allocator, "  * {{ box-sizing:border-box; margin:0; padding:0; }}\n", .{});
@@ -1108,8 +1238,8 @@ pub fn writeBuildingHtmlReport(
     try html.print(allocator, "  footer {{ margin-top:40px; color:var(--text-dim); font-size:12px; text-align:center; }}\n", .{});
     try html.print(allocator, "</style>\n</head>\n<body>\n<div class=\"container\">\n", .{});
 
-    try html.print(allocator, "<h1>{s}</h1>\n", .{scale_label});
-    try html.print(allocator, "<div class=\"subtitle\">Source: {s}</div>\n", .{bim_path});
+    try html.print(allocator, "<h1>{s}</h1>\n", .{escaped_scale_label});
+    try html.print(allocator, "<div class=\"subtitle\">Source: {s}</div>\n", .{escaped_bim_path});
 
     try html.print(allocator, "<div class=\"verdict\">\n", .{});
     try html.print(allocator, "<p>Use <strong class=\"win\">{s}</strong> for live/latest-value queries.</p>\n", .{compound.realtime.winner});
@@ -1212,7 +1342,7 @@ pub fn writeBuildingHtmlReport(
     }
     try html.print(allocator, "</table></div>\n</details>\n", .{});
 
-    try html.print(allocator, "<footer>Digital Twin recommendation for {s} · relative rankings are reliable, absolute numbers are approximate (CLAUDE.md §6)</footer>\n", .{scale_label});
+    try html.print(allocator, "<footer>Digital Twin recommendation for {s} · relative rankings are reliable, absolute numbers are approximate (CLAUDE.md §6)</footer>\n", .{escaped_scale_label});
     try html.print(allocator, "</div>\n</body>\n</html>\n", .{});
 
     try dir.writeFile(io, .{ .sub_path = "recommendation.html", .data = html.items });

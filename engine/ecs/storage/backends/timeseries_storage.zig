@@ -154,6 +154,18 @@ pub fn rangeByTime(self: *const Self, allocator: std.mem.Allocator, q: RangeQuer
     const start_day = @divFloor(q.start_time, PARTITION_MS);
     const end_day = @divFloor(q.end_time, PARTITION_MS);
 
+    // When scoped to one sensor, narrow the partition scan to that
+    // sensor's own type instead of walking every type's partitions and
+    // filtering per-row — a sensor's type is fixed across all its
+    // readings, and latest_by_sensor already caches it. A sensor with no
+    // resident readings (no entry here) has nothing to return.
+    var only_type: ?SensorType = null;
+    if (q.sensor_id) |sid| {
+        if (self_mut.latest_dirty) self_mut.rebuildLatest();
+        const latest = self.latest_by_sensor.get(sid) orelse return &.{};
+        only_type = latest.sensor_type;
+    }
+
     var result: std.ArrayList(SensorReading) = .empty;
     defer result.deinit(allocator);
 
@@ -161,6 +173,9 @@ pub fn rangeByTime(self: *const Self, allocator: std.mem.Allocator, q: RangeQuer
     while (it.next()) |entry| {
         const key = entry.key_ptr.*;
         if (key.day_index < start_day or key.day_index > end_day) continue;
+        if (only_type) |t| {
+            if (key.sensor_type != t) continue;
+        }
 
         const part = entry.value_ptr;
         if (!part.sorted) self_mut.sortPartition(part);
@@ -195,6 +210,36 @@ pub fn rangeByTime(self: *const Self, allocator: std.mem.Allocator, q: RangeQuer
     }.lt);
 
     return result.toOwnedSlice(allocator);
+}
+
+test "rangeByTime: scoping to one sensor returns only that sensor's readings when another type shares the range" {
+    const allocator = std.testing.allocator;
+    var backend = try Self.init(allocator);
+    defer backend.deinit();
+
+    // Two sensors of DIFFERENT types, overlapping time range/day partition.
+    try backend.insert(.{ .sensor_id = 1, .timestamp = 1000, .value = 10.0, .sensor_type = .temperature });
+    try backend.insert(.{ .sensor_id = 2, .timestamp = 1500, .value = 20.0, .sensor_type = .humidity });
+    try backend.insert(.{ .sensor_id = 1, .timestamp = 2000, .value = 11.0, .sensor_type = .temperature });
+
+    const result = try backend.rangeByTime(allocator, .{ .sensor_id = 1, .start_time = 0, .end_time = 3000 });
+    defer allocator.free(result);
+
+    try std.testing.expectEqual(@as(usize, 2), result.len);
+    for (result) |r| try std.testing.expectEqual(@as(u32, 1), r.sensor_id);
+}
+
+test "rangeByTime: a sensor_id with no resident readings returns empty" {
+    const allocator = std.testing.allocator;
+    var backend = try Self.init(allocator);
+    defer backend.deinit();
+
+    try backend.insert(.{ .sensor_id = 1, .timestamp = 1000, .value = 10.0, .sensor_type = .temperature });
+
+    const result = try backend.rangeByTime(allocator, .{ .sensor_id = 999, .start_time = 0, .end_time = 3000 });
+    defer allocator.free(result);
+
+    try std.testing.expectEqual(@as(usize, 0), result.len);
 }
 
 /// Zone/floor topology bookkeeping delegates to the shared ZoneIndex — see

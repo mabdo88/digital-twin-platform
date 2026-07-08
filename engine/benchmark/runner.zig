@@ -143,6 +143,104 @@ pub fn q12_wrapper(world: anytype, sensor_id: u32, threshold: f32, min_duration_
     _ = try queries.query_threshold_breach(world, sensor_id, threshold, min_duration_ms, window_hours);
 }
 
+// ---------------------------------------------------------------------------
+// run() — the zig build bench entry point. Generates each scale tier's
+// dataset, benchmarks every deployment backend against every query pattern,
+// and writes latency.md/latency.json/benchmark.html.
+// ---------------------------------------------------------------------------
+
+pub const Options = struct { output_dir: []const u8 };
+
+/// Fixed query args for the internal regression fixture. Sensor 0 always
+/// lands in zone 0 / floor 0 / position (0,0,0) under dataset.zig's
+/// topology convention (insertDataset), regardless of scale tier, so these
+/// stay valid across every DatasetSpec in scale_tiers.
+const FIXTURE_SENSOR_ID: u32 = 0;
+const FIXTURE_ZONE_ID: u32 = 0;
+const FIXTURE_FLOOR_ID: u32 = 0;
+const FIXTURE_SENSOR_TYPE: sb.SensorType = .temperature;
+const FIXTURE_POSITION = queries.Vec3{ .x = 0, .y = 0, .z = 0 };
+const FIXTURE_THRESHOLD_VALUE: f32 = 15.0;
+const ONE_HOUR_MS: i64 = 60 * 60 * 1000;
+
+/// timeQuery callable for one query pattern against one backend's World —
+/// same dispatch shape as simulation.zig's runOne, but against the fixed
+/// regression-fixture args above instead of a live sensor's real state.
+fn QueryCaller(comptime W: type) type {
+    return struct {
+        world: *W,
+        query: queries.QueryName,
+
+        fn call(self: *@This()) !void {
+            switch (self.query) {
+                .avg_window => _ = try queries.query_avg_window(self.world, FIXTURE_SENSOR_ID, @as(u32, 24)),
+                .latest_single => try q1_wrapper(self.world, FIXTURE_SENSOR_ID),
+                .latest_zone => try q2_wrapper(self.world, FIXTURE_ZONE_ID),
+                .latest_by_type => try q3_wrapper(self.world, FIXTURE_SENSOR_TYPE),
+                .avg_zone_type => try q5_wrapper(self.world, FIXTURE_ZONE_ID, FIXTURE_SENSOR_TYPE, @as(u32, 24)),
+                .floor_stats => try q6_wrapper(self.world, FIXTURE_FLOOR_ID, FIXTURE_SENSOR_TYPE, @as(u32, 24)),
+                .hourly_rollup => try q7_wrapper(self.world, FIXTURE_SENSOR_ID, @as(u32, 2)),
+                .daily_zone_rollup => try q8_wrapper(self.world, FIXTURE_ZONE_ID, FIXTURE_SENSOR_TYPE),
+                .spatial_radius => try q9_wrapper(self.world, FIXTURE_POSITION, @as(f32, 50.0)),
+                .zone_hierarchy => try q10_wrapper(self.world, FIXTURE_ZONE_ID, @as(u32, 2)),
+                .anomalies => try q11_wrapper(self.world, FIXTURE_SENSOR_TYPE, queries.ANOMALY_STD_DEV_THRESHOLD, queries.ANOMALY_WINDOW_HOURS),
+                .threshold_breach => try q12_wrapper(self.world, FIXTURE_SENSOR_ID, FIXTURE_THRESHOLD_VALUE, ONE_HOUR_MS, queries.THRESHOLD_BREACH_WINDOW_HOURS),
+            }
+        }
+    };
+}
+
+/// Runs every query pattern against every deployment backend for one
+/// dataset spec, returning one RunRow per (query, backend) pair. Caller
+/// frees the returned slice with `allocator`.
+pub fn collectRows(allocator: std.mem.Allocator, io: std.Io, spec: DatasetSpec) ![]report.RunRow {
+    const readings = try generateDatasetScaled(allocator, spec.num_sensors, spec.readings_per_sensor);
+    defer allocator.free(readings);
+
+    var rows: std.ArrayList(report.RunRow) = .empty;
+    errdefer rows.deinit(allocator);
+
+    inline for (backends) |entry| {
+        const W = World(entry.T);
+        var world = try W.init(allocator);
+        defer world.deinit();
+        try insertDataset(&world, readings);
+
+        const memory_bytes = world.memoryUsed();
+
+        for (std.enums.values(queries.QueryName)) |q| {
+            var caller = QueryCaller(W){ .world = &world, .query = q };
+            const stats = try metrics.timeQuery(allocator, io, spec.iterations, QueryCaller(W).call, .{&caller});
+            try rows.append(allocator, .{
+                .scale = spec.name,
+                .query = report.queryNameStr(q),
+                .backend = entry.name,
+                .memory_bytes = memory_bytes,
+                .stats = stats,
+            });
+        }
+    }
+
+    return rows.toOwnedSlice(allocator);
+}
+
+/// The `zig build bench` entry point (called from bench_main.zig): runs
+/// the full multi-scale regression suite — every scale tier × every
+/// deployment backend × every query pattern — and writes latency.md,
+/// latency.json, and benchmark.html under `options.output_dir`.
+pub fn run(allocator: std.mem.Allocator, io: std.Io, options: Options) !void {
+    var all_rows: std.ArrayList(report.RunRow) = .empty;
+    defer all_rows.deinit(allocator);
+
+    for (scale_tiers) |spec| {
+        const rows = try collectRows(allocator, io, spec);
+        defer allocator.free(rows);
+        try all_rows.appendSlice(allocator, rows);
+    }
+
+    try report.writeReports(allocator, io, options.output_dir, all_rows.items);
+}
+
 // query_avg_window/latest_single/latest_zone/latest_by_type/avg_zone_type/
 // floor_stats/hourly_rollup/daily_zone_rollup cross-backend equivalence is
 // proven once, in queries.zig (the canonical home for the 12 query
@@ -153,3 +251,51 @@ pub fn q12_wrapper(world: anytype, sensor_id: u32, threshold: f32, min_duration_
 // the raw World interface methods (getLatestBySensor, rangeByTime), which
 // queries.zig's query-level tests never exercise directly.
 
+test "run: writes latency.md, latency.json, and benchmark.html covering every scale tier and backend" {
+    const allocator = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const cwd = std.Io.Dir.cwd();
+    const out_dir = "zig-cache-test-runner-run";
+    defer cwd.deleteTree(io, out_dir) catch {};
+
+    try run(allocator, io, .{ .output_dir = out_dir });
+
+    var dir = try cwd.openDir(io, out_dir, .{});
+    defer dir.close(io);
+
+    const md = try dir.readFileAlloc(io, "latency.md", allocator, .limited(1024 * 1024));
+    defer allocator.free(md);
+    try std.testing.expect(std.mem.indexOf(u8, md, "Seed: `42`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, md, "query_latest_single") != null);
+    for (scale_tiers) |ds| {
+        try std.testing.expect(std.mem.indexOf(u8, md, ds.name) != null);
+    }
+
+    // The "- Backends:" summary line must list every backend actually
+    // benchmarked (all 5 in `backends`), not a stale hardcoded subset —
+    // regression check for the bug where this line and the HTML dashboard's
+    // header/chip/color-legend silently omitted "Lake" after it was added
+    // to the registry.
+    const backends_line_start = std.mem.indexOf(u8, md, "- Backends:").?;
+    const backends_line_end = std.mem.indexOfPos(u8, md, backends_line_start, "\n").?;
+    const backends_line = md[backends_line_start..backends_line_end];
+    inline for (backends) |entry| {
+        try std.testing.expect(std.mem.indexOf(u8, backends_line, entry.name) != null);
+    }
+
+    const js = try dir.readFileAlloc(io, "latency.json", allocator, .limited(1024 * 1024));
+    defer allocator.free(js);
+    try std.testing.expect(std.mem.indexOf(u8, js, "\"results\"") != null);
+
+    const html = try dir.readFileAlloc(io, "benchmark.html", allocator, .limited(4 * 1024 * 1024));
+    defer allocator.free(html);
+    const chip_start = std.mem.indexOf(u8, html, "<strong>Backends</strong>").?;
+    const chip_end = std.mem.indexOfPos(u8, html, chip_start, "</span>").?;
+    const chip = html[chip_start..chip_end];
+    inline for (backends) |entry| {
+        try std.testing.expect(std.mem.indexOf(u8, chip, entry.name) != null);
+    }
+}

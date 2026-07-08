@@ -646,7 +646,16 @@ fn resolveEquipmentProperties(
 /// entity with its position resolved from the IfcLocalPlacement chain, and
 /// (b) one ZoneMetadata per storey/space.
 fn resolveHierarchy(arena: Allocator, entities: *std.AutoHashMapUnmanaged(u32, Entity)) ParseError!Resolved {
-    // Parent lookup: child_ifc_id -> parent_ifc_id.
+    // Parent lookup: child_ifc_id -> parent_ifc_id. Two explicit passes, not
+    // one loop checking both relation types per entity: IfcRelContained-
+    // InSpatialStructure is the authoritative "physically located in"
+    // relation (what zone/floor placement means); IfcRelAggregates is
+    // compositional (e.g. a storey being part of a building) and can name
+    // the same child under an unrelated, non-spatial parent. Running
+    // ContainedInSpatialStructure as a second, unconditional pass makes it
+    // always win for a child named by both — deterministic regardless of
+    // entities' (HashMap) iteration order, unlike checking both relation
+    // types within a single pass over that same unordered iteration.
     var parent_of: std.AutoHashMapUnmanaged(u32, u32) = .empty;
 
     var it = entities.iterator();
@@ -666,10 +675,17 @@ fn resolveHierarchy(arena: Allocator, entities: *std.AutoHashMapUnmanaged(u32, E
                 }
             }
         }
+    }
+
+    var it_contained = entities.iterator();
+    while (it_contained.next()) |kv| {
+        const e = kv.value_ptr.*;
 
         // IfcRelContainedInSpatialStructure(GlobalId, OwnerHistory, Name,
         //                                    Description, RelatedElements[],
         //                                    RelatingStructure)
+        // Takes precedence over IfcRelAggregates for the same child — see
+        // comment above.
         if (std.mem.eql(u8, e.type_name, "IFCRELCONTAINEDINSPATIALSTRUCTURE") and e.args.len >= 6) {
             const children_arg = e.args[4];
             const parent_arg = e.args[5];
@@ -798,6 +814,63 @@ fn resolveHierarchy(arena: Allocator, entities: *std.AutoHashMapUnmanaged(u32, E
         .zones = try zones.toOwnedSlice(arena),
         .equipment = try equipment.toOwnedSlice(arena),
     };
+}
+
+test "resolveHierarchy: IfcRelContainedInSpatialStructure takes precedence over IfcRelAggregates for the same child" {
+    // Space #4 is named as a child by BOTH relation types, under two
+    // DIFFERENT parents: IfcRelAggregates says storey #3, but
+    // IfcRelContainedInSpatialStructure — the authoritative "physically
+    // located in" relation — says storey #2. The resolved parent must be
+    // #2 deterministically, not whichever relation entity happened to be
+    // visited last in HashMap iteration order.
+    const source =
+        \\DATA;
+        \\#2=IFCBUILDINGSTOREY('g2',$,'Correct Storey',$,$,$,$,$,$,0.0);
+        \\#3=IFCBUILDINGSTOREY('g3',$,'Wrong Storey',$,$,$,$,$,$,0.0);
+        \\#4=IFCSPACE('g4',$,'Space 1',$,$,$,$,$,$);
+        \\#5=IFCRELCONTAINEDINSPATIALSTRUCTURE('g5',$,$,$,(#4),#2);
+        \\#6=IFCRELAGGREGATES('g6',$,$,$,#3,(#4));
+        \\ENDSEC;
+    ;
+
+    var model = try parseSlice(std.testing.allocator, source);
+    defer model.deinit();
+
+    var space: ?BuildingElement = null;
+    for (model.building_elements) |el| {
+        if (el.ifc_id == 4) space = el;
+    }
+    try std.testing.expect(space != null);
+    try std.testing.expectEqual(@as(?u32, 2), space.?.parent_id);
+}
+
+test "resolveHierarchy: precedence holds with the relation entity ids swapped (order-independent)" {
+    // Same scenario as above but with IfcRelAggregates given the LOWER
+    // entity id (#5) and IfcRelContainedInSpatialStructure the higher
+    // (#6) — the opposite arrangement from the test above. The resolved
+    // parent must still be #2: this pins the fix's actual guarantee
+    // (ContainedInSpatialStructure always wins, via a dedicated second
+    // pass) rather than one arrangement that happens to work by luck of
+    // HashMap iteration order.
+    const source =
+        \\DATA;
+        \\#2=IFCBUILDINGSTOREY('g2',$,'Correct Storey',$,$,$,$,$,$,0.0);
+        \\#3=IFCBUILDINGSTOREY('g3',$,'Wrong Storey',$,$,$,$,$,$,0.0);
+        \\#4=IFCSPACE('g4',$,'Space 1',$,$,$,$,$,$);
+        \\#5=IFCRELAGGREGATES('g5',$,$,$,#3,(#4));
+        \\#6=IFCRELCONTAINEDINSPATIALSTRUCTURE('g6',$,$,$,(#4),#2);
+        \\ENDSEC;
+    ;
+
+    var model = try parseSlice(std.testing.allocator, source);
+    defer model.deinit();
+
+    var space: ?BuildingElement = null;
+    for (model.building_elements) |el| {
+        if (el.ifc_id == 4) space = el;
+    }
+    try std.testing.expect(space != null);
+    try std.testing.expectEqual(@as(?u32, 2), space.?.parent_id);
 }
 
 /// Walk an IfcLocalPlacement chain back to a world position.

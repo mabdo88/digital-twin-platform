@@ -350,6 +350,22 @@ pub fn filterTypeScoped(allocator: std.mem.Allocator, mix: []const queries.Query
     return list.toOwnedSlice(allocator);
 }
 
+/// Overwrites `.memory_bytes` on every GrowthPoint from `start_idx` onward
+/// with `memory_bytes` — so every row a checkpoint's query batch produced
+/// reports one consistent snapshot (taken once, after that batch finished)
+/// instead of a value that depended on which query in the batch happened
+/// to run first (CLAUDE.md §3.4's memory-measurement phases collapse to
+/// one number per RunRow/GrowthPoint; this is the "after this batch of
+/// queries" phase, applied uniformly rather than order-dependently).
+fn backfillGrowthMemory(growth: []GrowthPoint, start_idx: usize, memory_bytes: usize) void {
+    for (growth[start_idx..]) |*g| g.memory_bytes = memory_bytes;
+}
+
+/// Same as `backfillGrowthMemory`, for the `report.RunRow` slice.
+fn backfillRowMemory(rows: []report.RunRow, start_idx: usize, memory_bytes: usize) void {
+    for (rows[start_idx..]) |*r| r.memory_bytes = memory_bytes;
+}
+
 /// Time one query ONCE (metrics.timeQuery with a single timed iteration)
 /// against the live world, using one real sensor's args. Single-shot is
 /// the honest measurement here: each checkpoint measures the query
@@ -747,6 +763,8 @@ pub fn simulateAllBackends(
                 std.debug.print("  [{s}] running {d} building-level queries ({d} live readings, {d:.1} MB)...\n", .{
                     b.name, query_mix.len, live_count, @as(f64, @floatFromInt(live_bytes)) / (1024.0 * 1024.0),
                 });
+                const growth_start_idx = growth.items.len;
+                const rows_start_idx = rows.items.len;
                 for (query_mix) |qw| {
                     if (!isHistoricalSupported(b) and isHistorical(qw.query)) continue;
 
@@ -762,7 +780,7 @@ pub fn simulateAllBackends(
                         .backend = b.name,
                         .query = queryName(qw.query),
                         .median_ns = qstats.median_ns,
-                        .memory_bytes = world.memoryUsed(),
+                        .memory_bytes = 0, // backfilled below, once, after the batch
                         .live_bytes = live_bytes,
                         .reading_count = live_count,
                     });
@@ -771,11 +789,18 @@ pub fn simulateAllBackends(
                             .scale = scale_label,
                             .query = queryName(qw.query),
                             .backend = b.name,
-                            .memory_bytes = world.memoryUsed(),
+                            .memory_bytes = 0, // backfilled below, once, after the batch
                             .stats = qstats,
                         });
                     }
                 }
+                // One memory snapshot for the whole batch, taken after every
+                // query in it ran (CLAUDE.md §3.4) — not resampled per query,
+                // which made a row's reported memory depend on its position
+                // in the loop rather than reflecting a real measurement phase.
+                const post_query_memory = world.memoryUsed();
+                backfillGrowthMemory(growth.items, growth_start_idx, post_query_memory);
+                if (is_final) backfillRowMemory(rows.items, rows_start_idx, post_query_memory);
 
                 // Steady state only: the type-scoped per-type queries that
                 // feed the per-sensor-type recommendations, and (once, from
@@ -784,6 +809,7 @@ pub fn simulateAllBackends(
                 // types.
                 if (is_final) {
                     std.debug.print("  [{s}] steady state — running type-scoped queries across {d} sensor types...\n", .{ b.name, type_samples.len });
+                    const type_rows_start_idx = type_rows.items.len;
                     for (type_samples) |group| {
                         const type_mix = synthetic.profileFor(group.sensor_type).relevant_queries;
                         for (type_mix) |qw| {
@@ -795,11 +821,14 @@ pub fn simulateAllBackends(
                                 .scale = @tagName(group.sensor_type),
                                 .query = queryName(qw.query),
                                 .backend = b.name,
-                                .memory_bytes = world.memoryUsed(),
+                                .memory_bytes = 0, // backfilled below, once, after the batch
                                 .stats = qstats,
                             });
                         }
                     }
+                    // Same one-snapshot-per-batch treatment as the building-
+                    // level query mix above.
+                    backfillRowMemory(type_rows.items, type_rows_start_idx, world.memoryUsed());
 
                     if (type_volumes.items.len == 0) {
                         for (type_samples) |group| {
@@ -859,6 +888,46 @@ pub fn simulateAllBackends(
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+
+test "backfillGrowthMemory: overwrites memory_bytes only from start_idx onward" {
+    var growth = [_]GrowthPoint{
+        .{ .sim_day = 1, .label = "a", .backend = "TimeSeries", .query = "q1", .median_ns = 0, .memory_bytes = 111, .live_bytes = 0, .reading_count = 0 },
+        .{ .sim_day = 1, .label = "a", .backend = "TimeSeries", .query = "q2", .median_ns = 0, .memory_bytes = 222, .live_bytes = 0, .reading_count = 0 },
+        .{ .sim_day = 1, .label = "a", .backend = "TimeSeries", .query = "q3", .median_ns = 0, .memory_bytes = 333, .live_bytes = 0, .reading_count = 0 },
+    };
+
+    // Simulates: q1 belonged to an earlier checkpoint (untouched); q2/q3
+    // belong to the checkpoint whose post-query memory snapshot is 999 —
+    // both must end up reporting that SAME value, not whatever
+    // world.memoryUsed() happened to return mid-loop when each was appended.
+    backfillGrowthMemory(&growth, 1, 999);
+
+    try testing.expectEqual(@as(usize, 111), growth[0].memory_bytes);
+    try testing.expectEqual(@as(usize, 999), growth[1].memory_bytes);
+    try testing.expectEqual(@as(usize, 999), growth[2].memory_bytes);
+}
+
+test "backfillRowMemory: overwrites memory_bytes only from start_idx onward" {
+    const zero_stats: metrics.LatencyStats = .{
+        .iterations = 1,
+        .median_ns = 0,
+        .p95_ns = 0,
+        .p99_ns = 0,
+        .min_ns = 0,
+        .max_ns = 0,
+        .mean_ns = 0,
+        .total_ns = 0,
+    };
+    var rows = [_]report.RunRow{
+        .{ .scale = "S", .query = "q1", .backend = "TimeSeries", .memory_bytes = 111, .stats = zero_stats },
+        .{ .scale = "S", .query = "q2", .backend = "TimeSeries", .memory_bytes = 222, .stats = zero_stats },
+    };
+
+    backfillRowMemory(&rows, 1, 999);
+
+    try testing.expectEqual(@as(usize, 111), rows[0].memory_bytes);
+    try testing.expectEqual(@as(usize, 999), rows[1].memory_bytes);
+}
 
 test "simDaysForRetention: short retention gets the 30-day floor margin" {
     // 90d retention -> margin max(30, 90/20=4) = 30 -> 120 sim days.

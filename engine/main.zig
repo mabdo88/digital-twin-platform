@@ -101,12 +101,28 @@ fn findElement(elements: []const ifc.BuildingElement, id: u32) ?ifc.BuildingElem
 fn floorIdForZone(elements: []const ifc.BuildingElement, zone_id: u32, zone_type: ifc.ZoneType) u32 {
     if (zone_type == .storey) return zone_id;
     var current = findElement(elements, zone_id);
-    while (current) |el| {
+    // Bound the walk in case of cyclic parent_id data — same guard as
+    // ifc_parser.resolvePlacement, and the same reason: trusting the input
+    // is how runtime hangs are born. A cycle falls back to the "no
+    // containing storey found" case below, same as an exhausted hierarchy.
+    var hops: usize = 0;
+    while (current) |el| : (hops += 1) {
+        if (hops > 64) break;
         if (el.element_type == .storey) return el.ifc_id;
         current = if (el.parent_id) |pid| findElement(elements, pid) else null;
     }
     // No containing storey found in the hierarchy — the zone is its own floor.
     return zone_id;
+}
+
+test "floorIdForZone: a cyclic parent_id chain does not hang — falls back to the zone's own id" {
+    const elements = [_]ifc.BuildingElement{
+        .{ .ifc_id = 1, .name = "", .element_type = .space, .parent_id = 2, .position = .{ .x = 0, .y = 0, .z = 0 } },
+        .{ .ifc_id = 2, .name = "", .element_type = .space, .parent_id = 1, .position = .{ .x = 0, .y = 0, .z = 0 } },
+    };
+
+    const result = floorIdForZone(&elements, 1, .space);
+    try std.testing.expectEqual(@as(u32, 1), result);
 }
 
 fn buildZoneFloorMap(

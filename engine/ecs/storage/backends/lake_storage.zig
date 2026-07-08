@@ -134,16 +134,7 @@ pub fn insert(self: *Self, reading: SensorReading) !void {
     part.last_ts = reading.timestamp;
 
     // Dictionary-encode sensor_id: look up in dict, or add.
-    var dict_idx: u16 = 0;
-    for (part.sid_dict.items, 0..) |sid, i| {
-        if (sid == reading.sensor_id) {
-            dict_idx = @intCast(i);
-            break;
-        }
-    } else {
-        dict_idx = @intCast(part.sid_dict.items.len);
-        try part.sid_dict.append(self.allocator, reading.sensor_id);
-    }
+    const dict_idx = try sb.dictionaryIndex(self.allocator, &part.sid_dict, reading.sensor_id);
     try part.sid_indices.append(self.allocator, dict_idx);
 
     // Raw values column.
@@ -211,10 +202,25 @@ pub fn getLatestBySensor(self: *const Self, sensor_id: u32) ?SensorReading {
 /// Full linear scan of partitions overlapping the query time range.
 /// Decodes compressed columns on the fly, filtering during decode.
 pub fn rangeByTime(self: *const Self, allocator: std.mem.Allocator, q: RangeQuery) ![]const SensorReading {
+    const self_mut: *Self = @constCast(self);
     if (q.start_time > q.end_time) return &.{};
 
     const start_day = @divFloor(q.start_time, PARTITION_MS);
     const end_day = @divFloor(q.end_time, PARTITION_MS);
+
+    // When scoped to one sensor, narrow the partition scan to that
+    // sensor's own type instead of decoding every time-overlapping
+    // partition regardless of type — decodePartition decompresses the
+    // whole partition, the expensive part of this cold-storage model. A
+    // sensor's type is fixed across all its readings, and latest_by_sensor
+    // already caches it. A sensor with no resident readings (no entry
+    // here) has nothing to return.
+    var only_type: ?SensorType = null;
+    if (q.sensor_id) |sid| {
+        if (self_mut.latest_dirty) self_mut.rebuildLatest();
+        const latest = self.latest_by_sensor.get(sid) orelse return &.{};
+        only_type = latest.sensor_type;
+    }
 
     var result: std.ArrayList(SensorReading) = .empty;
     defer result.deinit(allocator);
@@ -223,6 +229,9 @@ pub fn rangeByTime(self: *const Self, allocator: std.mem.Allocator, q: RangeQuer
     while (it.next()) |entry| {
         const key = entry.key_ptr.*;
         if (key.day_index < start_day or key.day_index > end_day) continue;
+        if (only_type) |t| {
+            if (key.sensor_type != t) continue;
+        }
 
         const part = entry.value_ptr;
         const filter = RangeFilter{

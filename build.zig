@@ -17,6 +17,7 @@ pub fn build(b: *std.Build) void {
         "engine/bim_test.zig",
         "engine/synthetic_test.zig",
         "engine/sim_test.zig",
+        "engine/main.zig",
     };
     for (test_targets) |t| {
         const cmd = b.addSystemCommand(&.{

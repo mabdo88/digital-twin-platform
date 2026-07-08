@@ -263,6 +263,19 @@ pub fn rangeByTime(self: *const Self, allocator: std.mem.Allocator, q: RangeQuer
 
     try self_mut.mergeParts();
 
+    // When scoped to one sensor, narrow the partition scan to that
+    // sensor's own type instead of paying ensurePartitionCompressed/
+    // ensureGranuleIndex setup on every time-overlapping partition
+    // regardless of type. A sensor's type is fixed across all its
+    // readings, and latest_by_sensor already caches it. A sensor with no
+    // resident readings (no entry here) has nothing to return.
+    var only_type: ?SensorType = null;
+    if (q.sensor_id) |sid| {
+        if (self_mut.latest_dirty) self_mut.rebuildLatest();
+        const latest = self.latest_by_sensor.get(sid) orelse return &.{};
+        only_type = latest.sensor_type;
+    }
+
     var result: std.ArrayList(SensorReading) = .empty;
     defer result.deinit(allocator);
 
@@ -270,6 +283,10 @@ pub fn rangeByTime(self: *const Self, allocator: std.mem.Allocator, q: RangeQuer
     while (it.next()) |entry| {
         const key = entry.key_ptr.*;
         const part = entry.value_ptr;
+
+        if (only_type) |t| {
+            if (key.sensor_type != t) continue;
+        }
 
         // Use min_ts/max_ts for pruning instead of day_index, so merged
         // parts spanning multiple days are correctly included.
@@ -487,16 +504,7 @@ fn ensurePartitionCompressed(self: *Self, part: *Partition) !void {
     part.sid_dict.clearRetainingCapacity();
     part.sid_indices.clearRetainingCapacity();
     for (part.sensor_ids.items) |sid| {
-        var dict_idx: u16 = 0;
-        for (part.sid_dict.items, 0..) |d_sid, i| {
-            if (d_sid == sid) {
-                dict_idx = @intCast(i);
-                break;
-            }
-        } else {
-            dict_idx = @intCast(part.sid_dict.items.len);
-            try part.sid_dict.append(self.allocator, sid);
-        }
+        const dict_idx = try sb.dictionaryIndex(self.allocator, &part.sid_dict, sid);
         try part.sid_indices.append(self.allocator, dict_idx);
     }
 
