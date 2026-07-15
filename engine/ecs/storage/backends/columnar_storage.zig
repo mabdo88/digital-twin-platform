@@ -177,40 +177,59 @@ pub fn count(self: *const Self) usize {
     return self.total_count;
 }
 
-/// Reports the compressed footprint across all partitions. Timestamp
-/// and value columns use delta+varint encoding; sensor_id uses dictionary
-/// encoding; sensor_type is eliminated (implicit from partition key).
-///
-/// Disclosed tradeoff: this is a storage-cost proxy for what a real
-/// column store persists to disk, NOT this benchmark's actual resident
-/// RAM. The raw `sensor_ids`/`timestamps`/`values` ArrayLists (see
-/// Partition above) stay fully allocated for every compressed part too —
-/// `rangeByTime`/`iterateAll` scan those raw columns directly rather than
-/// decoding `ts_deltas`/`sid_dict`/`val_deltas` on every query — so this
-/// backend's actual in-process RAM is closer to TimeSeries's uncompressed
-/// footprint than the number below suggests. Fine for comparing on-disk
-/// storage cost across backends; not a live memory measurement for this
-/// one.
+/// Reports actual resident RAM across all partitions. The raw
+/// `sensor_ids`/`timestamps`/`values` ArrayLists (see Partition above) stay
+/// fully allocated even once a partition is compressed — `rangeByTime`/
+/// `iterateAll` scan those raw columns directly rather than decoding
+/// `ts_deltas`/`sid_dict`/`val_deltas` on every query — so the raw columns'
+/// capacity is counted unconditionally, and the compressed columns are
+/// added on top for a compressed partition (they're a second, additional
+/// resident copy, not a replacement). This mirrors the same tradeoff a real
+/// column store makes caching a hot block's decompressed form instead of
+/// re-decoding on every scan: it costs more RAM than disk footprint alone,
+/// and this number reports that true cost rather than an on-disk proxy.
 pub fn memoryUsed(self: *const Self) usize {
     var total: usize = self.partitions.capacity() * (@sizeOf(PartitionKey) + @sizeOf(Partition));
     var it = self.partitions.iterator();
     while (it.next()) |entry| {
         const part = entry.value_ptr;
+        total += part.timestamps.capacity * @sizeOf(i64);
+        total += part.sensor_ids.capacity * @sizeOf(u32);
+        total += part.values.capacity * @sizeOf(f32);
         if (part.compressed) {
-            total += part.ts_deltas.items.len; // compressed timestamps
+            total += part.ts_deltas.items.len; // compressed timestamps (additional, resident)
             total += part.sid_dict.items.len * @sizeOf(u32); // dictionary
             total += part.sid_indices.items.len * @sizeOf(u16); // indices
-            total += part.val_deltas.items.len; // compressed values
-        } else {
-            total += part.timestamps.capacity * @sizeOf(i64);
-            total += part.sensor_ids.capacity * @sizeOf(u32);
-            total += part.values.capacity * @sizeOf(f32);
+            total += part.val_deltas.items.len; // compressed values (additional, resident)
         }
         total += part.granule_marks.items.len * @sizeOf(usize);
         total += part.granule_ts.items.len * @sizeOf(i64);
     }
     total += self.latest_by_sensor.capacity() * (@sizeOf(u32) + @sizeOf(SensorReading));
     return total + self.zone_index.memoryUsed();
+}
+
+test "memoryUsed: compression adds to the resident total, never subtracts from it" {
+    const allocator = std.testing.allocator;
+    var backend = try Self.init(allocator);
+    defer backend.deinit();
+
+    var t: i64 = 0;
+    while (t < 200) : (t += 1) {
+        try backend.insert(.{ .sensor_id = 1, .timestamp = t, .value = @floatFromInt(t), .sensor_type = .temperature });
+    }
+
+    const before = backend.memoryUsed();
+
+    // rangeByTime lazily compresses every overlapping partition.
+    const result = try backend.rangeByTime(allocator, .{ .start_time = 0, .end_time = 1000 });
+    allocator.free(result);
+
+    // The raw columns stay resident and queried directly post-compression
+    // (see memoryUsed's doc comment), so the reported total must never drop
+    // below the pre-compression figure — that would mean the raw columns
+    // silently stopped being counted.
+    try std.testing.expect(backend.memoryUsed() >= before);
 }
 
 /// Iteration order: sorted by (timestamp asc, sensor_id asc).

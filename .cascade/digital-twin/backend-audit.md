@@ -8,6 +8,7 @@ _All backends gained pruneOlderThan (real per-type eviction) 2026-07-01, part of
 _Full-scale audit 2026-07-05 after the first-ever complete hospital-scale run: Lake's description below (2026-07-01 entry) is STALE — it was upgraded from a flat uncompressed array to an S3+Parquet cold-tier model, see update at the end. Hierarchical's mergeAllLeaves rewritten to a heap merge the same week._
 _2026-07-06: the audit's open finding is CLOSED — query_spatial_radius now reads real registered positions (World.registerPosition, sourced from ZoneLocation.position) instead of sensor_id arithmetic. Same day: RingBuffer's simulation eviction stat fixed (derived from ingested − live count, so ring-overwrite eviction is finally visible), and per-type generation-horizon capping landed (Step 4). See `sequential-execution-and-audit.md` for all three._
 _2026-07-07: external verification pass — every backend's and query's claimed real-world analogue checked against outside sources (ClickHouse/InfluxDB/Parquet docs, BAS alarm-management literature, anomaly-detection practice, Prometheus/Grafana query semantics), not just re-read against itself. No code changed. See the dated entry at the end of this file._
+_2026-07-15: one of the two items left open by the 2026-07-07 pass is CLOSED — Columnar's `memoryUsed()` now counts the always-resident raw columns unconditionally instead of only the compressed footprint once compressed. RingBuffer's coverage-penalty finding (2026-06-30) remains open. See the dated entry at the end of this file._
 
 ## Verdict per backend
 
@@ -181,3 +182,17 @@ Every prior entry above is grounded in careful internal reasoning, but none of i
 **Verification method:** `zig build test` run against the working tree (including three files with in-progress, uncommitted realism work — `simulation.zig`'s frequency-derived RingBuffer capacity, `zone_index.zig`'s maintained reverse index, `main.zig`'s IFC data-quality note) — all suites green (21/21, 17/17, 8/8, 3/3, etc.), no regressions.
 
 **Conclusion:** no fabricated or unsupported real-world claim found anywhere in the 7 backends or 12 queries. The one imprecision worth remembering (Parquet DELTA_BINARY_PACKED naming) is cosmetic, already hedged as "analogue" in the code, and does not misrepresent what the implementation actually does. The two items still open going into this pass (`recommendBackend()` not penalizing RingBuffer's low coverage; Columnar's `memoryUsed()` excluding its resident raw working set) remain open — this pass did not re-investigate or resolve them, only confirmed backend/query realism.
+
+---
+
+## Columnar `memoryUsed()` now reports true resident memory (2026-07-15)
+
+Closes the second of the two items the 2026-07-07 pass left open (the first, RingBuffer's coverage penalty, is still open — see the 2026-06-30 entry above).
+
+**The bug:** `memoryUsed()` branched on `part.compressed` — compressed, it reported only `ts_deltas`/`sid_dict`/`sid_indices`/`val_deltas`; uncompressed, only the raw `timestamps`/`sensor_ids`/`values` capacity. But the raw arrays are **never freed** by `ensurePartitionCompressed` — `rangeByTime`/`iterateAll` read them directly rather than decoding the compressed columns on every query (the doc comment above `memoryUsed` always disclosed this). So a compressed partition understated its own reported memory by the full size of its raw columns, every time.
+
+**The fix:** raw column capacity is now counted unconditionally; compressed columns are added on top only when `part.compressed` is true (an additional, not alternative, resident copy). The doc comment no longer frames this as an on-disk storage-cost proxy — it's now the actual resident RAM.
+
+**Downstream effect, worth flagging explicitly:** `cost_model.zig`'s `storage_cost = (memory_bytes / TB) * storage_price_per_tb_year` consumes `memoryUsed()` directly, so Columnar's reported dollar cost and memory figure both increase in any fresh run — this was an understatement being corrected, not a neutral refactor. The checked-in artifacts `releases/benchmark-results/recommendation.md`, `benchmark-results/latency.md`, and `benchmark-results-office/recommendation.md` were all generated under the old logic and are now stale; they need a re-run (`zig build bench`, or `dt --bim ...` for the per-building reports) to reflect the corrected figures, and any historical-track recommendation that was close on cost margin should be re-checked once regenerated.
+
+**Verification:** new test `ecs.storage.backends.columnar_storage.test.memoryUsed: compression adds to the resident total, never subtracts from it` — inserts 200 readings, captures `memoryUsed()` pre-compression, forces compression via an unfiltered `rangeByTime` call, and asserts the post-compression total is never less than the pre-compression baseline (the old bug would have made it drop to roughly the compressed footprint alone, well under the raw-columns baseline). Full suite green, no regressions.

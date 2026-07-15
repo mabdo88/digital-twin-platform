@@ -276,12 +276,17 @@ The same folder also holds **status docs** (read as current state, not as proced
   RingBuffer excluded). The final recommendation per building/type is a deployment
   combo: "<real-time winner> for live queries + <historical winner> for everything
   else." `main.zig` consumes this for both building-level and per-type reports.
-- **RingBuffer eviction sizing — resolved:** flat capacity of 10 readings per
-  sensor for ALL types (no per-type formula). `main.zig` calls
-  `setRetentionHint(sensor_type, 10)` for every placed type before ingest.
-  RingBuffer is a deliberately tiny real-time-only cache; its existing eviction
-  (11th write evicts oldest) handles it. See `storage-redesign-plan.md` for the
-  full reasoning.
+- **RingBuffer eviction sizing — resolved:** one flat capacity applied to every
+  placed type (still no per-type formula), but derived from the building's
+  fastest-sampling placed sensor type rather than a hard-coded constant —
+  revised 2026-07-07 (`simulation.deriveRingBufferCap`/`ringBufferCapForFrequency`),
+  superseding the original 2026-07-01 flat-10 decision. `simulation.zig` calls
+  `setRetentionHint(sensor_type, cap)` for every placed type before ingest,
+  where `cap = max(10, ceil(fastest placed type's frequency_hz))` — e.g. a
+  50Hz type yields a 50-reading cap, 100Hz yields 100. RingBuffer is a
+  deliberately tiny real-time-only cache; its existing eviction (capacity+1th
+  write evicts oldest) handles it. See `storage-redesign-plan.md` for the
+  original reasoning and `sequential-execution-and-audit.md` for the revision.
 - **Calibration:** DuckDB is the primary calibration; vendor benchmarks are optional
   metadata. Not yet built (Phase 8).
 
