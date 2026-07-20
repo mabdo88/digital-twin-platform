@@ -763,6 +763,29 @@ pub fn simulateAllBackends(
                 std.debug.print("  [{s}] running {d} building-level queries ({d} live readings, {d:.1} MB)...\n", .{
                     b.name, query_mix.len, live_count, @as(f64, @floatFromInt(live_bytes)) / (1024.0 * 1024.0),
                 });
+                // Warm up once, untimed, before any query in the mix is
+                // measured. Some backends defer write-time housekeeping to
+                // first read (TimeSeries/Columnar lazily sort/compress a
+                // freshly-ingested day-partition inside rangeByTime) — with
+                // no warmup, whichever query happens to run first absorbs
+                // that one-time rebuild cost while every later query in the
+                // same checkpoint measures against an already-warm
+                // structure, making that first query's own number a poor
+                // proxy for its true steady-state cost (query_avg_window is
+                // always first, since QueryName's declaration order fixes
+                // deriveQueryMix's emission order — see backend-audit.md's
+                // 2026-07-20 entry). Mirrors timeQuery's existing "warm up
+                // once before the timed loop" convention for iterations > 1
+                // (metrics_system.zig), extended to the once-per-checkpoint
+                // granularity: run the first eligible query in the mix once
+                // and discard the result, so the rebuild cost lands before
+                // the timed loop starts rather than inside it.
+                for (query_mix) |warmup_qw| {
+                    if (!isHistoricalSupported(b) and isHistorical(warmup_qw.query)) continue;
+                    _ = try runOne(&world, allocator, io, warmup_qw.query, overall_sample);
+                    break;
+                }
+
                 const growth_start_idx = growth.items.len;
                 const rows_start_idx = rows.items.len;
                 for (query_mix) |qw| {

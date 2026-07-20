@@ -92,7 +92,7 @@
     </div>
     <div class="card">
       <div class="card-label">Known gap</div>
-      <p>Phase 5 (building-type profiles) deliberately removed 2026-06-30 — superseded by per-sensor-type canonical data, see Phase 5 notes. Phase 6 complete: statistical models, failure modes (dropout/stuck/drift), validation, determinism, and 100K-scale all done. Phase 7 complete: per-query winner table, compound recommendations, per-sensor-type recommendations, and cloud-equivalent cost model all implemented. The 25-iteration sampling methodology is retired (single-shot against real data). Phase 8 (DuckDB calibration) hasn't been started.</p>
+      <p>Phase 5 (building-type profiles) deliberately removed 2026-06-30 — superseded by per-sensor-type canonical data, see Phase 5 notes. Phase 6 complete: statistical models, failure modes (dropout/stuck/drift), validation, determinism, and 100K-scale all done. Phase 7 complete: compound recommendations, per-sensor-type recommendations, cloud-equivalent cost model, and (added 2026-07-20) an interactive per-query dashboard with cost-per-million-queries, superseding the old per-query winner table in the per-building report. The 25-iteration sampling methodology is retired (single-shot against real data). Phase 8 (DuckDB calibration) hasn't been started. Measurement artifact found and fixed same day (see backend-audit.md 2026-07-20 entry): query_avg_window was always first in the per-checkpoint query mix and its single-shot timing absorbed each backend's lazy index-rebuild cost after ingest; simulateAllBackends now runs one untimed warmup query per checkpoint before the timed loop starts, confirmed to remove the artifact (TimeSeries's steady-state avg_window dropped from 15354.4µs to 20.7µs). Known test-coverage gap (same backend-audit.md entry, not yet addressed): AoS/SoA/RingBuffer/Lake currently carry zero dedicated unit tests despite historical entries claiming otherwise; only query_spatial_radius has a per-query cross-backend golden test, the template comment for the rest was never followed up on.</p>
     </div>
   </div>
 
@@ -198,7 +198,7 @@ var PHASES = [
     goal: 'Turn measured metrics into a recommendation + transparent cost estimate.',
     tasks: [
       { code: '7.1', title: 'Per-query winner table', done: true,
-        note: 'engine/benchmark/report.zig\'s writeWinners() — per scale, per query, lowest-median backend plus runner-up and speedup ratio. Already existed before the 2026-06-29 recheck; this entry was stale.' },
+        note: 'engine/benchmark/report.zig\'s writeWinners() — per scale, per query, lowest-median backend plus runner-up and speedup ratio. Scope narrowed 2026-07-20: this table is now internal-only, feeding the zig build bench regression-suite report (latency.md/benchmark.html). The per-building recommendation.md/html report replaced its copy of this table with the richer 7.6 dashboard below; writeWinnersHtml (the HTML twin) was deleted as dead code once its only caller went.' },
       { code: '7.2', title: 'Per-sensor-type recommendation', done: true,
         note: 'Implemented 2026-07-01 as compound per-type recommendations: main.zig runs recommendCompound for each placed sensor type, scoped to that type\'s canonical type-scoped queries. Results shown in console output and recommendation.md. The old per-building-type recommendBackend() is removed; EXPECTED_WINNERS table removed; recommendations are now compound (real-time track + historical track) per building and per sensor type.' },
       { code: '7.3', title: 'Cost model + formula', done: true,
@@ -206,7 +206,9 @@ var PHASES = [
       { code: '7.4', title: 'Naive vs optimised cost comparison', done: true,
         note: 'Implemented 2026-07-01 alongside 7.3. naiveTotalCost sums all deployment backends; optimisedCost computes just the compound recommendation\'s two winners (real-time + historical) with query cost split by real-time fraction. Savings $ and % shown in recommendation.md.' },
       { code: '7.5', title: 'JSON + Markdown output', done: true,
-        note: 'latency.md / latency.json / benchmark.html cover raw per-query latency. recommendation.md (written by main.zig) emits the compound recommendation: real-time winner + historical winner, per-building and per-sensor-type, plus a cloud-equivalent cost estimate (7.3-7.4).' }
+        note: 'latency.md / latency.json / benchmark.html cover raw per-query latency. recommendation.md (written by main.zig) emits the compound recommendation: real-time winner + historical winner, per-building and per-sensor-type, plus a cloud-equivalent cost estimate (7.3-7.4).' },
+      { code: '7.6', title: 'Per-query dashboard with cost, markdown + interactive HTML', done: true,
+        note: 'Implemented 2026-07-20: report.perQueryResults() ranks every query\'s eligible backends (same full-retention eligibility rule as the compound tracks, via queries.familyOf) and attaches each backend\'s amortized cost per million queries (total annual cost / queries-per-year, so storage footprint differentiates backends, not just query volume which is identical for all). writePerQueryMarkdown renders it in recommendation.md; writeBuildingHtmlReport renders an interactive twin in recommendation.html with click-to-sort columns and family-filter chips (self-contained inline JS, no external requests). Superseded the old redundant "Per-query winner" table (7.1) in the per-building report.' }
     ]
   },
   {
@@ -235,7 +237,7 @@ function render() {
   var donePct = Math.round((doneTasks / totalTasks) * 100);
 
   document.getElementById('subtitle').textContent =
-    'Headless storage-benchmarking engine · Zig + ECS · 8 phases · ' + totalTasks + ' tasks · rechecked 2026-07-01';
+    'Headless storage-benchmarking engine · Zig + ECS · 8 phases · ' + totalTasks + ' tasks · rechecked 2026-07-20';
   document.getElementById('donePct').textContent = donePct + '% complete';
   document.getElementById('doneFrac').textContent = doneTasks + ' / ' + totalTasks;
   document.getElementById('overallBar').style.width = donePct + '%';
