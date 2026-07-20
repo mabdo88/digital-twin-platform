@@ -502,7 +502,30 @@ pub fn main(init: std.process.Init) !void {
     }
 
     std.debug.print("\n[6/6] Writing reports...\n", .{});
-    try writeRecommendationReport(allocator, io, args.output_dir, args.bim_path, scale_label, model, placement, compound, rows.items, type_recommendations.items, growth.items, sim_stats.items, type_volumes.items, type_quality.items);
+
+    // Get all backend names from runner registry
+    const all_backend_names = comptime blk: {
+        var names: [runner.backends.len][]const u8 = undefined;
+        for (runner.backends, 0..) |b, i| names[i] = b.name;
+        break :blk names;
+    };
+
+    // Compute cost estimates for the recommendation report
+    const cost_estimates = try cost_model.estimateAll(allocator, rows.items, &all_backend_names, cost_model.DEFAULT_WORKLOAD, cost_model.DEFAULT_PRICING);
+    defer allocator.free(cost_estimates);
+
+    // Amortized cost per query, per backend: total annual cost (storage +
+    // query) / queries per year. Total — not just query_cost_year, which is
+    // volume-based and therefore identical for every backend; storage
+    // footprint is what actually differentiates them.
+    var cost_per_query_map: std.StringHashMap(f64) = .init(allocator);
+    defer cost_per_query_map.deinit();
+    for (cost_estimates) |e| {
+        const per_query = e.total_cost_year / @as(f64, @floatFromInt(cost_model.DEFAULT_WORKLOAD.queries_per_year));
+        try cost_per_query_map.put(e.backend, per_query);
+    }
+
+    try writeRecommendationReport(allocator, io, args.output_dir, args.bim_path, scale_label, model, placement, compound, rows.items, type_recommendations.items, growth.items, sim_stats.items, type_volumes.items, type_quality.items, cost_per_query_map);
     std.debug.print("  Wrote recommendation.md + recommendation.html + simulation.json to {s}/\n", .{args.output_dir});
 
     const sd = try buildSchematicData(allocator, model, placement, zone_floor);
@@ -538,6 +561,7 @@ fn writeRecommendationReport(
     sim_stats: []const sim.SimStats,
     type_volumes: []const sim.TypeVolume,
     type_quality: []const sim.TypeQuality,
+    backend_cost_per_query: std.StringHashMap(f64),
 ) !void {
     var md: std.ArrayList(u8) = .empty;
     defer md.deinit(allocator);
@@ -660,6 +684,15 @@ fn writeRecommendationReport(
 
     try md.print(allocator, "**Deployment combo: {s} (live) + {s} (historical)**\n\n", .{ compound.realtime.winner, compound.historical.winner });
 
+    // Per-query dashboard: winner + runner-up + amortized cost for every
+    // query, under the same eligibility rule as the tracks above.
+    const query_rankings = try report.perQueryResults(allocator, rows, scale_label, backend_cost_per_query, &full_retention_names);
+    defer {
+        for (query_rankings) |q| allocator.free(q.results);
+        allocator.free(query_rankings);
+    }
+    try report.writePerQueryMarkdown(&md, allocator, query_rankings);
+
     if (type_recommendations.len > 0) {
         var placed_type_count: u32 = 0;
         for (counts) |c| {
@@ -718,44 +751,29 @@ fn writeRecommendationReport(
         });
     }
 
-    // Explicit per-query winner — the direct answer to "which backend for
-    // this query behavior": for each query pattern this building actually
-    // runs, the single fastest backend at steady state, not left for the
-    // reader to eyeball out of the raw latency table above. Same grouping
-    // logic the internal regression-suite report already uses
-    // (report.writeReports), reused rather than reimplemented. Non-real-time
-    // queries only admit full-retention backends — same eligibility rule the
-    // compound recommendation applies, so a count-capped cache that scanned
-    // 200x less data can't be presented as a "winner" (see writeWinners's
-    // doc comment).
-    try md.print(allocator, "\n### Per-query winner (lowest median)\n\n", .{});
-    try md.print(allocator, "For queries outside the real-time family, only full-retention backends compete " ++
-        "(same rule as the recommendation tracks above) — the real-time cache holds a fraction " ++
-        "of the data those queries need, so its latency on them is not comparable.\n\n", .{});
-    try md.print(allocator, "| Query | Winner | Median | Runner-up | Median | Speedup |\n", .{});
-    try md.print(allocator, "|---|---|---:|---|---:|---:|\n", .{});
-    try report.writeWinners(&md, allocator, rows, scale_label, &full_retention_names, true);
     try md.print(allocator, "\n</details>\n\n", .{});
 
     try md.print(allocator, "See `schematic.svg` in this directory for a floor-by-floor map of placed sensors.\n\n", .{});
 
     // Cost estimate — cloud-equivalent $/year per backend + naive vs optimised
-    const all_backend_names = comptime blk: {
-        var names: [runner.backends.len][]const u8 = undefined;
-        for (runner.backends, 0..) |b, i| names[i] = b.name;
-        break :blk names;
-    };
     // Real-time queries are ~3 of 12 patterns; estimate their fraction of
     // total query volume (latest_* are high-frequency, ~1/sec each, while
     // historical/aggregate are ~1/min — so real-time is the majority of
     // total query count).
     const realtime_query_fraction = 0.7;
 
-    const cost_estimates = try cost_model.estimateAll(allocator, rows, &all_backend_names, cost_model.DEFAULT_WORKLOAD, cost_model.DEFAULT_PRICING);
-    defer allocator.free(cost_estimates);
+    const all_backend_names_inner = comptime blk: {
+        var names: [runner.backends.len][]const u8 = undefined;
+        for (runner.backends, 0..) |b, i| names[i] = b.name;
+        break :blk names;
+    };
+
+    const cost_estimates_for_table = try cost_model.estimateAll(allocator, rows, &all_backend_names_inner, cost_model.DEFAULT_WORKLOAD, cost_model.DEFAULT_PRICING);
+    defer allocator.free(cost_estimates_for_table);
+
     var cost_rows: std.ArrayList(report.CostRow) = .empty;
     defer cost_rows.deinit(allocator);
-    for (cost_estimates) |e| {
+    for (cost_estimates_for_table) |e| {
         try cost_rows.append(allocator, .{
             .backend = e.backend,
             .storage_gb = e.storage_tb * 1024.0,
@@ -764,14 +782,14 @@ fn writeRecommendationReport(
             .total_cost_year = e.total_cost_year,
         });
     }
-    const naive_cost = cost_model.naiveTotalCost(rows, &all_backend_names, cost_model.DEFAULT_WORKLOAD, cost_model.DEFAULT_PRICING);
+    const naive_cost = cost_model.naiveTotalCost(rows, &all_backend_names_inner, cost_model.DEFAULT_WORKLOAD, cost_model.DEFAULT_PRICING);
     const optimised_cost = cost_model.optimisedCost(rows, compound.realtime.winner, compound.historical.winner, realtime_query_fraction, cost_model.DEFAULT_WORKLOAD, cost_model.DEFAULT_PRICING);
 
     try cost_model.writeCostSection(
         &md,
         allocator,
         rows,
-        &all_backend_names,
+        &all_backend_names_inner,
         compound.realtime.winner,
         compound.historical.winner,
         realtime_query_fraction,
@@ -805,7 +823,7 @@ fn writeRecommendationReport(
         compound,
         type_recommendations,
         rows,
-        &full_retention_names,
+        query_rankings,
         growth,
         sim_stats,
         cost_rows.items,

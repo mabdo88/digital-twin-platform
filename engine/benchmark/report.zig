@@ -129,6 +129,88 @@ test "escapeXml: text with nothing to escape is returned unchanged" {
     try std.testing.expectEqualStrings("Room 204", escaped);
 }
 
+/// Format nanoseconds as scaled microseconds (same scaling logic as latencies).
+fn formatNs(ns: i64) ScaledDuration {
+    const us = @as(f64, @floatFromInt(ns)) / 1000.0;
+    return scaleMicros(us);
+}
+
+/// Display label for a query family in the report tables (hyphenated, unlike
+/// the enum tag).
+fn familyLabel(f: queries.QueryFamily) []const u8 {
+    return switch (f) {
+        .real_time => "real-time",
+        .aggregation => "aggregation",
+        .historical => "historical",
+        .spatial => "spatial",
+        .anomaly => "anomaly",
+    };
+}
+
+/// Returns `query_results` sorted by family (real-time first, following enum
+/// order) then query name. Caller frees.
+fn sortedRankings(allocator: std.mem.Allocator, query_results: []const QueryRanking) ![]QueryRanking {
+    const sorted = try allocator.dupe(QueryRanking, query_results);
+    std.mem.sort(QueryRanking, sorted, {}, struct {
+        fn lt(_: void, lhs: QueryRanking, rhs: QueryRanking) bool {
+            const lf = @intFromEnum(lhs.family);
+            const rf = @intFromEnum(rhs.family);
+            if (lf != rf) return lf < rf;
+            return std.mem.lessThan(u8, lhs.query_name, rhs.query_name);
+        }
+    }.lt);
+    return sorted;
+}
+
+/// Write the per-query dashboard: for each query this building runs, the
+/// fastest eligible backend, its latency, the runner-up margin, and the
+/// winner's amortized cost per million queries. Grouped by family
+/// (real-time first), then query name. Backend eligibility is already
+/// applied by perQueryResults — see its doc comment.
+pub fn writePerQueryMarkdown(
+    md: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    query_results: []const QueryRanking,
+) !void {
+    try md.print(allocator, "## Per-query dashboard\n\n", .{});
+    if (query_results.len == 0) {
+        try md.print(allocator, "No per-query results available.\n\n", .{});
+        return;
+    }
+
+    const sorted = try sortedRankings(allocator, query_results);
+    defer allocator.free(sorted);
+
+    try md.print(allocator, "The direct per-query answer behind the two-track recommendation above: for every query " ++
+        "pattern this building runs, the fastest backend at steady state. Non-real-time queries only admit " ++
+        "full-retention backends (same rule as the tracks — the count-capped real-time cache scanned a fraction " ++
+        "of the data, an incomparable measurement). Cost/M is the winner's total annual cost (storage + query) " ++
+        "amortized per million queries.\n\n", .{});
+    try md.print(allocator, "| Family | Query | Winner | Latency | Runner-up | Speedup | Cost/M queries |\n", .{});
+    try md.print(allocator, "|---|---|---|---:|---|---:|---:|\n", .{});
+
+    for (sorted) |qr| {
+        if (qr.results.len == 0) continue;
+
+        const winner = qr.results[0];
+        const winner_us = @as(f64, @floatFromInt(winner.median_ns)) / 1000.0;
+        try md.print(allocator, "| {s} | {s} | **{s}** | ", .{ familyLabel(qr.family), qr.query_name, winner.backend });
+        try writeScaledUs(md, allocator, winner_us, true);
+
+        if (qr.results.len > 1) {
+            const runner = qr.results[1];
+            const speedup = if (winner.median_ns > 0)
+                @as(f64, @floatFromInt(runner.median_ns)) / @as(f64, @floatFromInt(winner.median_ns))
+            else
+                0.0;
+            try md.print(allocator, " | {s} | {d:.2}× | ${d:.4} |\n", .{ runner.backend, speedup, winner.cost_per_query * 1_000_000.0 });
+        } else {
+            try md.print(allocator, " | — | — | ${d:.4} |\n", .{winner.cost_per_query * 1_000_000.0});
+        }
+    }
+    try md.print(allocator, "\n", .{});
+}
+
 /// Writes a raw microsecond value to `w`. `scaled = false` preserves the
 /// exact legacy "N.N" plain-µs formatting (used by the zig build bench
 /// regression suite, which must stay byte-identical); `scaled = true` runs
@@ -177,6 +259,26 @@ pub const CostRow = struct {
     storage_cost_year: f64,
     query_cost_year: f64,
     total_cost_year: f64,
+};
+
+/// One backend's result for a single query — latency percentiles and the
+/// backend's amortized cost per single query execution (USD; total annual
+/// cost / queries per year, so storage footprint differentiates backends).
+pub const QueryBackendResult = struct {
+    backend: []const u8,
+    median_ns: i64,
+    p95_ns: i64,
+    p99_ns: i64,
+    cost_per_query: f64,
+};
+
+/// All eligible backends' results for one query, sorted by median latency
+/// ascending — `results[0]` is the winner. `family` uses the same
+/// queries.familyOf classification the compound recommendation splits on.
+pub const QueryRanking = struct {
+    query_name: []const u8,
+    results: []QueryBackendResult,
+    family: queries.QueryFamily,
 };
 
 /// How much each unit of *uncovered* query weight counts against a backend
@@ -375,6 +477,90 @@ pub fn recommendCompound(
             .winner = if (hist_scores.len > 0) hist_scores[0].backend else "none",
         },
     };
+}
+
+/// Compute per-query rankings for a given scale: for each unique query, the
+/// eligible backends sorted fastest-first, each carrying its amortized
+/// cost-per-query (from `backend_cost_per_query`, keyed by backend name).
+/// Applies the SAME eligibility rule writeWinners / recommendCompound use:
+/// non-real-time queries only admit `historical_eligible` backends — the
+/// count-capped real-time cache scanned a fraction of the data those queries
+/// need, an incomparable measurement (see writeWinners's doc comment).
+/// Caller frees each ranking's `results` slice and the outer slice.
+pub fn perQueryResults(
+    allocator: std.mem.Allocator,
+    rows: []const RunRow,
+    scale: []const u8,
+    backend_cost_per_query: std.StringHashMap(f64),
+    historical_eligible: ?[]const []const u8,
+) ![]QueryRanking {
+    var results: std.ArrayList(QueryRanking) = .empty;
+    errdefer {
+        for (results.items) |qr| allocator.free(qr.results);
+        results.deinit(allocator);
+    }
+
+    var seen: std.ArrayList([]const u8) = .empty;
+    defer seen.deinit(allocator);
+
+    for (rows) |r| {
+        if (!std.mem.eql(u8, r.scale, scale)) continue;
+
+        var already = false;
+        for (seen.items) |s| {
+            if (std.mem.eql(u8, s, r.query)) {
+                already = true;
+                break;
+            }
+        }
+        if (already) continue;
+        try seen.append(allocator, r.query);
+
+        // Unrecognized query names stay unfiltered — same fallback
+        // findWinnerAndRunnerUp's rowEligible applies.
+        const query_name = queryNameFromStr(r.query);
+        const family: queries.QueryFamily = if (query_name) |q| queries.familyOf(q) else .aggregation;
+        const restrict = query_name != null and family != .real_time;
+
+        var backend_results: std.ArrayList(QueryBackendResult) = .empty;
+        defer backend_results.deinit(allocator);
+
+        for (rows) |cand| {
+            if (!std.mem.eql(u8, cand.scale, scale)) continue;
+            if (!std.mem.eql(u8, cand.query, r.query)) continue;
+            if (restrict and !backendEligible(historical_eligible, cand.backend)) continue;
+            var dup = false;
+            for (backend_results.items) |br| {
+                if (std.mem.eql(u8, br.backend, cand.backend)) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (dup) continue;
+            try backend_results.append(allocator, .{
+                .backend = cand.backend,
+                .median_ns = cand.stats.median_ns,
+                .p95_ns = cand.stats.p95_ns,
+                .p99_ns = cand.stats.p99_ns,
+                .cost_per_query = backend_cost_per_query.get(cand.backend) orelse 0.0,
+            });
+        }
+        if (backend_results.items.len == 0) continue;
+
+        std.mem.sort(QueryBackendResult, backend_results.items, {}, struct {
+            fn lt(_: void, lhs: QueryBackendResult, rhs: QueryBackendResult) bool {
+                return lhs.median_ns < rhs.median_ns;
+            }
+        }.lt);
+
+        try results.append(allocator, .{
+            .query_name = r.query,
+            .results = try backend_results.toOwnedSlice(allocator),
+            .family = family,
+        });
+    }
+
+    return results.toOwnedSlice(allocator);
 }
 
 /// A track's top two backends count as a "close race" when within this
@@ -794,11 +980,9 @@ pub fn writeWinners(
 /// Result of scanning `rows` for one query's fastest backend (winner) and
 /// second-fastest (runner-up) at `scale`, respecting the same eligibility
 /// rule scoreBackends/recommendCompound apply (non-real-time queries only
-/// admit `historical_eligible` backends when it's non-null). Shared by
-/// writeWinners (Markdown) and writeWinnersHtml (HTML) below so the two
-/// renderers can't drift on selection logic while each still emits its own
-/// cell format. Returns null when no eligible backend has data for this
-/// query.
+/// admit `historical_eligible` backends when it's non-null). Used by
+/// writeWinners (the regression-suite Markdown report). Returns null when no
+/// eligible backend has data for this query.
 const WinnerPair = struct {
     winner: RunRow,
     runner_up: ?RunRow,
@@ -1178,11 +1362,13 @@ test "colorForBackend: assigns a real color by position past the old 4-entry pal
 // ---------------------------------------------------------------------------
 // Self-contained HTML dashboard for one per-building `dt --bim` run —
 // mirrors recommendation.md's section order (verdict first, then supporting
-// detail, heaviest tables collapsed behind <details>). Plain HTML/CSS only:
-// no JS, no external requests, no charting library — same hand-rolled-
-// static-asset spirit as schematic.zig's SVG output. Distinct from
-// writeHtmlReport above (the zig build bench regression-suite dashboard);
-// this function is never called from writeReports.
+// detail, heaviest tables collapsed behind <details>). Hand-rolled HTML/CSS
+// with one small inline vanilla-JS block (per-query dashboard sorting +
+// family filtering — same self-contained-inline-script pattern as
+// writeHtmlReport's scale tabs): no external requests, no charting library —
+// same hand-rolled-static-asset spirit as schematic.zig's SVG output.
+// Distinct from writeHtmlReport above (the zig build bench regression-suite
+// dashboard); this function is never called from writeReports.
 // ---------------------------------------------------------------------------
 
 pub fn writeBuildingHtmlReport(
@@ -1195,7 +1381,7 @@ pub fn writeBuildingHtmlReport(
     compound: CompoundRecommendation,
     type_recommendations: []const TypeRecommendation,
     rows: []const RunRow,
-    full_retention_names: []const []const u8,
+    query_rankings: []const QueryRanking,
     growth: []const sim_mod.GrowthPoint,
     sim_stats: []const sim_mod.SimStats,
     cost_rows: []const CostRow,
@@ -1235,6 +1421,12 @@ pub fn writeBuildingHtmlReport(
     try html.print(allocator, "  details {{ background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:12px 16px; margin:16px 0; }}\n", .{});
     try html.print(allocator, "  summary {{ cursor:pointer; font-weight:600; padding:4px 0; }}\n", .{});
     try html.print(allocator, "  .scroll {{ overflow-x:auto; }}\n", .{});
+    try html.print(allocator, "  .chips {{ margin:10px 0; display:flex; gap:8px; flex-wrap:wrap; }}\n", .{});
+    try html.print(allocator, "  .chip {{ background:var(--panel-2); border:1px solid var(--border); color:var(--text-dim); border-radius:14px; padding:3px 12px; font-size:12px; cursor:pointer; }}\n", .{});
+    try html.print(allocator, "  .chip.active {{ background:var(--accent); color:var(--bg); border-color:var(--accent); }}\n", .{});
+    try html.print(allocator, "  th.sortable {{ cursor:pointer; user-select:none; }}\n", .{});
+    try html.print(allocator, "  th.sortable:hover {{ color:var(--text); }}\n", .{});
+    try html.print(allocator, "  th.sorted-asc::after {{ content:' \\25B4'; }}\n  th.sorted-desc::after {{ content:' \\25BE'; }}\n", .{});
     try html.print(allocator, "  footer {{ margin-top:40px; color:var(--text-dim); font-size:12px; text-align:center; }}\n", .{});
     try html.print(allocator, "</style>\n</head>\n<body>\n<div class=\"container\">\n", .{});
 
@@ -1281,6 +1473,57 @@ pub fn writeBuildingHtmlReport(
     try writeScoreTableHtml(&html, allocator, "Real-time track", compound.realtime.scores);
     try writeScoreTableHtml(&html, allocator, "Historical track", compound.historical.scores);
 
+    if (query_rankings.len > 0) {
+        const sorted_rankings = try sortedRankings(allocator, query_rankings);
+        defer allocator.free(sorted_rankings);
+
+        try html.print(allocator, "<h2>Per-query dashboard</h2>\n", .{});
+        try html.print(allocator, "<p style=\"color:var(--text-dim);font-size:13px;margin-bottom:4px\">The fastest eligible backend for every query this building runs. " ++
+            "Non-real-time queries only admit full-retention backends (same rule as the tracks). " ++
+            "Cost/M is the winner's total annual cost amortized per million queries. " ++
+            "Click a column header to sort; click a chip to filter by family.</p>\n", .{});
+        try html.print(allocator, "<div class=\"chips\" id=\"pq-chips\"><span class=\"chip active\" data-family=\"all\">all</span>", .{});
+        // One chip per family that actually appears (sorted_rankings is
+        // family-ordered, so a family's rows are contiguous).
+        var last_family: ?queries.QueryFamily = null;
+        for (sorted_rankings) |qr| {
+            if (last_family == qr.family) continue;
+            last_family = qr.family;
+            try html.print(allocator, "<span class=\"chip\" data-family=\"{s}\">{s}</span>", .{ familyLabel(qr.family), familyLabel(qr.family) });
+        }
+        try html.print(allocator, "</div>\n", .{});
+
+        try html.print(allocator, "<div class=\"scroll\"><table id=\"pq-table\">\n<thead><tr>", .{});
+        try html.print(allocator, "<th class=\"sortable\" data-col=\"0\">Family</th><th class=\"sortable\" data-col=\"1\">Query</th><th class=\"sortable\" data-col=\"2\">Winner</th>" ++
+            "<th class=\"sortable\" data-col=\"3\" data-num=\"1\">Latency</th><th>Runner-up</th>" ++
+            "<th class=\"sortable\" data-col=\"5\" data-num=\"1\">Speedup</th><th class=\"sortable\" data-col=\"6\" data-num=\"1\">Cost/M queries</th>", .{});
+        try html.print(allocator, "</tr></thead>\n<tbody>\n", .{});
+        for (sorted_rankings) |qr| {
+            if (qr.results.len == 0) continue;
+            const winner = qr.results[0];
+            const winner_us = @as(f64, @floatFromInt(winner.median_ns)) / 1000.0;
+            const cost_per_m = winner.cost_per_query * 1_000_000.0;
+            try html.print(allocator, "<tr data-family=\"{s}\"><td>{s}</td><td>{s}</td><td><strong style=\"color:var(--green)\">{s}</strong></td>", .{
+                familyLabel(qr.family), familyLabel(qr.family), qr.query_name, winner.backend,
+            });
+            try html.print(allocator, "<td data-v=\"{d}\">", .{winner.median_ns});
+            try writeScaledUs(&html, allocator, winner_us, true);
+            try html.print(allocator, "</td>", .{});
+            if (qr.results.len > 1) {
+                const runner = qr.results[1];
+                const speedup = if (winner.median_ns > 0)
+                    @as(f64, @floatFromInt(runner.median_ns)) / @as(f64, @floatFromInt(winner.median_ns))
+                else
+                    0.0;
+                try html.print(allocator, "<td>{s}</td><td data-v=\"{d:.4}\">{d:.2}×</td>", .{ runner.backend, speedup, speedup });
+            } else {
+                try html.print(allocator, "<td>—</td><td data-v=\"0\">—</td>", .{});
+            }
+            try html.print(allocator, "<td data-v=\"{d:.6}\">${d:.4}</td></tr>\n", .{ cost_per_m, cost_per_m });
+        }
+        try html.print(allocator, "</tbody></table></div>\n", .{});
+    }
+
     if (type_recommendations.len > 0) {
         try html.print(allocator, "<h2>Recommendation by sensor type</h2>\n", .{});
         for (type_recommendations) |tr| {
@@ -1299,10 +1542,6 @@ pub fn writeBuildingHtmlReport(
         try writeScaledUs(&html, allocator, @as(f64, @floatFromInt(r.stats.p95_ns)) / 1000.0, true);
         try html.print(allocator, "</td><td>{d:.1}</td></tr>\n", .{@as(f64, @floatFromInt(r.memory_bytes)) / 1024.0});
     }
-    try html.print(allocator, "</table></div>\n", .{});
-    try html.print(allocator, "<h3 style=\"font-size:14px;margin:16px 0 6px\">Per-query winner (lowest median)</h3>\n", .{});
-    try html.print(allocator, "<div class=\"scroll\"><table>\n<tr><th>Query</th><th>Winner</th><th>Median</th><th>Runner-up</th><th>Median</th><th>Speedup</th></tr>\n", .{});
-    try writeWinnersHtml(&html, allocator, rows, scale_label, full_retention_names);
     try html.print(allocator, "</table></div>\n</details>\n", .{});
 
     try html.print(allocator, "<h2>Cost estimate (cloud-equivalent)</h2>\n", .{});
@@ -1343,7 +1582,50 @@ pub fn writeBuildingHtmlReport(
     try html.print(allocator, "</table></div>\n</details>\n", .{});
 
     try html.print(allocator, "<footer>Digital Twin recommendation for {s} · relative rankings are reliable, absolute numbers are approximate (CLAUDE.md §6)</footer>\n", .{escaped_scale_label});
-    try html.print(allocator, "</div>\n</body>\n</html>\n", .{});
+    try html.print(allocator, "</div>\n", .{});
+
+    // Per-query dashboard interactivity: column sorting + family-chip
+    // filtering. Self-contained vanilla JS, no external requests — same
+    // inline-script pattern as writeHtmlReport's scale tabs. Numeric columns
+    // sort on each cell's data-v attribute (raw ns / ratio / $) so display
+    // formatting (unit scaling, × suffix) never affects ordering.
+    try html.print(allocator, "<script>\n", .{});
+    try html.print(allocator, "(function() {{\n", .{});
+    try html.print(allocator, "  const table = document.getElementById('pq-table');\n", .{});
+    try html.print(allocator, "  if (!table) return;\n", .{});
+    try html.print(allocator, "  const tbody = table.querySelector('tbody');\n", .{});
+    try html.print(allocator, "  table.querySelectorAll('th.sortable').forEach(th => {{\n", .{});
+    try html.print(allocator, "    th.addEventListener('click', () => {{\n", .{});
+    try html.print(allocator, "      const col = parseInt(th.getAttribute('data-col'), 10);\n", .{});
+    try html.print(allocator, "      const numeric = th.hasAttribute('data-num');\n", .{});
+    try html.print(allocator, "      const asc = !th.classList.contains('sorted-asc');\n", .{});
+    try html.print(allocator, "      table.querySelectorAll('th').forEach(h => h.classList.remove('sorted-asc', 'sorted-desc'));\n", .{});
+    try html.print(allocator, "      th.classList.add(asc ? 'sorted-asc' : 'sorted-desc');\n", .{});
+    try html.print(allocator, "      const key = tr => {{\n", .{});
+    try html.print(allocator, "        const cell = tr.children[col];\n", .{});
+    try html.print(allocator, "        return numeric ? parseFloat(cell.getAttribute('data-v') || '0') : cell.textContent.trim();\n", .{});
+    try html.print(allocator, "      }};\n", .{});
+    try html.print(allocator, "      Array.from(tbody.rows)\n", .{});
+    try html.print(allocator, "        .sort((a, b) => {{\n", .{});
+    try html.print(allocator, "          const ka = key(a), kb = key(b);\n", .{});
+    try html.print(allocator, "          const cmp = numeric ? ka - kb : String(ka).localeCompare(String(kb));\n", .{});
+    try html.print(allocator, "          return asc ? cmp : -cmp;\n", .{});
+    try html.print(allocator, "        }})\n", .{});
+    try html.print(allocator, "        .forEach(tr => tbody.appendChild(tr));\n", .{});
+    try html.print(allocator, "    }});\n", .{});
+    try html.print(allocator, "  }});\n", .{});
+    try html.print(allocator, "  document.querySelectorAll('#pq-chips .chip').forEach(chip => {{\n", .{});
+    try html.print(allocator, "    chip.addEventListener('click', () => {{\n", .{});
+    try html.print(allocator, "      document.querySelectorAll('#pq-chips .chip').forEach(c => c.classList.remove('active'));\n", .{});
+    try html.print(allocator, "      chip.classList.add('active');\n", .{});
+    try html.print(allocator, "      const fam = chip.getAttribute('data-family');\n", .{});
+    try html.print(allocator, "      Array.from(tbody.rows).forEach(tr => {{\n", .{});
+    try html.print(allocator, "        tr.style.display = (fam === 'all' || tr.getAttribute('data-family') === fam) ? '' : 'none';\n", .{});
+    try html.print(allocator, "      }});\n", .{});
+    try html.print(allocator, "    }});\n", .{});
+    try html.print(allocator, "  }});\n", .{});
+    try html.print(allocator, "}})();\n", .{});
+    try html.print(allocator, "</script>\n</body>\n</html>\n", .{});
 
     try dir.writeFile(io, .{ .sub_path = "recommendation.html", .data = html.items });
 }
@@ -1373,47 +1655,3 @@ fn writeScoreTableHtml(
     try html.print(allocator, "</table></div>\n", .{});
 }
 
-/// HTML-table equivalent of writeWinners above — same findWinnerAndRunnerUp
-/// selection helper, rendered as <tr> rows instead of Markdown pipes.
-fn writeWinnersHtml(
-    html: *std.ArrayList(u8),
-    allocator: std.mem.Allocator,
-    rows: []const RunRow,
-    scale: []const u8,
-    historical_eligible: ?[]const []const u8,
-) !void {
-    var seen: std.ArrayList([]const u8) = .empty;
-    defer seen.deinit(allocator);
-
-    for (rows) |r| {
-        if (!std.mem.eql(u8, r.scale, scale)) continue;
-        var already = false;
-        for (seen.items) |s| {
-            if (std.mem.eql(u8, s, r.query)) {
-                already = true;
-                break;
-            }
-        }
-        if (already) continue;
-        try seen.append(allocator, r.query);
-
-        const pair = findWinnerAndRunnerUp(rows, scale, r.query, historical_eligible) orelse continue;
-        const best_us = @as(f64, @floatFromInt(pair.winner.stats.median_ns)) / 1000.0;
-
-        try html.print(allocator, "<tr><td>{s}</td><td><strong>{s}</strong></td><td>", .{ r.query, pair.winner.backend });
-        try writeScaledUs(html, allocator, best_us, true);
-        try html.print(allocator, "</td>", .{});
-        if (pair.runner_up) |second| {
-            const second_us = @as(f64, @floatFromInt(second.stats.median_ns)) / 1000.0;
-            const speedup = if (pair.winner.stats.median_ns > 0)
-                @as(f64, @floatFromInt(second.stats.median_ns)) / @as(f64, @floatFromInt(pair.winner.stats.median_ns))
-            else
-                0.0;
-            try html.print(allocator, "<td>{s}</td><td>", .{second.backend});
-            try writeScaledUs(html, allocator, second_us, true);
-            try html.print(allocator, "</td><td>{d:.2}×</td></tr>\n", .{speedup});
-        } else {
-            try html.print(allocator, "<td>—</td><td>—</td><td>—</td></tr>\n", .{});
-        }
-    }
-}
