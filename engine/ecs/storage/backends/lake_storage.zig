@@ -145,10 +145,10 @@ pub fn insert(self: *Self, reading: SensorReading) !void {
 
     if (self.latest_by_sensor.get(reading.sensor_id)) |current| {
         if (reading.timestamp > current.timestamp) {
-            self.latest_by_sensor.put(reading.sensor_id, reading) catch {};
+            try self.latest_by_sensor.put(reading.sensor_id, reading);
         }
     } else {
-        self.latest_by_sensor.put(reading.sensor_id, reading) catch {};
+        try self.latest_by_sensor.put(reading.sensor_id, reading);
     }
 }
 
@@ -194,7 +194,11 @@ pub fn iterateAll(self: *const Self, allocator: std.mem.Allocator) ![]const Sens
 
 pub fn getLatestBySensor(self: *const Self, sensor_id: u32) ?SensorReading {
     const self_mut: *Self = @constCast(self);
-    if (self_mut.latest_dirty) self_mut.rebuildLatest();
+    // Fixed by the StorageBackend interface (?SensorReading, no error
+    // union) — an OOM here has nowhere to propagate, unlike rangeByTime/
+    // allSensorIds below, which are already fallible and `try` this same
+    // rebuild. Swallowing is the structural floor for this one call site.
+    if (self_mut.latest_dirty) self_mut.rebuildLatest() catch {};
     return self_mut.latest_by_sensor.get(sensor_id);
 }
 
@@ -217,7 +221,7 @@ pub fn rangeByTime(self: *const Self, allocator: std.mem.Allocator, q: RangeQuer
     // here) has nothing to return.
     var only_type: ?SensorType = null;
     if (q.sensor_id) |sid| {
-        if (self_mut.latest_dirty) self_mut.rebuildLatest();
+        if (self_mut.latest_dirty) try self_mut.rebuildLatest();
         const latest = self.latest_by_sensor.get(sid) orelse return &.{};
         only_type = latest.sensor_type;
     }
@@ -280,7 +284,7 @@ pub fn allSensorIds(self: *const Self, allocator: std.mem.Allocator) ![]u32 {
     defer result.deinit(allocator);
 
     const self_mut: *Self = @constCast(self);
-    if (self_mut.latest_dirty) self_mut.rebuildLatest();
+    if (self_mut.latest_dirty) try self_mut.rebuildLatest();
     var it = self_mut.latest_by_sensor.keyIterator();
     while (it.next()) |k| try result.append(allocator, k.*);
 
@@ -332,7 +336,7 @@ pub fn pruneOlderThan(self: *Self, sensor_type: SensorType, cutoff_timestamp: i6
     self.latest_dirty = true;
 }
 
-fn rebuildLatest(self: *Self) void {
+fn rebuildLatest(self: *Self) !void {
     self.latest_by_sensor.clearRetainingCapacity();
     var it = self.partitions.iterator();
     while (it.next()) |entry| {
@@ -354,10 +358,10 @@ fn rebuildLatest(self: *Self) void {
             };
             if (self.latest_by_sensor.get(sid)) |current| {
                 if (prev_ts > current.timestamp) {
-                    self.latest_by_sensor.put(sid, reading) catch {};
+                    try self.latest_by_sensor.put(sid, reading);
                 }
             } else {
-                self.latest_by_sensor.put(sid, reading) catch {};
+                try self.latest_by_sensor.put(sid, reading);
             }
         }
     }
@@ -508,6 +512,91 @@ fn readVarint(buf: []const u8, pos: *usize) u64 {
         shift += 7;
     }
     return result;
+}
+
+// ---------------------------------------------------------------------------
+// Tests — this file had none until 2026-07-20, despite owning the most
+// complex encode/decode and retention logic of any backend (delta+zigzag+
+// varint timestamps, dictionary-encoded sensor_ids, whole-partition-drop
+// retention with boundary-partition compaction). Tested black-box through
+// the public interface, matching this codebase's existing style (e.g.
+// columnar_storage.zig's memoryUsed test).
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+
+test "insert/rangeByTime: timestamp delta+zigzag+varint and sensor_id dictionary encoding round-trip exactly, including negative deltas and dictionary reuse" {
+    const allocator = testing.allocator;
+    var backend = try Self.init(allocator);
+    defer backend.deinit();
+
+    // Non-monotonic timestamps for the same sensor force a negative delta
+    // on the second insert (100 -> 50), exercising zigzag's negative-number
+    // path. Sensor 1 appears three times, sensor 2 once — sensor 1 must
+    // reuse the SAME dictionary entry, not append duplicates.
+    try backend.insert(.{ .sensor_id = 1, .timestamp = 100, .value = 1.5, .sensor_type = .temperature });
+    try backend.insert(.{ .sensor_id = 1, .timestamp = 50, .value = 2.5, .sensor_type = .temperature });
+    try backend.insert(.{ .sensor_id = 2, .timestamp = 75, .value = 3.5, .sensor_type = .temperature });
+    try backend.insert(.{ .sensor_id = 1, .timestamp = 200, .value = 4.5, .sensor_type = .temperature });
+
+    const result = try backend.rangeByTime(allocator, .{ .start_time = 0, .end_time = 1000 });
+    defer allocator.free(result);
+
+    // Ordered by timestamp ascending, ties broken by sensor_id ascending.
+    try testing.expectEqual(@as(usize, 4), result.len);
+    const expected = [_]SensorReading{
+        .{ .sensor_id = 1, .timestamp = 50, .value = 2.5, .sensor_type = .temperature },
+        .{ .sensor_id = 2, .timestamp = 75, .value = 3.5, .sensor_type = .temperature },
+        .{ .sensor_id = 1, .timestamp = 100, .value = 1.5, .sensor_type = .temperature },
+        .{ .sensor_id = 1, .timestamp = 200, .value = 4.5, .sensor_type = .temperature },
+    };
+    for (result, expected) |got, want| {
+        try testing.expectEqual(want.sensor_id, got.sensor_id);
+        try testing.expectEqual(want.timestamp, got.timestamp);
+        try testing.expectEqual(want.value, got.value);
+        try testing.expectEqual(want.sensor_type, got.sensor_type);
+    }
+
+    // Dictionary reuse: only 2 distinct sensor_ids were ever inserted, so
+    // the partition's dictionary must hold exactly 2 entries, not 4 (one
+    // per insert) — a bug here would still pass the round-trip check above
+    // but silently waste the compression this backend exists to provide.
+    var it = backend.partitions.iterator();
+    const part = it.next().?.value_ptr;
+    try testing.expectEqual(@as(usize, 2), part.sid_dict.items.len);
+}
+
+test "pruneOlderThan: drops whole partitions before the cutoff, compacts the boundary partition, leaves later partitions and other types untouched" {
+    const allocator = testing.allocator;
+    var backend = try Self.init(allocator);
+    defer backend.deinit();
+
+    const day: i64 = 86_400_000;
+
+    // Day 0: fully before the cutoff -> whole partition dropped.
+    // Day 1: cutoff falls inside it -> boundary compaction.
+    // Day 2: fully after the cutoff -> untouched.
+    try backend.insert(.{ .sensor_id = 1, .timestamp = day / 2, .value = 1, .sensor_type = .temperature });
+    try backend.insert(.{ .sensor_id = 1, .timestamp = day + 100, .value = 2, .sensor_type = .temperature });
+    try backend.insert(.{ .sensor_id = 1, .timestamp = day + day / 2, .value = 3, .sensor_type = .temperature });
+    try backend.insert(.{ .sensor_id = 1, .timestamp = 2 * day + 100, .value = 4, .sensor_type = .temperature });
+
+    // Humidity readings across the same three days must be completely
+    // unaffected by pruning temperature.
+    try backend.insert(.{ .sensor_id = 2, .timestamp = day / 2, .value = 10, .sensor_type = .humidity });
+    try backend.insert(.{ .sensor_id = 2, .timestamp = 2 * day + 100, .value = 11, .sensor_type = .humidity });
+
+    const cutoff = day + day / 2; // inside day 1, keeps day1's second half and all of day 2
+    try backend.pruneOlderThan(.temperature, cutoff);
+
+    const surviving_temp = try backend.rangeByTime(allocator, .{ .start_time = 0, .end_time = 10 * day, .sensor_id = 1 });
+    defer allocator.free(surviving_temp);
+    try testing.expectEqual(@as(usize, 2), surviving_temp.len);
+    for (surviving_temp) |r| try testing.expect(r.timestamp >= cutoff);
+
+    const surviving_humidity = try backend.rangeByTime(allocator, .{ .start_time = 0, .end_time = 10 * day, .sensor_id = 2 });
+    defer allocator.free(surviving_humidity);
+    try testing.expectEqual(@as(usize, 2), surviving_humidity.len);
 }
 
 // ---------------------------------------------------------------------------

@@ -961,18 +961,31 @@ pub fn query_latest_by_type(world: anytype, sensor_type: sb.SensorType) ![]const
 }
 
 // ---------------------------------------------------------------------------
-// Golden-result equivalence test
+// Golden-result equivalence tests
 //
-// This is the TEMPLATE for every future backend-equivalence test:
-//   1. Seed a deterministic PRNG with a fixed seed.
-//   2. Generate the SAME synthetic dataset once.
-//   3. Insert it into World(AoS) and World(SoA) independently.
-//   4. Run the query on both worlds.
-//   5. Assert results agree within a documented float tolerance.
+// CLAUDE.md §3.2: "All backends must produce identical query results for
+// the same input." Until 2026-07-20 this was NOT actually checked anywhere
+// in the codebase — this comment block previously described a template and
+// claimed (both here and in runner.zig) that 8 of the 12 query patterns'
+// equivalence was "proven once, in queries.zig." Neither was true: the only
+// test that existed (query_spatial_radius below) exercises a single backend
+// (AoS) for a boundary/edge-case property, not cross-backend agreement, and
+// runner.zig's own claimed equivalence checks didn't exist either. Rechecked
+// against the live tree, not assumed from the comment — same lesson this
+// project has hit before with backend-audit.md's stale claims.
 //
-// The tolerance is 1e-5 (absolute). This is generous for f32 summation of
-// a few hundred values — the real goal is catching logic divergences
-// between backends, not numerical noise from different iteration orders.
+// `allQueriesEquivalent` below closes the actual gap: one dataset, inserted
+// into all 7 backends (the 5 deployment candidates plus AoS/SoA, the
+// worst-case reference baselines), all 12 query patterns run against each,
+// compared field-by-field against AoS as the reference. Aggregation fields
+// (avg/z_score) use a float tolerance (1e-4, generous for f32 summation of
+// a few hundred values); everything else (counts, ids, timestamps, sorted
+// order) must match exactly. The shared dataset.zig fixture (50
+// readings/sensor) sits well under RingBuffer's 1000/sensor default
+// capacity, so no eviction occurs and RingBuffer is expected to agree on
+// every query, including the historical-rollup patterns it's excluded from
+// in real deployment (that exclusion is about incomplete data after real
+// eviction, not a difference in query logic).
 // ---------------------------------------------------------------------------
 
 const aos = @import("../ecs/storage/backends/aos_storage.zig");
@@ -981,6 +994,7 @@ const timeseries = @import("../ecs/storage/backends/timeseries_storage.zig");
 const columnar = @import("../ecs/storage/backends/columnar_storage.zig");
 const hierarchical = @import("../ecs/storage/backends/hierarchical_storage.zig");
 const ringbuffer = @import("../ecs/storage/backends/ringbuffer_storage.zig");
+const lake = @import("../ecs/storage/backends/lake_storage.zig");
 const World = @import("../ecs/world.zig").World;
 
 // Shared dataset fixtures + zone/floor topology — the single source of truth.
@@ -1019,5 +1033,169 @@ test "query_spatial_radius: registered positions decide membership — boundary 
     defer allocator.free(result);
 
     try std.testing.expectEqualSlices(EntityId, &.{ 1, 2 }, result);
+}
+
+/// Every query pattern's result for one backend, bundled so
+/// `allQueriesEquivalent` can generate+insert the dataset once per backend,
+/// run all 12 patterns in a single pass, and compare the whole bundle
+/// against a reference. Slice fields are owned; free with `deinit`.
+const AllQueryResults = struct {
+    latest_single: ?sb.SensorReading,
+    latest_zone: []const sb.SensorReading,
+    latest_by_type: []const sb.SensorReading,
+    avg_window: f32,
+    avg_zone_type: f32,
+    floor_stats: Stats,
+    hourly_rollup: []HourlyAggregate,
+    daily_zone_rollup: []DailyAggregate,
+    spatial_radius: []EntityId,
+    zone_hierarchy: []EntityId,
+    anomalies: []AnomalyResult,
+    threshold_breach: ?BreachEvent,
+
+    fn deinit(self: @This(), allocator: std.mem.Allocator) void {
+        allocator.free(self.latest_zone);
+        allocator.free(self.latest_by_type);
+        allocator.free(self.hourly_rollup);
+        allocator.free(self.daily_zone_rollup);
+        allocator.free(self.spatial_radius);
+        allocator.free(self.zone_hierarchy);
+        allocator.free(self.anomalies);
+    }
+};
+
+/// Runs all 12 query patterns against a fresh World(B) seeded with the
+/// shared dataset.zig fixture. Fixture args (sensor 0 / zone 0 / floor 0 /
+/// origin) are valid for every backend because insertDataset's topology
+/// convention places sensor 0 there regardless of backend type.
+fn runAllQueries(comptime B: type, allocator: std.mem.Allocator, readings: []const sb.SensorReading) !AllQueryResults {
+    var world = try World(B).init(allocator);
+    defer world.deinit();
+    try insertDataset(&world, readings);
+
+    const sensor_id: u32 = 0;
+    const zone_id: u32 = 0;
+    const floor_id: u32 = 0;
+    const sensor_type: sb.SensorType = .temperature;
+    const position = Vec3{ .x = 0, .y = 0, .z = 0 };
+    const one_hour_ms: i64 = 60 * 60 * 1000;
+
+    return .{
+        .latest_single = try query_latest_single(&world, sensor_id),
+        .latest_zone = try query_latest_zone(&world, zone_id),
+        .latest_by_type = try query_latest_by_type(&world, sensor_type),
+        .avg_window = try query_avg_window(&world, sensor_id, 24),
+        .avg_zone_type = try query_avg_zone_type(&world, zone_id, sensor_type, 24),
+        .floor_stats = try query_floor_stats(&world, floor_id, sensor_type, 24),
+        .hourly_rollup = try query_hourly_rollup(&world, sensor_id, 2),
+        .daily_zone_rollup = try query_daily_zone_rollup(&world, zone_id, sensor_type),
+        .spatial_radius = try query_spatial_radius(&world, position, 50.0),
+        .zone_hierarchy = try query_zone_hierarchy(&world, zone_id, 2),
+        .anomalies = try query_anomalies(&world, sensor_type, 2.5, 24),
+        .threshold_breach = try query_threshold_breach(&world, sensor_id, 15.0, one_hour_ms, 24),
+    };
+}
+
+const EQUIV_TOLERANCE: f32 = 1e-4;
+
+fn expectStatsEqual(expected: Stats, got: Stats) !void {
+    try std.testing.expectApproxEqAbs(expected.min, got.min, EQUIV_TOLERANCE);
+    try std.testing.expectApproxEqAbs(expected.max, got.max, EQUIV_TOLERANCE);
+    try std.testing.expectApproxEqAbs(expected.avg, got.avg, EQUIV_TOLERANCE);
+}
+
+fn expectReadingEqual(expected: sb.SensorReading, got: sb.SensorReading) !void {
+    try std.testing.expectEqual(expected.sensor_id, got.sensor_id);
+    try std.testing.expectEqual(expected.timestamp, got.timestamp);
+    try std.testing.expectEqual(expected.sensor_type, got.sensor_type);
+    try std.testing.expectApproxEqAbs(expected.value, got.value, EQUIV_TOLERANCE);
+}
+
+fn expectReadingSlicesEqual(expected: []const sb.SensorReading, got: []const sb.SensorReading) !void {
+    try std.testing.expectEqual(expected.len, got.len);
+    for (expected, got) |e, g| try expectReadingEqual(e, g);
+}
+
+/// Compares every field of two AllQueryResults bundles for one backend
+/// against the AoS reference. Any divergence here means that backend's
+/// query logic (or the generic World(T) layer it routes through) disagrees
+/// with the reference on real data — exactly the class of bug CLAUDE.md
+/// §3.2 requires this suite to catch.
+fn expectAllQueriesEqual(backend_name: []const u8, expected: AllQueryResults, got: AllQueryResults) !void {
+    errdefer std.debug.print("query equivalence mismatch: backend={s}\n", .{backend_name});
+
+    if (expected.latest_single) |e| {
+        try expectReadingEqual(e, got.latest_single.?);
+    } else {
+        try std.testing.expect(got.latest_single == null);
+    }
+    try expectReadingSlicesEqual(expected.latest_zone, got.latest_zone);
+    try expectReadingSlicesEqual(expected.latest_by_type, got.latest_by_type);
+    try std.testing.expectApproxEqAbs(expected.avg_window, got.avg_window, EQUIV_TOLERANCE);
+    try std.testing.expectApproxEqAbs(expected.avg_zone_type, got.avg_zone_type, EQUIV_TOLERANCE);
+    try expectStatsEqual(expected.floor_stats, got.floor_stats);
+
+    try std.testing.expectEqual(expected.hourly_rollup.len, got.hourly_rollup.len);
+    for (expected.hourly_rollup, got.hourly_rollup) |e, g| {
+        try std.testing.expectEqual(e.hour_bucket, g.hour_bucket);
+        try std.testing.expectEqual(e.count, g.count);
+        try std.testing.expectApproxEqAbs(e.avg, g.avg, EQUIV_TOLERANCE);
+        try std.testing.expectApproxEqAbs(e.min, g.min, EQUIV_TOLERANCE);
+        try std.testing.expectApproxEqAbs(e.max, g.max, EQUIV_TOLERANCE);
+    }
+
+    try std.testing.expectEqual(expected.daily_zone_rollup.len, got.daily_zone_rollup.len);
+    for (expected.daily_zone_rollup, got.daily_zone_rollup) |e, g| {
+        try std.testing.expectEqual(e.day_bucket, g.day_bucket);
+        try std.testing.expectEqual(e.count, g.count);
+        try std.testing.expectApproxEqAbs(e.avg, g.avg, EQUIV_TOLERANCE);
+        try std.testing.expectApproxEqAbs(e.min, g.min, EQUIV_TOLERANCE);
+        try std.testing.expectApproxEqAbs(e.max, g.max, EQUIV_TOLERANCE);
+    }
+
+    try std.testing.expectEqualSlices(EntityId, expected.spatial_radius, got.spatial_radius);
+    try std.testing.expectEqualSlices(EntityId, expected.zone_hierarchy, got.zone_hierarchy);
+
+    try std.testing.expectEqual(expected.anomalies.len, got.anomalies.len);
+    for (expected.anomalies, got.anomalies) |e, g| {
+        try expectReadingEqual(e.reading, g.reading);
+        try std.testing.expectApproxEqAbs(e.z_score, g.z_score, EQUIV_TOLERANCE);
+    }
+
+    if (expected.threshold_breach) |e| {
+        const g = got.threshold_breach.?;
+        try std.testing.expectEqual(e.sensor_id, g.sensor_id);
+        try std.testing.expectEqual(e.start_ts, g.start_ts);
+        try std.testing.expectEqual(e.end_ts, g.end_ts);
+        try std.testing.expectEqual(e.duration_ms, g.duration_ms);
+        try std.testing.expectApproxEqAbs(e.peak_value, g.peak_value, EQUIV_TOLERANCE);
+    } else {
+        try std.testing.expect(got.threshold_breach == null);
+    }
+}
+
+test "all 12 query patterns: every backend (AoS, SoA, TimeSeries, Columnar, Hierarchical, RingBuffer, Lake) agrees with the AoS reference on the same seeded dataset" {
+    const allocator = std.testing.allocator;
+    const readings = try generateDataset(allocator);
+    defer allocator.free(readings);
+
+    const expected = try runAllQueries(aos, allocator, readings);
+    defer expected.deinit(allocator);
+
+    const Candidate = struct { name: []const u8, T: type };
+    const candidates = [_]Candidate{
+        .{ .name = "SoA", .T = soa },
+        .{ .name = "TimeSeries", .T = timeseries },
+        .{ .name = "Columnar", .T = columnar },
+        .{ .name = "Hierarchical", .T = hierarchical },
+        .{ .name = "RingBuffer", .T = ringbuffer },
+        .{ .name = "Lake", .T = lake },
+    };
+
+    inline for (candidates) |c| {
+        const got = try runAllQueries(c.T, allocator, readings);
+        defer got.deinit(allocator);
+        try expectAllQueriesEqual(c.name, expected, got);
+    }
 }
 

@@ -195,3 +195,51 @@ pub fn pruneOlderThan(self: *Self, sensor_type: SensorType, cutoff_timestamp: i6
 }
 
 // ---------------------------------------------------------------------------
+// Tests — this file had none until 2026-07-20. pruneOlderThan's compaction
+// is the one place unique to SoA's structure that a naive AoS-style fix
+// could get wrong: it must advance FOUR parallel arrays in lockstep. A bug
+// that shrinks or writes one array out of sync with the others wouldn't
+// change row counts — it would silently reassign a surviving row's value or
+// sensor_type to the wrong sensor_id/timestamp.
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+
+test "pruneOlderThan: compaction keeps all four parallel arrays in lockstep — surviving rows keep their original value" {
+    const allocator = testing.allocator;
+    var backend = try Self.init(allocator);
+    defer backend.deinit();
+
+    // Each reading's value is a fingerprint of its own (sensor_id,
+    // timestamp) pair — if the arrays ever desync during compaction, a
+    // surviving row's value won't match its own sensor_id/timestamp anymore
+    // and the assertion below catches it directly, rather than just
+    // checking counts.
+    const fingerprint = struct {
+        fn f(sensor_id: u32, ts: i64) f32 {
+            return @floatFromInt(sensor_id * 1000 + @as(u32, @intCast(ts)));
+        }
+    }.f;
+
+    var t: i64 = 1;
+    while (t <= 5) : (t += 1) {
+        try backend.insert(.{ .sensor_id = 1, .timestamp = t, .value = fingerprint(1, t), .sensor_type = .temperature });
+        try backend.insert(.{ .sensor_id = 2, .timestamp = t, .value = fingerprint(2, t), .sensor_type = .humidity });
+    }
+    try testing.expectEqual(@as(usize, 10), backend.count());
+
+    // Prune temperature (sensor 1) readings older than ts=4 — removes
+    // ts=1,2,3 for sensor 1 only. Humidity (sensor 2) is untouched.
+    try backend.pruneOlderThan(.temperature, 4);
+    try testing.expectEqual(@as(usize, 7), backend.count());
+
+    const survivors = try backend.iterateAll(allocator);
+    defer allocator.free(survivors);
+    try testing.expectEqual(@as(usize, 7), survivors.len);
+    for (survivors) |r| {
+        try testing.expectEqual(fingerprint(r.sensor_id, r.timestamp), r.value);
+        if (r.sensor_type == .temperature) try testing.expect(r.timestamp >= 4);
+    }
+}
+
+// ---------------------------------------------------------------------------

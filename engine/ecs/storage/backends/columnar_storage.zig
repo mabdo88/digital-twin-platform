@@ -170,7 +170,7 @@ pub fn insert(self: *Self, reading: SensorReading) !void {
     if (reading.timestamp > part.max_ts) part.max_ts = reading.timestamp;
     self.total_count += 1;
     self.parts_merged = false;
-    self.updateLatest(reading);
+    try self.updateLatest(reading);
 }
 
 pub fn count(self: *const Self) usize {
@@ -269,7 +269,11 @@ pub fn iterateAll(self: *const Self, allocator: std.mem.Allocator) ![]const Sens
 
 pub fn getLatestBySensor(self: *const Self, sensor_id: u32) ?SensorReading {
     const self_mut: *Self = @constCast(self);
-    if (self_mut.latest_dirty) self_mut.rebuildLatest();
+    // Fixed by the StorageBackend interface (?SensorReading, no error
+    // union) — an OOM here has nowhere to propagate, unlike rangeByTime/
+    // allSensorIds below, which are already fallible and `try` this same
+    // rebuild. Swallowing is the structural floor for this one call site.
+    if (self_mut.latest_dirty) self_mut.rebuildLatest() catch {};
     return self_mut.latest_by_sensor.get(sensor_id);
 }
 
@@ -290,7 +294,7 @@ pub fn rangeByTime(self: *const Self, allocator: std.mem.Allocator, q: RangeQuer
     // resident readings (no entry here) has nothing to return.
     var only_type: ?SensorType = null;
     if (q.sensor_id) |sid| {
-        if (self_mut.latest_dirty) self_mut.rebuildLatest();
+        if (self_mut.latest_dirty) try self_mut.rebuildLatest();
         const latest = self.latest_by_sensor.get(sid) orelse return &.{};
         only_type = latest.sensor_type;
     }
@@ -443,7 +447,7 @@ pub fn allSensorIds(self: *const Self, allocator: std.mem.Allocator) ![]u32 {
     defer result.deinit(allocator);
 
     const self_mut: *Self = @constCast(self);
-    if (self_mut.latest_dirty) self_mut.rebuildLatest();
+    if (self_mut.latest_dirty) try self_mut.rebuildLatest();
     var it = self_mut.latest_by_sensor.keyIterator();
     while (it.next()) |k| try result.append(allocator, k.*);
 
@@ -540,18 +544,18 @@ fn ensurePartitionCompressed(self: *Self, part: *Partition) !void {
     part.compressed = true;
 }
 
-fn updateLatest(self: *Self, reading: SensorReading) void {
+fn updateLatest(self: *Self, reading: SensorReading) !void {
     if (self.latest_dirty) return;
     if (self.latest_by_sensor.get(reading.sensor_id)) |current| {
         if (reading.timestamp > current.timestamp) {
-            self.latest_by_sensor.put(reading.sensor_id, reading) catch {};
+            try self.latest_by_sensor.put(reading.sensor_id, reading);
         }
     } else {
-        self.latest_by_sensor.put(reading.sensor_id, reading) catch {};
+        try self.latest_by_sensor.put(reading.sensor_id, reading);
     }
 }
 
-fn rebuildLatest(self: *Self) void {
+fn rebuildLatest(self: *Self) !void {
     self.latest_by_sensor.clearRetainingCapacity();
     var it = self.partitions.iterator();
     while (it.next()) |entry| {
@@ -562,20 +566,20 @@ fn rebuildLatest(self: *Self) void {
             const ts = part.timestamps.items[i];
             if (self.latest_by_sensor.get(sid)) |current| {
                 if (ts > current.timestamp) {
-                    self.latest_by_sensor.put(sid, .{
+                    try self.latest_by_sensor.put(sid, .{
                         .sensor_id = sid,
                         .timestamp = ts,
                         .value = part.values.items[i],
                         .sensor_type = key.sensor_type,
-                    }) catch {};
+                    });
                 }
             } else {
-                self.latest_by_sensor.put(sid, .{
+                try self.latest_by_sensor.put(sid, .{
                     .sensor_id = sid,
                     .timestamp = ts,
                     .value = part.values.items[i],
                     .sensor_type = key.sensor_type,
-                }) catch {};
+                });
             }
         }
     }

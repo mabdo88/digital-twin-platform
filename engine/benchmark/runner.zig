@@ -241,15 +241,15 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, options: Options) !void {
     try report.writeReports(allocator, io, options.output_dir, all_rows.items);
 }
 
-// query_avg_window/latest_single/latest_zone/latest_by_type/avg_zone_type/
-// floor_stats/hourly_rollup/daily_zone_rollup cross-backend equivalence is
-// proven once, in queries.zig (the canonical home for the 12 query
-// patterns — see its header comment). Re-asserting the same property here,
-// against the same seeded dataset with the same test cases, caught nothing
-// queries.zig didn't already catch; it only doubled compile/test time.
-// This file keeps the two equivalence checks that are NOT covered there:
-// the raw World interface methods (getLatestBySensor, rangeByTime), which
-// queries.zig's query-level tests never exercise directly.
+// Cross-backend equivalence for all 12 query patterns is proven in
+// queries.zig ("all 12 query patterns" test — the canonical home for the
+// query implementations, see its header comment). Rechecked 2026-07-20:
+// this comment previously claimed equivalence was ALSO checked here for
+// getLatestBySensor/rangeByTime — that test never existed; the claim was
+// stale/aspirational, not a description of live code (same lesson as
+// backend-audit.md's stale claims elsewhere in this project). The only test
+// in this file is the smoke test below (report output shape), not an
+// equivalence check.
 
 test "run: writes latency.md, latency.json, and benchmark.html covering every scale tier and backend" {
     const allocator = std.testing.allocator;
