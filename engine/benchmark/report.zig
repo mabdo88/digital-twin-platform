@@ -96,6 +96,36 @@ fn formatNs(ns: i64) ScaledDuration {
     return scaleMicros(us);
 }
 
+// ---------------------------------------------------------------------------
+// Shared HTML document scaffolding between writeHtmlReport (the regression-
+// suite dashboard) and writeBuildingHtmlReport (the per-building report).
+// Their body content and JS are genuinely different reports, not
+// duplication — this is only the byte-for-byte identical skeleton the two
+// used to hand-copy independently (the color palette had already drifted
+// into two different formattings of the same 9 hex values).
+// ---------------------------------------------------------------------------
+
+/// The dark-theme color palette both HTML reports share. writeHtmlReport
+/// appends 3 more chart-only colors (--red/--orange/--purple) on top of
+/// this; writeBuildingHtmlReport uses it as-is.
+const HTML_ROOT_VARS = "--bg:#0f1419; --panel:#161c24; --panel-2:#1d2530; --border:#2a3441; " ++
+    "--text:#e6edf3; --text-dim:#8b97a6; --accent:#4ea8de; --green:#4ade80; --gold:#f0b429;";
+
+/// Emits `<!DOCTYPE html>` through the `<title>` tag and opens `<style>`.
+/// `title` is the caller's fully-formatted title text (may already contain
+/// interpolated/escaped values).
+fn writeHtmlDocStart(html: *std.ArrayList(u8), allocator: std.mem.Allocator, title: []const u8) !void {
+    try html.print(allocator, "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n", .{});
+    try html.print(allocator, "<meta charset=\"UTF-8\" />\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" />\n", .{});
+    try html.print(allocator, "<title>{s}</title>\n<style>\n", .{title});
+}
+
+/// Closes `</style>` and opens `<body><div class="container">`, after the
+/// caller has emitted its own CSS rules.
+fn writeHtmlStyleEndBodyStart(html: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
+    try html.print(allocator, "</style>\n</head>\n<body>\n<div class=\"container\">\n", .{});
+}
+
 /// Display label for a query family in the report tables (hyphenated, unlike
 /// the enum tag).
 fn familyLabel(f: queries.QueryFamily) []const u8 {
@@ -624,12 +654,8 @@ fn writeHtmlReport(
     const backend_roster = try uniqueBackends(allocator, rows);
     defer allocator.free(backend_roster);
 
-    try html.print(allocator, "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n", .{});
-    try html.print(allocator, "<meta charset=\"UTF-8\" />\n", .{});
-    try html.print(allocator, "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" />\n", .{});
-    try html.print(allocator, "<title>Digital Twin — Multi-Scale Backend Benchmark</title>\n", .{});
-    try html.print(allocator, "<style>\n", .{});
-    try html.print(allocator, "  :root {{\n    --bg: #0f1419; --panel: #161c24; --panel-2: #1d2530; --border: #2a3441;\n    --text: #e6edf3; --text-dim: #8b97a6; --accent: #4ea8de; --gold: #f0b429;\n    --green: #4ade80; --red: #f87171; --orange: #fb923c; --purple: #a78bfa;\n  }}\n", .{});
+    try writeHtmlDocStart(&html, allocator, "Digital Twin — Multi-Scale Backend Benchmark");
+    try html.print(allocator, "  :root {{ {s} --red:#f87171; --orange:#fb923c; --purple:#a78bfa; }}\n", .{HTML_ROOT_VARS});
     try html.print(allocator, "  * {{ box-sizing: border-box; margin: 0; padding: 0; }}\n", .{});
     try html.print(allocator, "  body {{\n    font-family: -apple-system, BlinkMacSystemFont, \"Segoe UI\", Roboto, sans-serif;\n    background: var(--bg); color: var(--text); line-height: 1.55; padding: 32px 20px 80px;\n  }}\n", .{});
     try html.print(allocator, "  .container {{ max-width: 1240px; margin: 0 auto; }}\n", .{});
@@ -658,7 +684,7 @@ fn writeHtmlReport(
     try html.print(allocator, "  .chart-title {{ font-size: 13px; color: var(--text-dim); margin-bottom: 12px; }}\n", .{});
     try html.print(allocator, "  .chart-title .qname {{ font-family: monospace; color: var(--text); }}\n", .{});
     try html.print(allocator, "  footer {{ margin-top: 50px; padding-top: 20px; border-top: 1px solid var(--border); color: var(--text-dim); font-size: 12px; text-align: center; }}\n", .{});
-    try html.print(allocator, "</style>\n</head>\n<body>\n<div class=\"container\">\n", .{});
+    try writeHtmlStyleEndBodyStart(&html, allocator);
 
     // Header
     try html.print(allocator, "<header>\n", .{});
@@ -1272,11 +1298,10 @@ pub fn writeBuildingHtmlReport(
     const escaped_bim_path = try escapeXml(allocator, bim_path);
     defer allocator.free(escaped_bim_path);
 
-    try html.print(allocator, "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n", .{});
-    try html.print(allocator, "<meta charset=\"UTF-8\" />\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" />\n", .{});
-    try html.print(allocator, "<title>{s} — Storage Recommendation</title>\n", .{escaped_scale_label});
-    try html.print(allocator, "<style>\n", .{});
-    try html.print(allocator, "  :root {{ --bg:#0f1419; --panel:#161c24; --panel-2:#1d2530; --border:#2a3441; --text:#e6edf3; --text-dim:#8b97a6; --accent:#4ea8de; --green:#4ade80; --gold:#f0b429; }}\n", .{});
+    const title = try std.fmt.allocPrint(allocator, "{s} — Storage Recommendation", .{escaped_scale_label});
+    defer allocator.free(title);
+    try writeHtmlDocStart(&html, allocator, title);
+    try html.print(allocator, "  :root {{ {s} }}\n", .{HTML_ROOT_VARS});
     try html.print(allocator, "  * {{ box-sizing:border-box; margin:0; padding:0; }}\n", .{});
     try html.print(allocator, "  body {{ font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif; background:var(--bg); color:var(--text); line-height:1.55; padding:32px 20px 80px; }}\n", .{});
     try html.print(allocator, "  .container {{ max-width:960px; margin:0 auto; }}\n", .{});
@@ -1288,9 +1313,6 @@ pub fn writeBuildingHtmlReport(
     try html.print(allocator, "  table {{ width:100%; border-collapse:collapse; font-size:13px; background:var(--panel); border:1px solid var(--border); border-radius:8px; overflow:hidden; }}\n", .{});
     try html.print(allocator, "  th, td {{ padding:8px 12px; text-align:left; border-bottom:1px solid var(--border); }}\n", .{});
     try html.print(allocator, "  th {{ background:var(--panel-2); color:var(--text-dim); font-weight:500; font-size:11px; text-transform:uppercase; }}\n", .{});
-    try html.print(allocator, "  .bar-track {{ background:var(--panel-2); height:16px; border-radius:4px; overflow:hidden; min-width:120px; }}\n", .{});
-    try html.print(allocator, "  .bar-fill {{ height:100%; background:var(--accent); }}\n", .{});
-    try html.print(allocator, "  .bar-fill.winner {{ background:var(--green); }}\n", .{});
     try html.print(allocator, "  details {{ background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:12px 16px; margin:16px 0; }}\n", .{});
     try html.print(allocator, "  summary {{ cursor:pointer; font-weight:600; padding:4px 0; }}\n", .{});
     try html.print(allocator, "  .scroll {{ overflow-x:auto; }}\n", .{});
@@ -1301,7 +1323,7 @@ pub fn writeBuildingHtmlReport(
     try html.print(allocator, "  th.sortable:hover {{ color:var(--text); }}\n", .{});
     try html.print(allocator, "  th.sorted-asc::after {{ content:' \\25B4'; }}\n  th.sorted-desc::after {{ content:' \\25BE'; }}\n", .{});
     try html.print(allocator, "  footer {{ margin-top:40px; color:var(--text-dim); font-size:12px; text-align:center; }}\n", .{});
-    try html.print(allocator, "</style>\n</head>\n<body>\n<div class=\"container\">\n", .{});
+    try writeHtmlStyleEndBodyStart(&html, allocator);
 
     try html.print(allocator, "<h1>{s}</h1>\n", .{escaped_scale_label});
     try html.print(allocator, "<div class=\"subtitle\">Source: {s}</div>\n", .{escaped_bim_path});
