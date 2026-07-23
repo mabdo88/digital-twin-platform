@@ -165,8 +165,8 @@ pub fn estimateAll(
 /// The "naive" baseline: what would it cost to run EVERY backend
 /// simultaneously (hot tier + warm tier + cold tier + cache)? This is the
 /// naive-vs-optimised comparison — the optimised deployment picks the
-/// compound recommendation's two winners; the naive approach just runs
-/// everything.
+/// two-track recommendation's real-time and historical winners (see
+/// report.TrackWinners); the naive approach just runs everything.
 pub fn naiveTotalCost(
     rows: []const report.RunRow,
     backend_names: []const []const u8,

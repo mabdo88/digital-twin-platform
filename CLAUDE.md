@@ -270,12 +270,22 @@ The same folder also holds **status docs** (read as current state, not as proced
   three written by `engine/benchmark/report.zig` (`latency.json`, `latency.md`,
   `benchmark.html`). The per-building path (`dt --bim ...`) writes
   `recommendation.md`, `simulation.json`, and `schematic.svg`.
-- **Tiered strategies — resolved:** the platform now emits **compound recommendations**
-  via `report.recommendCompound`: a real-time track (all backends compete, RingBuffer
-  wins on `latest_*` queries) and a historical track (full-retention backends only;
-  RingBuffer excluded). The final recommendation per building/type is a deployment
-  combo: "<real-time winner> for live queries + <historical winner> for everything
-  else." `main.zig` consumes this for both building-level and per-type reports.
+- **Tiered strategies — resolved, revised 2026-07-20:** the platform emits a two-track
+  recommendation via `report.pickTrackWinners`: a real-time track (all backends
+  compete, RingBuffer wins on `latest_*` queries) and a historical track
+  (full-retention backends only; RingBuffer excluded). The final recommendation per
+  building/type is a deployment combo: "<real-time winner> for live queries +
+  <historical winner> for everything else." `main.zig` consumes this for both
+  building-level and per-type reports. Superseded the original weighted-ratio
+  scorer (`report.recommendCompound`/`scoreBackends`, removed) after it didn't hold
+  up under scrutiny: every backend already answers `latest_*` via an O(1) cached
+  lookup, so the real-time track's weighted score mostly measured lookup-overhead
+  noise rather than a real architectural difference, and a single slow outlier
+  query could blow the historical track's weighted average up to 4+ digits with no
+  interpretable meaning. `pickTrackWinners` instead counts, per family, how many
+  queries each backend wins in `report.perQueryResults`' own already-computed
+  per-query dashboard — honest about being "who wins the most queries," nothing
+  more. See `.cascade/digital-twin/backend-audit.md`'s 2026-07-20 entry.
 - **RingBuffer eviction sizing — resolved:** one flat capacity applied to every
   placed type (still no per-type formula), but derived from the building's
   fastest-sampling placed sensor type rather than a hard-coded constant —

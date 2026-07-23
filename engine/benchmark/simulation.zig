@@ -338,18 +338,6 @@ pub fn isTypeScoped(q: queries.QueryName) bool {
     };
 }
 
-/// Filters `mix` down to the type-scoped queries (isTypeScoped) — used to
-/// build a single sensor type's own type-scoped query set for its
-/// per-type recommendation. Caller frees with `allocator`.
-pub fn filterTypeScoped(allocator: std.mem.Allocator, mix: []const queries.QueryWeight) ![]queries.QueryWeight {
-    var list: std.ArrayList(queries.QueryWeight) = .empty;
-    errdefer list.deinit(allocator);
-    for (mix) |qw| {
-        if (isTypeScoped(qw.query)) try list.append(allocator, qw);
-    }
-    return list.toOwnedSlice(allocator);
-}
-
 /// Overwrites `.memory_bytes` on every GrowthPoint from `start_idx` onward
 /// with `memory_bytes` — so every row a checkpoint's query batch produced
 /// reports one consistent snapshot (taken once, after that batch finished)

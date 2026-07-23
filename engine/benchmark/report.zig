@@ -40,45 +40,6 @@ pub fn queryNameStr(qn: queries.QueryName) []const u8 {
     };
 }
 
-/// One backend's standing in a profile-weighted recommendation.
-pub const BackendScore = struct {
-    backend: []const u8,
-    /// Weighted average of (this backend's median / the per-query winner's
-    /// median) across every query in the profile's mix that this backend
-    /// has data for. 1.0 = won every weighted query; higher is worse.
-    score: f64,
-    /// Fraction of the profile's total query weight this backend actually
-    /// has data for (1.0 = has data for every weighted query). A backend
-    /// with a low score but partial coverage is winning by omission, not
-    /// speed — see CLAUDE.md's "honest headline" (§6).
-    coverage: f64,
-};
-
-/// One track of a compound recommendation — scoped to one query family
-/// group (real-time vs. everything else) and possibly to a restricted set of
-/// eligible backends. Caller frees `scores`.
-pub const TrackRecommendation = struct {
-    scores: []BackendScore, // sorted ascending by score (best first)
-    winner: []const u8,
-};
-
-/// A building (or per-type) recommendation split into two independently-won
-/// tracks, because no single backend should be forced to serve both a tiny
-/// live cache's workload and a full-history store's workload:
-/// - `realtime`: the `real_time` query family (latest_*), scored across ALL
-///   backends — the tiny real-time cache legitimately competes here.
-/// - `historical`: every other family (aggregation/historical/spatial/
-///   anomaly), scored across ONLY the full-retention backends. A count-
-///   capped cache is excluded outright rather than being allowed to "win"
-///   by timing a query against the handful of readings it kept.
-/// The real deployment answer is the pair: "<realtime.winner> for live
-/// queries + <historical.winner> for everything else." Caller frees both
-/// `.scores` slices.
-pub const CompoundRecommendation = struct {
-    realtime: TrackRecommendation,
-    historical: TrackRecommendation,
-};
-
 /// Auto-scaled human-readable duration — µs below 1000µs, ms below
 /// 100_000µs (100ms), s otherwise. Used everywhere a raw query latency is
 /// displayed; never applied to scores/coverage/ratios (those stay as
@@ -181,11 +142,10 @@ pub fn writePerQueryMarkdown(
     const sorted = try sortedRankings(allocator, query_results);
     defer allocator.free(sorted);
 
-    try md.print(allocator, "The direct per-query answer behind the two-track recommendation above: for every query " ++
-        "pattern this building runs, the fastest backend at steady state. Non-real-time queries only admit " ++
-        "full-retention backends (same rule as the tracks — the count-capped real-time cache scanned a fraction " ++
-        "of the data, an incomparable measurement). Cost/M is the winner's total annual cost (storage + query) " ++
-        "amortized per million queries.\n\n", .{});
+    try md.print(allocator, "The ground truth behind the verdict above: for every query pattern this building runs, " ++
+        "the fastest backend at steady state. Non-real-time queries only admit full-retention backends — the " ++
+        "count-capped real-time cache scanned a fraction of the data, an incomparable measurement. Cost/M is the " ++
+        "winner's total annual cost (storage + query) amortized per million queries.\n\n", .{});
     try md.print(allocator, "| Family | Query | Winner | Latency | Runner-up | Speedup | Cost/M queries |\n", .{});
     try md.print(allocator, "|---|---|---|---:|---|---:|---:|\n", .{});
 
@@ -229,14 +189,13 @@ pub fn writeScaledUs(w: *std.ArrayList(u8), allocator: std.mem.Allocator, us: f6
     }
 }
 
-/// One backend ranking scoped to a single sensor type — same shape as the
-/// building-level CompoundRecommendation, filtered down to that type's own
+/// One sensor type's own TrackWinners (see below), scoped to that type's
 /// type-scoped queries. Moved here (from main.zig) so both the markdown
 /// assembly in main.zig and writeBuildingHtmlReport below can share one
 /// definition.
-pub const TypeRecommendation = struct {
+pub const TypeTrackWinners = struct {
     sensor_type: sb.SensorType,
-    compound: CompoundRecommendation,
+    winners: TrackWinners,
 };
 
 /// One row of the "Sensors placed, by type" table — plain data, no
@@ -274,22 +233,12 @@ pub const QueryBackendResult = struct {
 
 /// All eligible backends' results for one query, sorted by median latency
 /// ascending — `results[0]` is the winner. `family` uses the same
-/// queries.familyOf classification the compound recommendation splits on.
+/// queries.familyOf classification `pickTrackWinners` splits on.
 pub const QueryRanking = struct {
     query_name: []const u8,
     results: []QueryBackendResult,
     family: queries.QueryFamily,
 };
-
-/// How much each unit of *uncovered* query weight counts against a backend
-/// in `scoreBackends`'s score (1.0 = as good as tying the per-query
-/// winner; higher is worse). Set above the this/winner ratios functioning
-/// backends realistically reach (~1-3x) so a coverage gap reliably outweighs
-/// mere slowness: a backend that can't answer a weighted query at all (it
-/// evicted that type's data, or doesn't support that rollup) should rank
-/// below one that answers it slowly. Not researched — a deliberate,
-/// disclosed policy choice (CLAUDE.md §6 honesty).
-const UNCOVERED_QUERY_PENALTY: f64 = 4.0;
 
 /// True if `name` appears in `eligible`. Used to restrict a track to a
 /// subset of backends (e.g. the historical track excludes the count-capped
@@ -303,9 +252,8 @@ fn backendEligible(eligible: ?[]const []const u8, name: []const u8) bool {
 }
 
 /// Every distinct `RunRow.backend` across `rows`, first-seen order, deduped —
-/// scale-independent (unlike scoreBackends' own per-scale dedup above), for
-/// callers that need the full backend roster the regression suite actually
-/// benchmarked. Caller frees with `allocator`.
+/// scale-independent, for callers that need the full backend roster the
+/// regression suite actually benchmarked. Caller frees with `allocator`.
 ///
 /// Exists so the report header/chip/color-legend can't drift from a
 /// hardcoded backend list again: `writeHtmlReport`'s `backend_names` used
@@ -345,147 +293,13 @@ fn colorForBackend(roster: []const []const u8, name: []const u8) []const u8 {
     return "#999";
 }
 
-/// Core scorer behind both `recommendBackend` and `recommendCompound`. Ranks
-/// every backend present in `rows` at `scale` over the weighted `query_mix`,
-/// returning scores sorted ascending (best first; caller frees the slice).
-/// When `eligible` is non-null, backends outside that set are excluded
-/// entirely — not just from the ranking, but also from each query's
-/// per-query winner, so an ineligible-but-artificially-fast backend can't
-/// distort the eligible backends' ratios. `eligible == null` considers all.
-fn scoreBackends(
-    allocator: std.mem.Allocator,
-    rows: []const RunRow,
-    scale: []const u8,
-    query_mix: []const queries.QueryWeight,
-    eligible: ?[]const []const u8,
-) ![]BackendScore {
-    if (query_mix.len == 0) return &[_]BackendScore{};
-
-    var backend_names: std.ArrayList([]const u8) = .empty;
-    defer backend_names.deinit(allocator);
-    for (rows) |r| {
-        if (!std.mem.eql(u8, r.scale, scale)) continue;
-        if (!backendEligible(eligible, r.backend)) continue;
-        var seen = false;
-        for (backend_names.items) |b| {
-            if (std.mem.eql(u8, b, r.backend)) {
-                seen = true;
-                break;
-            }
-        }
-        if (!seen) try backend_names.append(allocator, r.backend);
-    }
-
-    var scores: std.ArrayList(BackendScore) = .empty;
-    defer scores.deinit(allocator);
-
-    for (backend_names.items) |backend| {
-        var weighted_sum: f64 = 0;
-        var covered_weight: f64 = 0;
-        var total_weight: f64 = 0;
-
-        for (query_mix) |qw| {
-            total_weight += qw.weight;
-            const qname = queryNameStr(qw.query);
-
-            var winner_median: ?i64 = null;
-            var this_median: ?i64 = null;
-            for (rows) |r| {
-                if (!std.mem.eql(u8, r.scale, scale)) continue;
-                if (!std.mem.eql(u8, r.query, qname)) continue;
-                if (!backendEligible(eligible, r.backend)) continue;
-                if (winner_median == null or r.stats.median_ns < winner_median.?) {
-                    winner_median = r.stats.median_ns;
-                }
-                if (std.mem.eql(u8, r.backend, backend)) {
-                    this_median = r.stats.median_ns;
-                }
-            }
-
-            if (this_median) |tm| {
-                covered_weight += qw.weight;
-                const wm = winner_median.?; // this_median set implies >=1 row, so winner_median is too
-                const ratio: f64 = if (wm <= 0) 1.0 else @as(f64, @floatFromInt(tm)) / @as(f64, @floatFromInt(wm));
-                weighted_sum += qw.weight * ratio;
-            }
-        }
-
-        const coverage: f64 = if (total_weight > 0) covered_weight / total_weight else 0;
-        // Penalize coverage gaps instead of silently scoring a backend only
-        // over the queries it happens to cover. The denominator is the FULL
-        // weighted mix, and each uncovered unit of weight is charged
-        // UNCOVERED_QUERY_PENALTY rather than dropped from the average — so a
-        // backend missing data for a weighted query can't win by omission. A
-        // backend with zero coverage stays +inf (worst possible), so it never
-        // edges out one that actually returns data.
-        const uncovered_weight = total_weight - covered_weight;
-        const score: f64 = if (covered_weight <= 0)
-            std.math.inf(f64)
-        else
-            (weighted_sum + UNCOVERED_QUERY_PENALTY * uncovered_weight) / total_weight;
-
-        try scores.append(allocator, .{ .backend = backend, .score = score, .coverage = coverage });
-    }
-
-    const owned = try scores.toOwnedSlice(allocator);
-    std.mem.sort(BackendScore, owned, {}, struct {
-        fn lt(_: void, a: BackendScore, b: BackendScore) bool {
-            return a.score < b.score;
-        }
-    }.lt);
-    return owned;
-}
-
-/// Split `query_mix` by query family and rank each track independently (see
-/// `CompoundRecommendation`): the `real_time` family across all backends,
-/// everything else across only `full_retention_backends`. `full_retention_
-/// backends` is the set of backend names eligible for the historical track
-/// (i.e. every deployment backend except the count-capped real-time cache);
-/// pass it straight from `runner.supported_backends`' names. Caller frees
-/// both returned `.scores` slices.
-pub fn recommendCompound(
-    allocator: std.mem.Allocator,
-    rows: []const RunRow,
-    scale: []const u8,
-    query_mix: []const queries.QueryWeight,
-    full_retention_backends: []const []const u8,
-) !CompoundRecommendation {
-    var realtime_mix: std.ArrayList(queries.QueryWeight) = .empty;
-    defer realtime_mix.deinit(allocator);
-    var historical_mix: std.ArrayList(queries.QueryWeight) = .empty;
-    defer historical_mix.deinit(allocator);
-
-    for (query_mix) |qw| {
-        if (queries.familyOf(qw.query) == .real_time) {
-            try realtime_mix.append(allocator, qw);
-        } else {
-            try historical_mix.append(allocator, qw);
-        }
-    }
-
-    const rt_scores = try scoreBackends(allocator, rows, scale, realtime_mix.items, null);
-    errdefer allocator.free(rt_scores);
-    const hist_scores = try scoreBackends(allocator, rows, scale, historical_mix.items, full_retention_backends);
-
-    return .{
-        .realtime = .{
-            .scores = rt_scores,
-            .winner = if (rt_scores.len > 0) rt_scores[0].backend else "none",
-        },
-        .historical = .{
-            .scores = hist_scores,
-            .winner = if (hist_scores.len > 0) hist_scores[0].backend else "none",
-        },
-    };
-}
-
 /// Compute per-query rankings for a given scale: for each unique query, the
 /// eligible backends sorted fastest-first, each carrying its amortized
 /// cost-per-query (from `backend_cost_per_query`, keyed by backend name).
-/// Applies the SAME eligibility rule writeWinners / recommendCompound use:
-/// non-real-time queries only admit `historical_eligible` backends — the
-/// count-capped real-time cache scanned a fraction of the data those queries
-/// need, an incomparable measurement (see writeWinners's doc comment).
+/// Applies the SAME eligibility rule `writeWinners` uses: non-real-time
+/// queries only admit `historical_eligible` backends — the count-capped
+/// real-time cache scanned a fraction of the data those queries need, an
+/// incomparable measurement (see writeWinners's doc comment).
 /// Caller frees each ranking's `results` slice and the outer slice.
 pub fn perQueryResults(
     allocator: std.mem.Allocator,
@@ -563,26 +377,90 @@ pub fn perQueryResults(
     return results.toOwnedSlice(allocator);
 }
 
-/// A track's top two backends count as a "close race" when within this
-/// fraction of each other — a disclosed, deliberate policy constant (not
-/// researched), same spirit as UNCOVERED_QUERY_PENALTY above. Motivated by
-/// an observed case: three consecutive runs of the same 32-sensor office
-/// building (identical seed, identical code) produced three different
-/// real-time-track winners between two backends whose scores sat within
-/// ~10% of each other on two of those three runs, while a >30x-margin
-/// track never reordered across the same three runs.
-pub const CLOSE_RACE_THRESHOLD: f64 = 0.15;
+/// The two-track deployment verdict: which backend wins the most real-time
+/// (`latest_*`) queries, and which wins the most of everything else.
+/// `*_wins`/`*_total` are how many of that family's queries were actually
+/// counted (query_rankings entries with at least one eligible result), so
+/// the verdict can say "wins 3 of 3" instead of a bare name. `winner` is
+/// `"none"` when a track has zero queries to count.
+///
+/// Replaces the old scoreBackends/recommendCompound weighted-ratio model
+/// (removed 2026-07-20 — the whole thing didn't hold up under scrutiny; see
+/// backend-audit.md's 2026-07-20 entry for the full reasoning): every
+/// backend already answers `latest_*` via an O(1) cached lookup, so that
+/// track's weighted score mostly measured lookup-overhead noise rather than
+/// a real architectural difference, and a single slow outlier query in the
+/// historical mix could blow the weighted average up to 4+ digits with no
+/// interpretable real-world meaning. Counting per-query wins directly off
+/// `perQueryResults`' own already-computed winners is honest about what it
+/// is — "who wins the most queries" — and can't be distorted by outliers or
+/// arbitrary weight/penalty constants the way an averaged ratio can.
+pub const TrackWinners = struct {
+    realtime_winner: []const u8,
+    realtime_wins: usize,
+    realtime_total: usize,
+    historical_winner: []const u8,
+    historical_wins: usize,
+    historical_total: usize,
+};
 
-/// True when `scores` (sorted ascending — best first, the shape
-/// TrackRecommendation.scores is already in) has a winner and runner-up
-/// within CLOSE_RACE_THRESHOLD of each other. Fewer than 2 scores is never
-/// a close race (nothing to compare against).
-pub fn isCloseRace(scores: []const BackendScore) bool {
-    if (scores.len < 2) return false;
-    const winner = scores[0].score;
-    const runner_up = scores[1].score;
-    if (winner <= 0) return false;
-    return (runner_up - winner) / winner <= CLOSE_RACE_THRESHOLD;
+/// Counts, for one family group (real-time vs everything else), how many
+/// queries each backend won (`query_rankings[i].results[0].backend`), and
+/// returns whichever backend won the most. Ties keep whichever backend was
+/// first counted — deterministic because `query_rankings`' own order is
+/// (both callers build it via `perQueryResults`, itself a deterministic
+/// scan of `rows`).
+fn trackWinner(allocator: std.mem.Allocator, query_rankings: []const QueryRanking, want_realtime: bool) !struct { winner: []const u8, wins: usize, total: usize } {
+    var names: std.ArrayList([]const u8) = .empty;
+    defer names.deinit(allocator);
+    var counts: std.ArrayList(usize) = .empty;
+    defer counts.deinit(allocator);
+    var total: usize = 0;
+
+    for (query_rankings) |qr| {
+        if ((qr.family == .real_time) != want_realtime) continue;
+        if (qr.results.len == 0) continue;
+        total += 1;
+        const winner_name = qr.results[0].backend;
+
+        var found = false;
+        for (names.items, 0..) |n, i| {
+            if (std.mem.eql(u8, n, winner_name)) {
+                counts.items[i] += 1;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            try names.append(allocator, winner_name);
+            try counts.append(allocator, 1);
+        }
+    }
+
+    if (names.items.len == 0) return .{ .winner = "none", .wins = 0, .total = total };
+
+    var best: usize = 0;
+    for (counts.items, 0..) |c, i| {
+        if (c > counts.items[best]) best = i;
+    }
+    return .{ .winner = names.items[best], .wins = counts.items[best], .total = total };
+}
+
+/// Derives `TrackWinners` from `perQueryResults`' output — see that
+/// function's doc comment for the eligibility rule (non-real-time queries
+/// already restricted to full-retention backends before this ever sees
+/// them, so no separate eligibility list is needed here).
+pub fn pickTrackWinners(allocator: std.mem.Allocator, query_rankings: []const QueryRanking) !TrackWinners {
+    const rt = try trackWinner(allocator, query_rankings, true);
+    const hist = try trackWinner(allocator, query_rankings, false);
+    return .{
+        .realtime_winner = rt.winner,
+        .realtime_wins = rt.wins,
+        .realtime_total = rt.total,
+        .historical_winner = hist.winner,
+        .historical_wins = hist.wins,
+        .historical_total = hist.total,
+    };
 }
 
 /// Write `latency.md`, `latency.json`, and `benchmark.html` under
@@ -916,16 +794,15 @@ fn queryNameFromStr(name: []const u8) ?queries.QueryName {
 }
 
 /// For each unique query within a given scale, find the backend with the
-/// lowest median latency and the runner-up; emit a Markdown row. Exported
-/// (not just used by writeReports' internal regression-suite report) so
-/// main.zig's live-simulation recommendation.md can surface the same
-/// per-query winner table instead of leaving the reader to eyeball the raw
-/// per-query latency rows.
+/// lowest median latency and the runner-up; emit a Markdown row. Used by
+/// writeReports' internal regression-suite report (the per-building path's
+/// recommendation.md gets the equivalent view from perQueryResults'
+/// dashboard instead).
 ///
 /// `historical_eligible`, when non-null, applies the SAME eligibility rule
-/// recommendCompound's historical track already applies to scoring: for any
-/// query outside the `real_time` family, only backends in that list compete
-/// for the winner/runner-up slots. Without this, the count-capped real-time
+/// `perQueryResults` already applies: for any query outside the `real_time`
+/// family, only backends in that list compete for the winner/runner-up
+/// slots. Without this, the count-capped real-time
 /// cache (RingBuffer, 10 readings/sensor) showed up as the 171x "winner" of
 /// query_anomalies in a real house run — it had scanned a ~200x smaller
 /// dataset than every other backend, an incomparable measurement presented
@@ -979,8 +856,8 @@ pub fn writeWinners(
 
 /// Result of scanning `rows` for one query's fastest backend (winner) and
 /// second-fastest (runner-up) at `scale`, respecting the same eligibility
-/// rule scoreBackends/recommendCompound apply (non-real-time queries only
-/// admit `historical_eligible` backends when it's non-null). Used by
+/// rule `perQueryResults` applies (non-real-time queries only admit
+/// `historical_eligible` backends when it's non-null). Used by
 /// writeWinners (the regression-suite Markdown report). Returns null when no
 /// eligible backend has data for this query.
 const WinnerPair = struct {
@@ -1225,59 +1102,6 @@ test "scaleMicros: stays microseconds below 1000, switches to ms then s at each 
     try std.testing.expectEqualStrings("s", at_s.unit);
 }
 
-test "isCloseRace: within threshold is close, beyond it is not, fewer than 2 scores is never close" {
-    const close = [_]BackendScore{
-        .{ .backend = "A", .score = 1.000, .coverage = 1.0 },
-        .{ .backend = "B", .score = 1.100, .coverage = 1.0 },
-    };
-    try std.testing.expect(isCloseRace(&close));
-
-    const far = [_]BackendScore{
-        .{ .backend = "A", .score = 1.000, .coverage = 1.0 },
-        .{ .backend = "B", .score = 1.318, .coverage = 1.0 },
-    };
-    try std.testing.expect(!isCloseRace(&far));
-
-    // Boundary: exactly CLOSE_RACE_THRESHOLD (15%) is still a close race
-    // (`<=`). 0.15 is not exactly representable in binary, so a decimal
-    // literal near it (e.g. winner=1.000/runner_up=1.150) does NOT reliably
-    // land on CLOSE_RACE_THRESHOLD bit-for-bit — verified: that pair's ratio
-    // lands 3 ULPs below it, meaning such a test can't distinguish `<=` from
-    // `<`. winner=10.0/runner_up=11.5 does land exactly: 11.5-10.0=1.5 is
-    // exact (both operands exactly representable in binary; Sterbenz's
-    // lemma also guarantees the subtraction itself is exact), and
-    // 1.5/10.0's correctly-rounded result happens to be the identical
-    // double as the `0.15` literal used to define CLOSE_RACE_THRESHOLD. The
-    // sanity check below proves this bit-exactness rather than assuming it.
-    const winner_score: f64 = 10.0;
-    const runner_up_score: f64 = 11.5;
-    const ratio = (runner_up_score - winner_score) / winner_score;
-    try std.testing.expectEqual(CLOSE_RACE_THRESHOLD, ratio);
-
-    const boundary = [_]BackendScore{
-        .{ .backend = "A", .score = winner_score, .coverage = 1.0 },
-        .{ .backend = "B", .score = runner_up_score, .coverage = 1.0 },
-    };
-    try std.testing.expect(isCloseRace(&boundary));
-
-    // One ULP further from winner than the exact-boundary case — proves the
-    // comparison doesn't drift past the intended threshold.
-    const just_beyond_score = std.math.nextAfter(f64, runner_up_score, std.math.inf(f64));
-    const just_beyond = [_]BackendScore{
-        .{ .backend = "A", .score = winner_score, .coverage = 1.0 },
-        .{ .backend = "B", .score = just_beyond_score, .coverage = 1.0 },
-    };
-    try std.testing.expect(!isCloseRace(&just_beyond));
-
-    const single = [_]BackendScore{
-        .{ .backend = "A", .score = 1.000, .coverage = 1.0 },
-    };
-    try std.testing.expect(!isCloseRace(&single));
-
-    const empty = [_]BackendScore{};
-    try std.testing.expect(!isCloseRace(&empty));
-}
-
 // This test exercises writeWinners directly (rather than through the full
 // `zig build bench` -> runner.run -> writeReports path, covered end-to-end
 // by runner.zig's own test) so it can pin the exact legacy "N.N" plain-µs
@@ -1359,6 +1183,55 @@ test "colorForBackend: assigns a real color by position past the old 4-entry pal
     try std.testing.expectEqualStrings("#999", colorForBackend(&backends, "Unknown"));
 }
 
+test "pickTrackWinners: picks the backend that wins the most queries in each family, independently" {
+    const allocator = std.testing.allocator;
+    const one_result = struct {
+        fn make(backend: []const u8) [1]QueryBackendResult {
+            return .{.{ .backend = backend, .median_ns = 1, .p95_ns = 1, .p99_ns = 1, .cost_per_query = 0 }};
+        }
+    }.make;
+
+    // Real-time: RingBuffer wins 2 of 3. Historical: Hierarchical wins 2 of
+    // 3, TimeSeries 1 of 3 — the two tracks must resolve independently, not
+    // share a single overall winner.
+    var rt1 = one_result("RingBuffer");
+    var rt2 = one_result("RingBuffer");
+    var rt3 = one_result("Lake");
+    var h1 = one_result("Hierarchical");
+    var h2 = one_result("Hierarchical");
+    var h3 = one_result("TimeSeries");
+    const rankings = [_]QueryRanking{
+        .{ .query_name = "query_latest_single", .results = &rt1, .family = .real_time },
+        .{ .query_name = "query_latest_zone", .results = &rt2, .family = .real_time },
+        .{ .query_name = "query_latest_by_type", .results = &rt3, .family = .real_time },
+        .{ .query_name = "query_avg_window", .results = &h1, .family = .aggregation },
+        .{ .query_name = "query_daily_zone_rollup", .results = &h2, .family = .historical },
+        .{ .query_name = "query_hourly_rollup", .results = &h3, .family = .historical },
+    };
+
+    const tw = try pickTrackWinners(allocator, &rankings);
+    try std.testing.expectEqualStrings("RingBuffer", tw.realtime_winner);
+    try std.testing.expectEqual(@as(usize, 2), tw.realtime_wins);
+    try std.testing.expectEqual(@as(usize, 3), tw.realtime_total);
+    try std.testing.expectEqualStrings("Hierarchical", tw.historical_winner);
+    try std.testing.expectEqual(@as(usize, 2), tw.historical_wins);
+    try std.testing.expectEqual(@as(usize, 3), tw.historical_total);
+}
+
+test "pickTrackWinners: a family with zero eligible-result rankings reports \"none\", not a crash" {
+    const allocator = std.testing.allocator;
+    var only_result = [_]QueryBackendResult{.{ .backend = "Hierarchical", .median_ns = 1, .p95_ns = 1, .p99_ns = 1, .cost_per_query = 0 }};
+    const rankings = [_]QueryRanking{
+        .{ .query_name = "query_hourly_rollup", .results = &only_result, .family = .historical },
+    };
+
+    const tw = try pickTrackWinners(allocator, &rankings);
+    try std.testing.expectEqualStrings("none", tw.realtime_winner);
+    try std.testing.expectEqual(@as(usize, 0), tw.realtime_wins);
+    try std.testing.expectEqual(@as(usize, 0), tw.realtime_total);
+    try std.testing.expectEqualStrings("Hierarchical", tw.historical_winner);
+}
+
 // ---------------------------------------------------------------------------
 // Self-contained HTML dashboard for one per-building `dt --bim` run —
 // mirrors recommendation.md's section order (verdict first, then supporting
@@ -1378,8 +1251,8 @@ pub fn writeBuildingHtmlReport(
     bim_path: []const u8,
     scale_label: []const u8,
     sensor_type_counts: []const SensorTypeCount,
-    compound: CompoundRecommendation,
-    type_recommendations: []const TypeRecommendation,
+    track_winners: TrackWinners,
+    type_track_winners: []const TypeTrackWinners,
     rows: []const RunRow,
     query_rankings: []const QueryRanking,
     growth: []const sim_mod.GrowthPoint,
@@ -1434,32 +1307,13 @@ pub fn writeBuildingHtmlReport(
     try html.print(allocator, "<div class=\"subtitle\">Source: {s}</div>\n", .{escaped_bim_path});
 
     try html.print(allocator, "<div class=\"verdict\">\n", .{});
-    try html.print(allocator, "<p>Use <strong class=\"win\">{s}</strong> for live/latest-value queries.</p>\n", .{compound.realtime.winner});
-    try html.print(allocator, "<p>Use <strong class=\"win\">{s}</strong> for everything else (history, aggregates, anomalies).</p>\n", .{compound.historical.winner});
-    if (compound.historical.scores.len > 1) {
-        const hist_margin = compound.historical.scores[1].score / compound.historical.scores[0].score;
-        if (isCloseRace(compound.historical.scores)) {
-            try html.print(allocator, "<p class=\"caveat\">The historical-query race is close: {s} vs {s} (within 15%) — treat this ranking as a near-tie, not a confident win.</p>\n", .{
-                compound.historical.scores[0].backend, compound.historical.scores[1].backend,
-            });
-        } else {
-            try html.print(allocator, "<p>{s} wins historical queries by <strong>{d:.1}x</strong> over {s} — a decisive, noise-proof margin.</p>\n", .{
-                compound.historical.winner, hist_margin, compound.historical.scores[1].backend,
-            });
-        }
-    }
-    if (compound.realtime.scores.len > 1) {
-        const rt_margin = compound.realtime.scores[1].score / compound.realtime.scores[0].score;
-        if (isCloseRace(compound.realtime.scores)) {
-            try html.print(allocator, "<p class=\"caveat\">The live-query race is close: {s} vs {s} (within 15%) — treat this ranking as a near-tie, not a confident win.</p>\n", .{
-                compound.realtime.scores[0].backend, compound.realtime.scores[1].backend,
-            });
-        } else {
-            try html.print(allocator, "<p>{s} wins live queries by <strong>{d:.1}x</strong> over {s} — a clear margin.</p>\n", .{
-                compound.realtime.winner, rt_margin, compound.realtime.scores[1].backend,
-            });
-        }
-    }
+    try html.print(allocator, "<p>Use <strong class=\"win\">{s}</strong> for live/latest-value queries — wins {d} of {d} real-time queries.</p>\n", .{
+        track_winners.realtime_winner, track_winners.realtime_wins, track_winners.realtime_total,
+    });
+    try html.print(allocator, "<p>Use <strong class=\"win\">{s}</strong> for everything else (history, aggregates, anomalies) — wins {d} of {d} historical queries.</p>\n", .{
+        track_winners.historical_winner, track_winners.historical_wins, track_winners.historical_total,
+    });
+    try html.print(allocator, "<p style=\"color:var(--text-dim);font-size:13px\">Each winner is whichever backend won the most queries in its family, from the per-query dashboard below — not a blended score.</p>\n", .{});
     try html.print(allocator, "</div>\n", .{});
 
     try html.print(allocator, "<h2>Sensors placed, by type</h2>\n<div class=\"scroll\"><table>\n", .{});
@@ -1469,17 +1323,13 @@ pub fn writeBuildingHtmlReport(
     }
     try html.print(allocator, "</table></div>\n", .{});
 
-    try html.print(allocator, "<h2>Recommendation detail</h2>\n", .{});
-    try writeScoreTableHtml(&html, allocator, "Real-time track", compound.realtime.scores);
-    try writeScoreTableHtml(&html, allocator, "Historical track", compound.historical.scores);
-
     if (query_rankings.len > 0) {
         const sorted_rankings = try sortedRankings(allocator, query_rankings);
         defer allocator.free(sorted_rankings);
 
         try html.print(allocator, "<h2>Per-query dashboard</h2>\n", .{});
-        try html.print(allocator, "<p style=\"color:var(--text-dim);font-size:13px;margin-bottom:4px\">The fastest eligible backend for every query this building runs. " ++
-            "Non-real-time queries only admit full-retention backends (same rule as the tracks). " ++
+        try html.print(allocator, "<p style=\"color:var(--text-dim);font-size:13px;margin-bottom:4px\">The fastest eligible backend for every query this building runs — the ground truth the verdict above is counted from. " ++
+            "Non-real-time queries only admit full-retention backends. " ++
             "Cost/M is the winner's total annual cost amortized per million queries. " ++
             "Click a column header to sort; click a chip to filter by family.</p>\n", .{});
         try html.print(allocator, "<div class=\"chips\" id=\"pq-chips\"><span class=\"chip active\" data-family=\"all\">all</span>", .{});
@@ -1524,13 +1374,25 @@ pub fn writeBuildingHtmlReport(
         try html.print(allocator, "</tbody></table></div>\n", .{});
     }
 
-    if (type_recommendations.len > 0) {
+    if (type_track_winners.len > 0) {
         try html.print(allocator, "<h2>Recommendation by sensor type</h2>\n", .{});
-        for (type_recommendations) |tr| {
-            try html.print(allocator, "<h3 style=\"font-size:15px;margin:16px 0 6px\">{s}</h3>\n", .{@tagName(tr.sensor_type)});
-            if (tr.compound.realtime.scores.len > 0) try writeScoreTableHtml(&html, allocator, "Real-time", tr.compound.realtime.scores);
-            if (tr.compound.historical.scores.len > 0) try writeScoreTableHtml(&html, allocator, "Historical", tr.compound.historical.scores);
+        try html.print(allocator, "<div class=\"scroll\"><table>\n<tr><th>Sensor type</th><th>Live</th><th>Historical</th></tr>\n", .{});
+        for (type_track_winners) |ttw| {
+            try html.print(allocator, "<tr><td>{s}</td><td>", .{@tagName(ttw.sensor_type)});
+            if (ttw.winners.realtime_total > 0) {
+                try html.print(allocator, "{s} ({d}/{d})", .{ ttw.winners.realtime_winner, ttw.winners.realtime_wins, ttw.winners.realtime_total });
+            } else {
+                try html.print(allocator, "—", .{});
+            }
+            try html.print(allocator, "</td><td>", .{});
+            if (ttw.winners.historical_total > 0) {
+                try html.print(allocator, "{s} ({d}/{d})", .{ ttw.winners.historical_winner, ttw.winners.historical_wins, ttw.winners.historical_total });
+            } else {
+                try html.print(allocator, "—", .{});
+            }
+            try html.print(allocator, "</td></tr>\n", .{});
         }
+        try html.print(allocator, "</table></div>\n", .{});
     }
 
     try html.print(allocator, "<details>\n<summary>Per-query latency detail</summary>\n", .{});
@@ -1628,30 +1490,5 @@ pub fn writeBuildingHtmlReport(
     try html.print(allocator, "</script>\n</body>\n</html>\n", .{});
 
     try dir.writeFile(io, .{ .sub_path = "recommendation.html", .data = html.items });
-}
-
-/// One score table (with a proportional bar meter per row, winner
-/// highlighted) for the HTML dashboard. `scores` must be sorted ascending
-/// by score (best first) — the shape TrackRecommendation.scores is already
-/// in. Bar width is `best_score / this_score` (winner = 100%, since lower
-/// scores are better).
-fn writeScoreTableHtml(
-    html: *std.ArrayList(u8),
-    allocator: std.mem.Allocator,
-    title: []const u8,
-    scores: []const BackendScore,
-) !void {
-    if (scores.len == 0) return;
-    try html.print(allocator, "<h3 style=\"font-size:14px;margin:14px 0 6px\">{s}</h3>\n", .{title});
-    try html.print(allocator, "<div class=\"scroll\"><table>\n<tr><th>Backend</th><th>Score</th><th>Coverage</th><th></th></tr>\n", .{});
-    const best = scores[0].score;
-    for (scores, 0..) |s, i| {
-        const bar_pct: f64 = if (s.score > 0) @min((best / s.score) * 100.0, 100.0) else 0.0;
-        const winner_class: []const u8 = if (i == 0) " winner" else "";
-        try html.print(allocator, "<tr><td>{s}</td><td>{d:.2}</td><td>{d:.0}%</td><td><div class=\"bar-track\"><div class=\"bar-fill{s}\" style=\"width:{d:.1}%\"></div></div></td></tr>\n", .{
-            s.backend, s.score, s.coverage * 100, winner_class, bar_pct,
-        });
-    }
-    try html.print(allocator, "</table></div>\n", .{});
 }
 
