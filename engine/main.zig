@@ -32,7 +32,7 @@ const cost_model = @import("benchmark/cost_model.zig");
 const schematic = @import("benchmark/schematic.zig");
 const sim = @import("benchmark/simulation.zig");
 
-const Args = struct {
+pub const Args = struct {
     bim_path: []const u8,
     output_dir: []const u8,
 };
@@ -49,10 +49,21 @@ fn printUsage() void {
 
 /// `arena` backs every returned string — freed automatically when the
 /// process exits (per `std.process.Init.arena`), so callers don't need to
-/// free `Args` fields individually.
+/// free `Args` fields individually. Thin OS wrapper around
+/// `parseArgsFromSlice` — `std.process.Args` is a real, platform-specific
+/// type (a WTF-16 vector on Windows, a `[*:0]const u8` vector on POSIX),
+/// not something a test can construct directly, so the actual parsing logic
+/// lives in the plain-slice version below where it's testable.
 fn parseArgs(arena: std.mem.Allocator, args: std.process.Args) !Args {
     const argv = try args.toSlice(arena);
+    return parseArgsFromSlice(argv);
+}
 
+/// `argv[0]` is conventionally the program name and is ignored, matching
+/// `std.process.Args.toSlice`'s contract (index 0 is the executable).
+/// Parameter type matches `toSlice`'s return type exactly so the real
+/// caller above needs no conversion.
+fn parseArgsFromSlice(argv: []const [:0]const u8) !Args {
     var bim_path: ?[]const u8 = null;
     var output_dir: []const u8 = "benchmark-results";
 
@@ -123,6 +134,64 @@ test "floorIdForZone: a cyclic parent_id chain does not hang — falls back to t
 
     const result = floorIdForZone(&elements, 1, .space);
     try std.testing.expectEqual(@as(u32, 1), result);
+}
+
+// ---------------------------------------------------------------------------
+// Tests — CLI argument parsing (parseArgsFromSlice). This file had no
+// argument-parsing coverage until 2026-07-20: parseArgs itself can't be
+// tested directly (std.process.Args is a real, platform-specific OS type —
+// a WTF-16 vector on Windows, [*:0]const u8 on POSIX — not something a test
+// can construct), so parseArgsFromSlice carries the actual logic against a
+// plain argv slice, matching toSlice's contract that argv[0] is the program
+// name.
+// ---------------------------------------------------------------------------
+
+test "parseArgsFromSlice: --bim is required; missing it is an error, not a silent default" {
+    const argv = [_][:0]const u8{"dt"};
+    try std.testing.expectError(error.MissingBimPath, parseArgsFromSlice(&argv));
+}
+
+test "parseArgsFromSlice: --out defaults to benchmark-results when omitted" {
+    const argv = [_][:0]const u8{ "dt", "--bim", "model.ifc" };
+    const args = try parseArgsFromSlice(&argv);
+    try std.testing.expectEqualStrings("model.ifc", args.bim_path);
+    try std.testing.expectEqualStrings("benchmark-results", args.output_dir);
+}
+
+test "parseArgsFromSlice: both flags are honored regardless of order" {
+    const forward = [_][:0]const u8{ "dt", "--bim", "a.ifc", "--out", "results" };
+    const a1 = try parseArgsFromSlice(&forward);
+    try std.testing.expectEqualStrings("a.ifc", a1.bim_path);
+    try std.testing.expectEqualStrings("results", a1.output_dir);
+
+    const reversed = [_][:0]const u8{ "dt", "--out", "results", "--bim", "a.ifc" };
+    const a2 = try parseArgsFromSlice(&reversed);
+    try std.testing.expectEqualStrings("a.ifc", a2.bim_path);
+    try std.testing.expectEqualStrings("results", a2.output_dir);
+}
+
+test "parseArgsFromSlice: --help/-h returns HelpRequested even with other flags present" {
+    const long = [_][:0]const u8{ "dt", "--help" };
+    try std.testing.expectError(error.HelpRequested, parseArgsFromSlice(&long));
+
+    const short = [_][:0]const u8{ "dt", "-h" };
+    try std.testing.expectError(error.HelpRequested, parseArgsFromSlice(&short));
+
+    const mixed = [_][:0]const u8{ "dt", "--bim", "a.ifc", "-h" };
+    try std.testing.expectError(error.HelpRequested, parseArgsFromSlice(&mixed));
+}
+
+test "parseArgsFromSlice: an unrecognized flag is rejected, not silently ignored" {
+    const argv = [_][:0]const u8{ "dt", "--bim", "a.ifc", "--bogus" };
+    try std.testing.expectError(error.UnknownArgument, parseArgsFromSlice(&argv));
+}
+
+test "parseArgsFromSlice: --bim/--out with no following value is an error, not an out-of-bounds read" {
+    const missing_bim_value = [_][:0]const u8{ "dt", "--bim" };
+    try std.testing.expectError(error.MissingValue, parseArgsFromSlice(&missing_bim_value));
+
+    const missing_out_value = [_][:0]const u8{ "dt", "--bim", "a.ifc", "--out" };
+    try std.testing.expectError(error.MissingValue, parseArgsFromSlice(&missing_out_value));
 }
 
 fn buildZoneFloorMap(
@@ -312,10 +381,6 @@ const full_retention_names = blk: {
 };
 
 pub fn main(init: std.process.Init) !void {
-    const allocator = init.gpa;
-    const io = init.io;
-    const run_start = std.Io.Clock.awake.now(io);
-
     const args = parseArgs(init.arena.allocator(), init.minimal.args) catch |err| switch (err) {
         error.HelpRequested => {
             printUsage();
@@ -326,6 +391,19 @@ pub fn main(init: std.process.Init) !void {
             return err;
         },
     };
+
+    try runPipeline(init.gpa, init.io, args);
+}
+
+/// The full parse-place-simulate-report pipeline, everything `main()` does
+/// once it has a validated `Args`. Split out so integration tests can drive
+/// it directly against a real IFC file with a manually-built `Args` and a
+/// test-local `std.Io.Threaded` — the same `io`-construction pattern
+/// `runner.zig`'s own "run: writes latency.md..." test already uses —
+/// instead of needing a real OS process (`std.process.Init` isn't
+/// constructible in a test).
+pub fn runPipeline(allocator: std.mem.Allocator, io: std.Io, args: Args) !void {
+    const run_start = std.Io.Clock.awake.now(io);
 
     std.debug.print("\n[1/6] Parsing IFC: {s}...\n", .{args.bim_path});
     const parse_start = std.Io.Clock.awake.now(io);

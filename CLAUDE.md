@@ -191,11 +191,21 @@ whether ClickHouse answers in 80 ms or 800 ms. Absolute numbers are approximate;
 ## 7. Build, test & run
 
 ```sh
-zig build            # compile the platform
-zig build test       # run unit + golden-result tests
-zig build bench      # run the full benchmark suite
+zig build                 # compile the platform
+zig build test            # run unit + golden-result tests (fast, -ODebug)
+zig build test-integration # run end-to-end pipeline tests against real IFC files (-OReleaseFast — see below)
+zig build bench           # run the full benchmark suite
 zig build run -- --bim path/to/model.ifc --out results-dir
 ```
+
+`test-integration` (added 2026-07-20, `engine/integration_test.zig`) drives `main.zig`'s
+`runPipeline` directly against real files in `assets/IFC/` and asserts on the actual
+written output (`recommendation.md`/`.html`, `simulation.json`, `schematic.svg`) —
+exercising the real CLI entry point, not just individual internal functions. It is
+**deliberately not part of `test`**: sim duration is derived from the building's own
+placed sensor types' retention (up to ~7 years for structural sensors), and a
+multi-year simulated run in `-ODebug` turns into a multi-hour wall-clock one (§3.4) —
+same reason `dt`/`dtb` are forced `ReleaseFast` regardless of `-Doptimize`.
 
 > **Agent note:** if these commands are not yet wired in `build.zig`, wiring them is a
 > legitimate early task — but do it as its own change, documented in the PR.
