@@ -20,14 +20,28 @@
 // within that block finds the exact range. This is O(log(n/granule))
 // instead of O(log n) — fewer comparisons, better cache locality.
 //
-// Column compression (matching ClickHouse encodings):
-//   - Timestamps: delta encoding + zigzag + LEB128 varint (ClickHouse's
-//     DELTA_BINARY_PACKED analogue).
+// Column compression (matching ClickHouse encodings, verified against
+// outside sources 2026-07-07 and rechecked 2026-07-20 — see
+// backend-audit.md's dated entries for both passes):
+//   - Timestamps: delta encoding + zigzag + LEB128 varint — ClickHouse's
+//     actual codec name for this is CODEC(Delta) (or CODEC(DoubleDelta)
+//     for constant-rate data, which we don't distinguish). The previous
+//     comment here named this "ClickHouse's DELTA_BINARY_PACKED" —
+//     DELTA_BINARY_PACKED is a Parquet encoding name, not a ClickHouse
+//     one (ClickHouse's own name is simply "Delta"); corrected 2026-07-20.
 //   - Sensor IDs: dictionary encoding (ClickHouse's LowCardinality).
 //     A small dictionary of unique IDs + u16 indices per row.
-//   - Values: delta encoding + zigzag + varint (ClickHouse's
-//     DELTA_DOUBLE for float columns — we use integer zigzag on the
-//     bit-cast representation).
+//   - Values: delta encoding + zigzag + varint on the bit-cast
+//     representation — NOT what real ClickHouse does for float columns.
+//     ClickHouse's actual float codec is Gorilla (XOR each value against
+//     the previous, encode the leading/trailing zero-bit run) — a
+//     genuinely different technique from delta-on-bit-pattern, not a
+//     naming variant of it. This is a real, working compression scheme
+//     (typically a real win when consecutive readings are close, since
+//     IEEE-754 bit patterns are monotonic with value for same-sign
+//     floats), just not the one ClickHouse ships. Mislabeled as
+//     "ClickHouse's DELTA_DOUBLE" (not a real ClickHouse codec name)
+//     until corrected 2026-07-20 — see backend-audit.md.
 //   - Sensor_type: NOT stored — implicit from the partition key, saving
 //     an entire column (ClickHouse partition pruning).
 //
@@ -531,7 +545,9 @@ fn ensurePartitionCompressed(self: *Self, part: *Partition) !void {
         try part.sid_indices.append(self.allocator, dict_idx);
     }
 
-    // Values: delta + zigzag + varint on bit-cast f32->i32->u32.
+    // Values: delta + zigzag + varint on bit-cast f32->i32->u32 — a
+    // delta-on-bit-pattern scheme, not ClickHouse's actual Gorilla/XOR
+    // float codec. See the file header's 2026-07-20 correction.
     part.val_deltas.clearRetainingCapacity();
     var prev_bits: u32 = 0;
     for (part.values.items) |val| {
