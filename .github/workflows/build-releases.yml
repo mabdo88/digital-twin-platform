@@ -39,7 +39,7 @@ jobs:
           cp zig-out/bin/${{ matrix.output }} dist/ || cp zig-out/bin/dt dist/${{ matrix.output }}
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
           path: dist/${{ matrix.output }}
@@ -55,7 +55,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Download artifacts
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           path: artifacts
 
