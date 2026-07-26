@@ -2,6 +2,11 @@
 
 Ready-to-run binaries for Windows, Linux, and macOS (Intel and ARM).
 
+**Prefer the [GitHub Releases page](https://github.com/mabdo88/digital-twin-platform/releases/latest)** —
+it's rebuilt automatically by CI on every tag, so it can't go stale the way
+files committed here can. The binaries below are kept in sync manually as a
+convenience for browsing the repo directly.
+
 ## Download and run
 
 Pick the executable for your platform and save it somewhere on your computer.

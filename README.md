@@ -29,7 +29,7 @@ apples-to-apples through one shared interface.
 
 ## Quick start
 
-**For end users:** Download a pre-built executable from [`releases/`](releases/) and run it from the terminal (see [`releases/README.md`](releases/README.md)).
+**For end users:** Download a pre-built executable from the [Releases page](https://github.com/mabdo88/digital-twin-platform/releases/latest) and run it from the terminal (see [`releases/README.md`](releases/README.md)).
 
 **For developers:** Clone the repo and build with Zig:
 
