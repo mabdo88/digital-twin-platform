@@ -26,6 +26,7 @@ apples-to-apples through one shared interface.
 - [`CLAUDE.md`](CLAUDE.md) — non-negotiable project rules (read this first if contributing).
 - [`AGENT.md`](AGENT.md) — phase-by-phase workflow and task checklist.
 - [`.cascade/digital-twin/backend-audit.md`](.cascade/digital-twin/backend-audit.md) — known issues per backend.
+- [`LICENSE`](LICENSE) — MIT.
 
 ## Quick start
 
