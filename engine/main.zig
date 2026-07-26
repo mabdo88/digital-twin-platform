@@ -42,7 +42,7 @@ fn printUsage() void {
         \\Usage: dt --bim <path/to/model.ifc> [--out <dir>]
         \\
         \\  --bim   Path to an IFC SPF file to parse and populate sensors from (required).
-        \\  --out   Directory to write benchmark.html/latency.md/latency.json into (default: benchmark-results).
+        \\  --out   Directory to write recommendation.md/.html, simulation.json, and schematic.svg into (default: benchmark-results).
         \\
     , .{});
 }
