@@ -20,14 +20,28 @@
 // within that block finds the exact range. This is O(log(n/granule))
 // instead of O(log n) — fewer comparisons, better cache locality.
 //
-// Column compression (matching ClickHouse encodings):
-//   - Timestamps: delta encoding + zigzag + LEB128 varint (ClickHouse's
-//     DELTA_BINARY_PACKED analogue).
+// Column compression (matching ClickHouse encodings, verified against
+// outside sources 2026-07-07 and rechecked 2026-07-20 — see
+// backend-audit.md's dated entries for both passes):
+//   - Timestamps: delta encoding + zigzag + LEB128 varint — ClickHouse's
+//     actual codec name for this is CODEC(Delta) (or CODEC(DoubleDelta)
+//     for constant-rate data, which we don't distinguish). The previous
+//     comment here named this "ClickHouse's DELTA_BINARY_PACKED" —
+//     DELTA_BINARY_PACKED is a Parquet encoding name, not a ClickHouse
+//     one (ClickHouse's own name is simply "Delta"); corrected 2026-07-20.
 //   - Sensor IDs: dictionary encoding (ClickHouse's LowCardinality).
 //     A small dictionary of unique IDs + u16 indices per row.
-//   - Values: delta encoding + zigzag + varint (ClickHouse's
-//     DELTA_DOUBLE for float columns — we use integer zigzag on the
-//     bit-cast representation).
+//   - Values: delta encoding + zigzag + varint on the bit-cast
+//     representation — NOT what real ClickHouse does for float columns.
+//     ClickHouse's actual float codec is Gorilla (XOR each value against
+//     the previous, encode the leading/trailing zero-bit run) — a
+//     genuinely different technique from delta-on-bit-pattern, not a
+//     naming variant of it. This is a real, working compression scheme
+//     (typically a real win when consecutive readings are close, since
+//     IEEE-754 bit patterns are monotonic with value for same-sign
+//     floats), just not the one ClickHouse ships. Mislabeled as
+//     "ClickHouse's DELTA_DOUBLE" (not a real ClickHouse codec name)
+//     until corrected 2026-07-20 — see backend-audit.md.
 //   - Sensor_type: NOT stored — implicit from the partition key, saving
 //     an entire column (ClickHouse partition pruning).
 //
@@ -170,47 +184,66 @@ pub fn insert(self: *Self, reading: SensorReading) !void {
     if (reading.timestamp > part.max_ts) part.max_ts = reading.timestamp;
     self.total_count += 1;
     self.parts_merged = false;
-    self.updateLatest(reading);
+    try self.updateLatest(reading);
 }
 
 pub fn count(self: *const Self) usize {
     return self.total_count;
 }
 
-/// Reports the compressed footprint across all partitions. Timestamp
-/// and value columns use delta+varint encoding; sensor_id uses dictionary
-/// encoding; sensor_type is eliminated (implicit from partition key).
-///
-/// Disclosed tradeoff: this is a storage-cost proxy for what a real
-/// column store persists to disk, NOT this benchmark's actual resident
-/// RAM. The raw `sensor_ids`/`timestamps`/`values` ArrayLists (see
-/// Partition above) stay fully allocated for every compressed part too —
-/// `rangeByTime`/`iterateAll` scan those raw columns directly rather than
-/// decoding `ts_deltas`/`sid_dict`/`val_deltas` on every query — so this
-/// backend's actual in-process RAM is closer to TimeSeries's uncompressed
-/// footprint than the number below suggests. Fine for comparing on-disk
-/// storage cost across backends; not a live memory measurement for this
-/// one.
+/// Reports actual resident RAM across all partitions. The raw
+/// `sensor_ids`/`timestamps`/`values` ArrayLists (see Partition above) stay
+/// fully allocated even once a partition is compressed — `rangeByTime`/
+/// `iterateAll` scan those raw columns directly rather than decoding
+/// `ts_deltas`/`sid_dict`/`val_deltas` on every query — so the raw columns'
+/// capacity is counted unconditionally, and the compressed columns are
+/// added on top for a compressed partition (they're a second, additional
+/// resident copy, not a replacement). This mirrors the same tradeoff a real
+/// column store makes caching a hot block's decompressed form instead of
+/// re-decoding on every scan: it costs more RAM than disk footprint alone,
+/// and this number reports that true cost rather than an on-disk proxy.
 pub fn memoryUsed(self: *const Self) usize {
     var total: usize = self.partitions.capacity() * (@sizeOf(PartitionKey) + @sizeOf(Partition));
     var it = self.partitions.iterator();
     while (it.next()) |entry| {
         const part = entry.value_ptr;
+        total += part.timestamps.capacity * @sizeOf(i64);
+        total += part.sensor_ids.capacity * @sizeOf(u32);
+        total += part.values.capacity * @sizeOf(f32);
         if (part.compressed) {
-            total += part.ts_deltas.items.len; // compressed timestamps
+            total += part.ts_deltas.items.len; // compressed timestamps (additional, resident)
             total += part.sid_dict.items.len * @sizeOf(u32); // dictionary
             total += part.sid_indices.items.len * @sizeOf(u16); // indices
-            total += part.val_deltas.items.len; // compressed values
-        } else {
-            total += part.timestamps.capacity * @sizeOf(i64);
-            total += part.sensor_ids.capacity * @sizeOf(u32);
-            total += part.values.capacity * @sizeOf(f32);
+            total += part.val_deltas.items.len; // compressed values (additional, resident)
         }
         total += part.granule_marks.items.len * @sizeOf(usize);
         total += part.granule_ts.items.len * @sizeOf(i64);
     }
     total += self.latest_by_sensor.capacity() * (@sizeOf(u32) + @sizeOf(SensorReading));
     return total + self.zone_index.memoryUsed();
+}
+
+test "memoryUsed: compression adds to the resident total, never subtracts from it" {
+    const allocator = std.testing.allocator;
+    var backend = try Self.init(allocator);
+    defer backend.deinit();
+
+    var t: i64 = 0;
+    while (t < 200) : (t += 1) {
+        try backend.insert(.{ .sensor_id = 1, .timestamp = t, .value = @floatFromInt(t), .sensor_type = .temperature });
+    }
+
+    const before = backend.memoryUsed();
+
+    // rangeByTime lazily compresses every overlapping partition.
+    const result = try backend.rangeByTime(allocator, .{ .start_time = 0, .end_time = 1000 });
+    allocator.free(result);
+
+    // The raw columns stay resident and queried directly post-compression
+    // (see memoryUsed's doc comment), so the reported total must never drop
+    // below the pre-compression figure — that would mean the raw columns
+    // silently stopped being counted.
+    try std.testing.expect(backend.memoryUsed() >= before);
 }
 
 /// Iteration order: sorted by (timestamp asc, sensor_id asc).
@@ -250,7 +283,11 @@ pub fn iterateAll(self: *const Self, allocator: std.mem.Allocator) ![]const Sens
 
 pub fn getLatestBySensor(self: *const Self, sensor_id: u32) ?SensorReading {
     const self_mut: *Self = @constCast(self);
-    if (self_mut.latest_dirty) self_mut.rebuildLatest();
+    // Fixed by the StorageBackend interface (?SensorReading, no error
+    // union) — an OOM here has nowhere to propagate, unlike rangeByTime/
+    // allSensorIds below, which are already fallible and `try` this same
+    // rebuild. Swallowing is the structural floor for this one call site.
+    if (self_mut.latest_dirty) self_mut.rebuildLatest() catch {};
     return self_mut.latest_by_sensor.get(sensor_id);
 }
 
@@ -263,6 +300,19 @@ pub fn rangeByTime(self: *const Self, allocator: std.mem.Allocator, q: RangeQuer
 
     try self_mut.mergeParts();
 
+    // When scoped to one sensor, narrow the partition scan to that
+    // sensor's own type instead of paying ensurePartitionCompressed/
+    // ensureGranuleIndex setup on every time-overlapping partition
+    // regardless of type. A sensor's type is fixed across all its
+    // readings, and latest_by_sensor already caches it. A sensor with no
+    // resident readings (no entry here) has nothing to return.
+    var only_type: ?SensorType = null;
+    if (q.sensor_id) |sid| {
+        if (self_mut.latest_dirty) try self_mut.rebuildLatest();
+        const latest = self.latest_by_sensor.get(sid) orelse return &.{};
+        only_type = latest.sensor_type;
+    }
+
     var result: std.ArrayList(SensorReading) = .empty;
     defer result.deinit(allocator);
 
@@ -270,6 +320,10 @@ pub fn rangeByTime(self: *const Self, allocator: std.mem.Allocator, q: RangeQuer
     while (it.next()) |entry| {
         const key = entry.key_ptr.*;
         const part = entry.value_ptr;
+
+        if (only_type) |t| {
+            if (key.sensor_type != t) continue;
+        }
 
         // Use min_ts/max_ts for pruning instead of day_index, so merged
         // parts spanning multiple days are correctly included.
@@ -407,7 +461,7 @@ pub fn allSensorIds(self: *const Self, allocator: std.mem.Allocator) ![]u32 {
     defer result.deinit(allocator);
 
     const self_mut: *Self = @constCast(self);
-    if (self_mut.latest_dirty) self_mut.rebuildLatest();
+    if (self_mut.latest_dirty) try self_mut.rebuildLatest();
     var it = self_mut.latest_by_sensor.keyIterator();
     while (it.next()) |k| try result.append(allocator, k.*);
 
@@ -487,20 +541,13 @@ fn ensurePartitionCompressed(self: *Self, part: *Partition) !void {
     part.sid_dict.clearRetainingCapacity();
     part.sid_indices.clearRetainingCapacity();
     for (part.sensor_ids.items) |sid| {
-        var dict_idx: u16 = 0;
-        for (part.sid_dict.items, 0..) |d_sid, i| {
-            if (d_sid == sid) {
-                dict_idx = @intCast(i);
-                break;
-            }
-        } else {
-            dict_idx = @intCast(part.sid_dict.items.len);
-            try part.sid_dict.append(self.allocator, sid);
-        }
+        const dict_idx = try sb.dictionaryIndex(self.allocator, &part.sid_dict, sid);
         try part.sid_indices.append(self.allocator, dict_idx);
     }
 
-    // Values: delta + zigzag + varint on bit-cast f32->i32->u32.
+    // Values: delta + zigzag + varint on bit-cast f32->i32->u32 — a
+    // delta-on-bit-pattern scheme, not ClickHouse's actual Gorilla/XOR
+    // float codec. See the file header's 2026-07-20 correction.
     part.val_deltas.clearRetainingCapacity();
     var prev_bits: u32 = 0;
     for (part.values.items) |val| {
@@ -513,18 +560,18 @@ fn ensurePartitionCompressed(self: *Self, part: *Partition) !void {
     part.compressed = true;
 }
 
-fn updateLatest(self: *Self, reading: SensorReading) void {
+fn updateLatest(self: *Self, reading: SensorReading) !void {
     if (self.latest_dirty) return;
     if (self.latest_by_sensor.get(reading.sensor_id)) |current| {
         if (reading.timestamp > current.timestamp) {
-            self.latest_by_sensor.put(reading.sensor_id, reading) catch {};
+            try self.latest_by_sensor.put(reading.sensor_id, reading);
         }
     } else {
-        self.latest_by_sensor.put(reading.sensor_id, reading) catch {};
+        try self.latest_by_sensor.put(reading.sensor_id, reading);
     }
 }
 
-fn rebuildLatest(self: *Self) void {
+fn rebuildLatest(self: *Self) !void {
     self.latest_by_sensor.clearRetainingCapacity();
     var it = self.partitions.iterator();
     while (it.next()) |entry| {
@@ -535,20 +582,20 @@ fn rebuildLatest(self: *Self) void {
             const ts = part.timestamps.items[i];
             if (self.latest_by_sensor.get(sid)) |current| {
                 if (ts > current.timestamp) {
-                    self.latest_by_sensor.put(sid, .{
+                    try self.latest_by_sensor.put(sid, .{
                         .sensor_id = sid,
                         .timestamp = ts,
                         .value = part.values.items[i],
                         .sensor_type = key.sensor_type,
-                    }) catch {};
+                    });
                 }
             } else {
-                self.latest_by_sensor.put(sid, .{
+                try self.latest_by_sensor.put(sid, .{
                     .sensor_id = sid,
                     .timestamp = ts,
                     .value = part.values.items[i],
                     .sensor_type = key.sensor_type,
-                }) catch {};
+                });
             }
         }
     }

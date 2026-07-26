@@ -32,7 +32,7 @@ const cost_model = @import("benchmark/cost_model.zig");
 const schematic = @import("benchmark/schematic.zig");
 const sim = @import("benchmark/simulation.zig");
 
-const Args = struct {
+pub const Args = struct {
     bim_path: []const u8,
     output_dir: []const u8,
 };
@@ -49,10 +49,21 @@ fn printUsage() void {
 
 /// `arena` backs every returned string — freed automatically when the
 /// process exits (per `std.process.Init.arena`), so callers don't need to
-/// free `Args` fields individually.
+/// free `Args` fields individually. Thin OS wrapper around
+/// `parseArgsFromSlice` — `std.process.Args` is a real, platform-specific
+/// type (a WTF-16 vector on Windows, a `[*:0]const u8` vector on POSIX),
+/// not something a test can construct directly, so the actual parsing logic
+/// lives in the plain-slice version below where it's testable.
 fn parseArgs(arena: std.mem.Allocator, args: std.process.Args) !Args {
     const argv = try args.toSlice(arena);
+    return parseArgsFromSlice(argv);
+}
 
+/// `argv[0]` is conventionally the program name and is ignored, matching
+/// `std.process.Args.toSlice`'s contract (index 0 is the executable).
+/// Parameter type matches `toSlice`'s return type exactly so the real
+/// caller above needs no conversion.
+fn parseArgsFromSlice(argv: []const [:0]const u8) !Args {
     var bim_path: ?[]const u8 = null;
     var output_dir: []const u8 = "benchmark-results";
 
@@ -101,12 +112,86 @@ fn findElement(elements: []const ifc.BuildingElement, id: u32) ?ifc.BuildingElem
 fn floorIdForZone(elements: []const ifc.BuildingElement, zone_id: u32, zone_type: ifc.ZoneType) u32 {
     if (zone_type == .storey) return zone_id;
     var current = findElement(elements, zone_id);
-    while (current) |el| {
+    // Bound the walk in case of cyclic parent_id data — same guard as
+    // ifc_parser.resolvePlacement, and the same reason: trusting the input
+    // is how runtime hangs are born. A cycle falls back to the "no
+    // containing storey found" case below, same as an exhausted hierarchy.
+    var hops: usize = 0;
+    while (current) |el| : (hops += 1) {
+        if (hops > 64) break;
         if (el.element_type == .storey) return el.ifc_id;
         current = if (el.parent_id) |pid| findElement(elements, pid) else null;
     }
     // No containing storey found in the hierarchy — the zone is its own floor.
     return zone_id;
+}
+
+test "floorIdForZone: a cyclic parent_id chain does not hang — falls back to the zone's own id" {
+    const elements = [_]ifc.BuildingElement{
+        .{ .ifc_id = 1, .name = "", .element_type = .space, .parent_id = 2, .position = .{ .x = 0, .y = 0, .z = 0 } },
+        .{ .ifc_id = 2, .name = "", .element_type = .space, .parent_id = 1, .position = .{ .x = 0, .y = 0, .z = 0 } },
+    };
+
+    const result = floorIdForZone(&elements, 1, .space);
+    try std.testing.expectEqual(@as(u32, 1), result);
+}
+
+// ---------------------------------------------------------------------------
+// Tests — CLI argument parsing (parseArgsFromSlice). This file had no
+// argument-parsing coverage until 2026-07-20: parseArgs itself can't be
+// tested directly (std.process.Args is a real, platform-specific OS type —
+// a WTF-16 vector on Windows, [*:0]const u8 on POSIX — not something a test
+// can construct), so parseArgsFromSlice carries the actual logic against a
+// plain argv slice, matching toSlice's contract that argv[0] is the program
+// name.
+// ---------------------------------------------------------------------------
+
+test "parseArgsFromSlice: --bim is required; missing it is an error, not a silent default" {
+    const argv = [_][:0]const u8{"dt"};
+    try std.testing.expectError(error.MissingBimPath, parseArgsFromSlice(&argv));
+}
+
+test "parseArgsFromSlice: --out defaults to benchmark-results when omitted" {
+    const argv = [_][:0]const u8{ "dt", "--bim", "model.ifc" };
+    const args = try parseArgsFromSlice(&argv);
+    try std.testing.expectEqualStrings("model.ifc", args.bim_path);
+    try std.testing.expectEqualStrings("benchmark-results", args.output_dir);
+}
+
+test "parseArgsFromSlice: both flags are honored regardless of order" {
+    const forward = [_][:0]const u8{ "dt", "--bim", "a.ifc", "--out", "results" };
+    const a1 = try parseArgsFromSlice(&forward);
+    try std.testing.expectEqualStrings("a.ifc", a1.bim_path);
+    try std.testing.expectEqualStrings("results", a1.output_dir);
+
+    const reversed = [_][:0]const u8{ "dt", "--out", "results", "--bim", "a.ifc" };
+    const a2 = try parseArgsFromSlice(&reversed);
+    try std.testing.expectEqualStrings("a.ifc", a2.bim_path);
+    try std.testing.expectEqualStrings("results", a2.output_dir);
+}
+
+test "parseArgsFromSlice: --help/-h returns HelpRequested even with other flags present" {
+    const long = [_][:0]const u8{ "dt", "--help" };
+    try std.testing.expectError(error.HelpRequested, parseArgsFromSlice(&long));
+
+    const short = [_][:0]const u8{ "dt", "-h" };
+    try std.testing.expectError(error.HelpRequested, parseArgsFromSlice(&short));
+
+    const mixed = [_][:0]const u8{ "dt", "--bim", "a.ifc", "-h" };
+    try std.testing.expectError(error.HelpRequested, parseArgsFromSlice(&mixed));
+}
+
+test "parseArgsFromSlice: an unrecognized flag is rejected, not silently ignored" {
+    const argv = [_][:0]const u8{ "dt", "--bim", "a.ifc", "--bogus" };
+    try std.testing.expectError(error.UnknownArgument, parseArgsFromSlice(&argv));
+}
+
+test "parseArgsFromSlice: --bim/--out with no following value is an error, not an out-of-bounds read" {
+    const missing_bim_value = [_][:0]const u8{ "dt", "--bim" };
+    try std.testing.expectError(error.MissingValue, parseArgsFromSlice(&missing_bim_value));
+
+    const missing_out_value = [_][:0]const u8{ "dt", "--bim", "a.ifc", "--out" };
+    try std.testing.expectError(error.MissingValue, parseArgsFromSlice(&missing_out_value));
 }
 
 fn buildZoneFloorMap(
@@ -287,8 +372,8 @@ fn buildSchematicData(
 }
 
 /// Comptime-extracted names of the full-retention backends
-/// (runner.supported_backends) — passed to `recommendCompound` as the
-/// eligible set for the historical track.
+/// (runner.supported_backends) — passed to `report.perQueryResults` as the
+/// eligible set for non-real-time queries.
 const full_retention_names = blk: {
     var names: [runner.supported_backends.len][]const u8 = undefined;
     for (runner.supported_backends, 0..) |b, i| names[i] = b.name;
@@ -296,10 +381,6 @@ const full_retention_names = blk: {
 };
 
 pub fn main(init: std.process.Init) !void {
-    const allocator = init.gpa;
-    const io = init.io;
-    const run_start = std.Io.Clock.awake.now(io);
-
     const args = parseArgs(init.arena.allocator(), init.minimal.args) catch |err| switch (err) {
         error.HelpRequested => {
             printUsage();
@@ -310,6 +391,19 @@ pub fn main(init: std.process.Init) !void {
             return err;
         },
     };
+
+    try runPipeline(init.gpa, init.io, args);
+}
+
+/// The full parse-place-simulate-report pipeline, everything `main()` does
+/// once it has a validated `Args`. Split out so integration tests can drive
+/// it directly against a real IFC file with a manually-built `Args` and a
+/// test-local `std.Io.Threaded` — the same `io`-construction pattern
+/// `runner.zig`'s own "run: writes latency.md..." test already uses —
+/// instead of needing a real OS process (`std.process.Init` isn't
+/// constructible in a test).
+pub fn runPipeline(allocator: std.mem.Allocator, io: std.Io, args: Args) !void {
+    const run_start = std.Io.Clock.awake.now(io);
 
     std.debug.print("\n[1/6] Parsing IFC: {s}...\n", .{args.bim_path});
     const parse_start = std.Io.Clock.awake.now(io);
@@ -431,62 +525,77 @@ pub fn main(init: std.process.Init) !void {
     );
 
     std.debug.print("\n[5/6] Computing recommendations...\n", .{});
-    const compound = try report.recommendCompound(allocator, rows.items, scale_label, query_mix, &full_retention_names);
-    defer allocator.free(compound.realtime.scores);
-    defer allocator.free(compound.historical.scores);
+
+    // Get all backend names from runner registry
+    const all_backend_names = comptime blk: {
+        var names: [runner.backends.len][]const u8 = undefined;
+        for (runner.backends, 0..) |b, i| names[i] = b.name;
+        break :blk names;
+    };
+
+    // Compute cost estimates for the recommendation report
+    const cost_estimates = try cost_model.estimateAll(allocator, rows.items, &all_backend_names, cost_model.DEFAULT_WORKLOAD, cost_model.DEFAULT_PRICING);
+    defer allocator.free(cost_estimates);
+
+    // Amortized cost per query, per backend: total annual cost (storage +
+    // query) / queries per year. Total — not just query_cost_year, which is
+    // volume-based and therefore identical for every backend; storage
+    // footprint is what actually differentiates them.
+    var cost_per_query_map: std.StringHashMap(f64) = .init(allocator);
+    defer cost_per_query_map.deinit();
+    for (cost_estimates) |e| {
+        const per_query = e.total_cost_year / @as(f64, @floatFromInt(cost_model.DEFAULT_WORKLOAD.queries_per_year));
+        try cost_per_query_map.put(e.backend, per_query);
+    }
+
+    // The per-query dashboard is the ground truth; the two-track verdict
+    // (track_winners) is derived directly from it by counting wins, not
+    // from a separate weighted-score model — see report.TrackWinners' doc
+    // comment for why the old recommendCompound/scoreBackends approach was
+    // removed 2026-07-20.
+    const query_rankings = try report.perQueryResults(allocator, rows.items, scale_label, cost_per_query_map, &full_retention_names);
+    defer {
+        for (query_rankings) |q| allocator.free(q.results);
+        allocator.free(query_rankings);
+    }
+    const track_winners = try report.pickTrackWinners(allocator, query_rankings);
 
     std.debug.print("\n=== Recommendation ({s}) ===\n", .{scale_label});
-    std.debug.print("Real-time track (latest_* queries — all backends compete):\n", .{});
-    std.debug.print("{s:<15} {s:>10} {s:>12}\n", .{ "Backend", "Score", "Coverage" });
-    for (compound.realtime.scores) |s| {
-        std.debug.print("{s:<15} {d:>10.3} {d:>11.0}%\n", .{ s.backend, s.score, s.coverage * 100 });
-    }
-    std.debug.print("Real-time winner: {s}\n\n", .{compound.realtime.winner});
+    std.debug.print("Real-time: {s} (wins {d}/{d} live queries)\n", .{ track_winners.realtime_winner, track_winners.realtime_wins, track_winners.realtime_total });
+    std.debug.print("Historical: {s} (wins {d}/{d} historical queries)\n", .{ track_winners.historical_winner, track_winners.historical_wins, track_winners.historical_total });
+    std.debug.print("\nDeployment combo: {s} (live) + {s} (historical)\n", .{ track_winners.realtime_winner, track_winners.historical_winner });
 
-    std.debug.print("Historical track (aggregation/historical/spatial/anomaly — full-retention backends only):\n", .{});
-    std.debug.print("{s:<15} {s:>10} {s:>12}\n", .{ "Backend", "Score", "Coverage" });
-    for (compound.historical.scores) |s| {
-        std.debug.print("{s:<15} {d:>10.3} {d:>11.0}%\n", .{ s.backend, s.score, s.coverage * 100 });
-    }
-    std.debug.print("Historical winner: {s}\n", .{compound.historical.winner});
-    std.debug.print("\nDeployment combo: {s} (live) + {s} (historical)\n", .{ compound.realtime.winner, compound.historical.winner });
-
-    var type_recommendations: std.ArrayList(report.TypeRecommendation) = .empty;
-    defer {
-        for (type_recommendations.items) |tr| {
-            allocator.free(tr.compound.realtime.scores);
-            allocator.free(tr.compound.historical.scores);
-        }
-        type_recommendations.deinit(allocator);
-    }
+    var type_track_winners: std.ArrayList(report.TypeTrackWinners) = .empty;
+    defer type_track_winners.deinit(allocator);
 
     for (type_samples) |ts| {
-        // Each type's OWN type-scoped queries — not a shared building-wide
-        // filter — since different types can care about different query
-        // patterns (occupancy's relevant_queries differ from vibration's).
-        const type_scoped_mix = try sim.filterTypeScoped(allocator, synthetic.profileFor(ts.sensor_type).relevant_queries);
-        defer allocator.free(type_scoped_mix);
-        if (type_scoped_mix.len == 0) continue;
+        const type_rankings = try report.perQueryResults(allocator, type_rows.items, @tagName(ts.sensor_type), cost_per_query_map, &full_retention_names);
+        defer {
+            for (type_rankings) |q| allocator.free(q.results);
+            allocator.free(type_rankings);
+        }
+        if (type_rankings.len == 0) continue;
 
-        const tc = try report.recommendCompound(allocator, type_rows.items, @tagName(ts.sensor_type), type_scoped_mix, &full_retention_names);
-        try type_recommendations.append(allocator, .{ .sensor_type = ts.sensor_type, .compound = tc });
+        const tw = try report.pickTrackWinners(allocator, type_rankings);
+        try type_track_winners.append(allocator, .{ .sensor_type = ts.sensor_type, .winners = tw });
     }
 
-    if (type_recommendations.items.len > 0) {
+    if (type_track_winners.items.len > 0) {
         std.debug.print("\n=== Recommendation by Sensor Type ({s}) ===\n", .{scale_label});
-        for (type_recommendations.items) |tr| {
-            if (tr.compound.realtime.scores.len > 0 and tr.compound.historical.scores.len > 0) {
-                std.debug.print("{s:<14} live: {s} | historical: {s}\n", .{ @tagName(tr.sensor_type), tr.compound.realtime.winner, tr.compound.historical.winner });
-            } else if (tr.compound.historical.scores.len > 0) {
-                std.debug.print("{s:<14} historical: {s}\n", .{ @tagName(tr.sensor_type), tr.compound.historical.winner });
-            } else if (tr.compound.realtime.scores.len > 0) {
-                std.debug.print("{s:<14} live: {s}\n", .{ @tagName(tr.sensor_type), tr.compound.realtime.winner });
+        for (type_track_winners.items) |ttw| {
+            if (ttw.winners.realtime_total > 0 and ttw.winners.historical_total > 0) {
+                std.debug.print("{s:<14} live: {s} | historical: {s}\n", .{ @tagName(ttw.sensor_type), ttw.winners.realtime_winner, ttw.winners.historical_winner });
+            } else if (ttw.winners.historical_total > 0) {
+                std.debug.print("{s:<14} historical: {s}\n", .{ @tagName(ttw.sensor_type), ttw.winners.historical_winner });
+            } else if (ttw.winners.realtime_total > 0) {
+                std.debug.print("{s:<14} live: {s}\n", .{ @tagName(ttw.sensor_type), ttw.winners.realtime_winner });
             }
         }
     }
 
     std.debug.print("\n[6/6] Writing reports...\n", .{});
-    try writeRecommendationReport(allocator, io, args.output_dir, args.bim_path, scale_label, model, placement, compound, rows.items, type_recommendations.items, growth.items, sim_stats.items, type_volumes.items, type_quality.items);
+
+    try writeRecommendationReport(allocator, io, args.output_dir, args.bim_path, scale_label, model, placement, track_winners, rows.items, query_rankings, type_track_winners.items, growth.items, sim_stats.items, type_volumes.items, type_quality.items);
     std.debug.print("  Wrote recommendation.md + recommendation.html + simulation.json to {s}/\n", .{args.output_dir});
 
     const sd = try buildSchematicData(allocator, model, placement, zone_floor);
@@ -515,9 +624,10 @@ fn writeRecommendationReport(
     scale_label: []const u8,
     model: ifc.ParsedModel,
     placement: placer.Placement,
-    compound: report.CompoundRecommendation,
+    track_winners: report.TrackWinners,
     rows: []const report.RunRow,
-    type_recommendations: []const report.TypeRecommendation,
+    query_rankings: []const report.QueryRanking,
+    type_track_winners: []const report.TypeTrackWinners,
     growth: []const sim.GrowthPoint,
     sim_stats: []const sim.SimStats,
     type_volumes: []const sim.TypeVolume,
@@ -534,46 +644,15 @@ fn writeRecommendationReport(
     });
 
     try md.print(allocator, "## Verdict\n\n", .{});
-    try md.print(allocator, "**Use `{s}` for live/latest-value queries.**\n\n", .{compound.realtime.winner});
-    try md.print(allocator, "**Use `{s}` for everything else** (history, aggregates, anomalies).\n\n", .{compound.historical.winner});
-
-    if (compound.historical.scores.len > 1) {
-        const hist_margin = compound.historical.scores[1].score / compound.historical.scores[0].score;
-        if (report.isCloseRace(compound.historical.scores)) {
-            try md.print(allocator, "The historical-query race is close: `{s}` vs `{s}` (within 15%) — treat this " ++
-                "specific ranking as a near-tie, not a confident win; single-shot microsecond-scale timing is " ++
-                "sensitive to run-to-run noise at this margin (CLAUDE.md §3.4).\n\n", .{
-                compound.historical.scores[0].backend,
-                compound.historical.scores[1].backend,
-            });
-        } else {
-            try md.print(allocator, "`{s}` wins historical queries by **{d:.1}x** over the next-best backend " ++
-                "(`{s}`) — a decisive, noise-proof margin.\n\n", .{
-                compound.historical.winner,
-                hist_margin,
-                compound.historical.scores[1].backend,
-            });
-        }
-    }
-
-    if (compound.realtime.scores.len > 1) {
-        const rt_margin = compound.realtime.scores[1].score / compound.realtime.scores[0].score;
-        if (report.isCloseRace(compound.realtime.scores)) {
-            try md.print(allocator, "The live-query race is close: `{s}` vs `{s}` (within 15%) — treat this " ++
-                "specific ranking as a near-tie, not a confident win; single-shot microsecond-scale timing is " ++
-                "sensitive to run-to-run noise at this margin (CLAUDE.md §3.4).\n\n", .{
-                compound.realtime.scores[0].backend,
-                compound.realtime.scores[1].backend,
-            });
-        } else {
-            try md.print(allocator, "`{s}` wins live queries by **{d:.1}x** over the next-best backend " ++
-                "(`{s}`) — a clear margin.\n\n", .{
-                compound.realtime.winner,
-                rt_margin,
-                compound.realtime.scores[1].backend,
-            });
-        }
-    }
+    try md.print(allocator, "**Use `{s}` for live/latest-value queries** — wins {d} of {d} real-time queries.\n\n", .{
+        track_winners.realtime_winner, track_winners.realtime_wins, track_winners.realtime_total,
+    });
+    try md.print(allocator, "**Use `{s}` for everything else** (history, aggregates, anomalies) — wins {d} of {d} " ++
+        "historical queries.\n\n", .{
+        track_winners.historical_winner, track_winners.historical_wins, track_winners.historical_total,
+    });
+    try md.print(allocator, "Each winner is whichever backend won the most queries in its family, read directly off " ++
+        "the per-query dashboard below — not a separate blended score.\n\n", .{});
 
     try md.print(allocator, "## Sensors placed, by type\n\n", .{});
     try md.print(allocator, "Density, sampling rate, and retention all come from each type's own canonical " ++
@@ -617,74 +696,39 @@ fn writeRecommendationReport(
         }
     }
 
-    try md.print(allocator, "## Recommendation\n\n", .{});
-    try md.print(allocator, "Recommendations are **compound** — split into two independently-won tracks, because no single backend " ++
-        "should serve both a tiny live cache's workload and a full-history store's workload:\n\n", .{});
-    try md.print(allocator, "1. **Real-time track** (`latest_single`, `latest_zone`, `latest_by_type`) — all backends compete; " ++
-        "the count-capped real-time cache (RingBuffer, 10 readings/sensor) legitimately wins here.\n", .{});
-    try md.print(allocator, "2. **Historical track** (aggregation, historical rollups, spatial, anomaly) — only full-retention " ++
-        "backends compete; the real-time cache is excluded because it evicts data these queries need.\n\n", .{});
-    try md.print(allocator, "Score = weighted average of (this backend's median / the per-query winner's median) across " ++
-        "that track's query mix. **1.00 = won every weighted query; higher is worse.** Coverage below 100% means " ++
-        "the backend has no data for one or more weighted queries.\n\n", .{});
+    // Per-query dashboard: winner + runner-up + amortized cost for every
+    // query. The verdict above is derived directly from this data (win
+    // counts, see report.pickTrackWinners) — this table is the ground
+    // truth, not a separate summary of it.
+    try report.writePerQueryMarkdown(&md, allocator, query_rankings);
 
-    try md.print(allocator, "### Real-time track\n\n", .{});
-    try md.print(allocator, "| Backend | Score | Coverage |\n|---|---:|---:|\n", .{});
-    for (compound.realtime.scores) |s| {
-        try md.print(allocator, "| {s} | {d:.2} | {d:.0}% |\n", .{ s.backend, s.score, s.coverage * 100 });
-    }
-    try md.print(allocator, "\n**Real-time winner: {s}**\n\n", .{compound.realtime.winner});
-
-    try md.print(allocator, "### Historical track\n\n", .{});
-    try md.print(allocator, "| Backend | Score | Coverage |\n|---|---:|---:|\n", .{});
-    for (compound.historical.scores) |s| {
-        try md.print(allocator, "| {s} | {d:.2} | {d:.0}% |\n", .{ s.backend, s.score, s.coverage * 100 });
-    }
-    try md.print(allocator, "\n**Historical winner: {s}**\n\n", .{compound.historical.winner});
-
-    try md.print(allocator, "**Deployment combo: {s} (live) + {s} (historical)**\n\n", .{ compound.realtime.winner, compound.historical.winner });
-
-    if (type_recommendations.len > 0) {
-        var placed_type_count: u32 = 0;
-        for (counts) |c| {
-            if (c > 0) placed_type_count += 1;
-        }
-
+    if (type_track_winners.len > 0) {
         try md.print(allocator, "## Recommendation by Sensor Type\n\n", .{});
-        try md.print(allocator, "Same scoring rule as above, but scoped to one sensor type at a time. Of the " ++
-            "{d} sensor types actually placed in this building, {d} have at least one type-scoped query in their " ++
-            "canonical relevant_queries and are scored below; each is measured once against a real placed sensor " ++
-            "of that exact type, over its full independently-generated dataset. Scores only the query patterns in " ++
-            "that type's own canonical relevant_queries that take a sensor type as an argument (`latest_by_type`, " ++
-            "`avg_zone_type`, `floor_stats`, `daily_zone_rollup`, `anomalies` — whichever are relevant for this " ++
-            "specific type). A type's winner can differ from the building-wide winner above if that type's " ++
-            "relevant queries behave differently.\n\n", .{
-            placed_type_count,
-            type_recommendations.len,
-        });
-        for (type_recommendations) |tr| {
-            if (tr.compound.realtime.scores.len > 0 and tr.compound.historical.scores.len > 0) {
-                try md.print(allocator, "**{s}** — live: **{s}** | historical: **{s}**\n\n", .{ @tagName(tr.sensor_type), tr.compound.realtime.winner, tr.compound.historical.winner });
-            } else if (tr.compound.historical.scores.len > 0) {
-                try md.print(allocator, "**{s}** — historical: **{s}**\n\n", .{ @tagName(tr.sensor_type), tr.compound.historical.winner });
-            } else if (tr.compound.realtime.scores.len > 0) {
-                try md.print(allocator, "**{s}** — live: **{s}**\n\n", .{ @tagName(tr.sensor_type), tr.compound.realtime.winner });
-            }
-            if (tr.compound.realtime.scores.len > 0) {
-                try md.print(allocator, "Real-time:\n\n", .{});
-                try md.print(allocator, "| Backend | Score | Coverage |\n|---|---:|---:|\n", .{});
-                for (tr.compound.realtime.scores) |s| {
-                    try md.print(allocator, "| {s} | {d:.2} | {d:.0}% |\n", .{ s.backend, s.score, s.coverage * 100 });
-                }
-                try md.print(allocator, "\n", .{});
-            }
-            if (tr.compound.historical.scores.len > 0) {
-                try md.print(allocator, "Historical:\n\n", .{});
-                try md.print(allocator, "| Backend | Score | Coverage |\n|---|---:|---:|\n", .{});
-                for (tr.compound.historical.scores) |s| {
-                    try md.print(allocator, "| {s} | {d:.2} | {d:.0}% |\n", .{ s.backend, s.score, s.coverage * 100 });
-                }
-                try md.print(allocator, "\n", .{});
+        try md.print(allocator, "Same win-counting rule as the verdict above, scoped to one sensor type at a time — " ++
+            "each measured once against a real placed sensor of that exact type, over its full independently-" ++
+            "generated dataset. Scores only the query patterns in that type's own canonical relevant_queries that " ++
+            "take a sensor type as an argument (`latest_by_type`, `avg_zone_type`, `floor_stats`, " ++
+            "`daily_zone_rollup`, `anomalies` — whichever are relevant for this specific type). A type's winner " ++
+            "can differ from the building-wide winner above if that type's relevant queries behave differently.\n\n", .{});
+        for (type_track_winners) |ttw| {
+            if (ttw.winners.realtime_total > 0 and ttw.winners.historical_total > 0) {
+                try md.print(allocator, "**{s}** — live: **{s}** ({d}/{d}) | historical: **{s}** ({d}/{d})\n\n", .{
+                    @tagName(ttw.sensor_type),
+                    ttw.winners.realtime_winner,
+                    ttw.winners.realtime_wins,
+                    ttw.winners.realtime_total,
+                    ttw.winners.historical_winner,
+                    ttw.winners.historical_wins,
+                    ttw.winners.historical_total,
+                });
+            } else if (ttw.winners.historical_total > 0) {
+                try md.print(allocator, "**{s}** — historical: **{s}** ({d}/{d})\n\n", .{
+                    @tagName(ttw.sensor_type), ttw.winners.historical_winner, ttw.winners.historical_wins, ttw.winners.historical_total,
+                });
+            } else if (ttw.winners.realtime_total > 0) {
+                try md.print(allocator, "**{s}** — live: **{s}** ({d}/{d})\n\n", .{
+                    @tagName(ttw.sensor_type), ttw.winners.realtime_winner, ttw.winners.realtime_wins, ttw.winners.realtime_total,
+                });
             }
         }
     }
@@ -702,44 +746,29 @@ fn writeRecommendationReport(
         });
     }
 
-    // Explicit per-query winner — the direct answer to "which backend for
-    // this query behavior": for each query pattern this building actually
-    // runs, the single fastest backend at steady state, not left for the
-    // reader to eyeball out of the raw latency table above. Same grouping
-    // logic the internal regression-suite report already uses
-    // (report.writeReports), reused rather than reimplemented. Non-real-time
-    // queries only admit full-retention backends — same eligibility rule the
-    // compound recommendation applies, so a count-capped cache that scanned
-    // 200x less data can't be presented as a "winner" (see writeWinners's
-    // doc comment).
-    try md.print(allocator, "\n### Per-query winner (lowest median)\n\n", .{});
-    try md.print(allocator, "For queries outside the real-time family, only full-retention backends compete " ++
-        "(same rule as the recommendation tracks above) — the real-time cache holds a fraction " ++
-        "of the data those queries need, so its latency on them is not comparable.\n\n", .{});
-    try md.print(allocator, "| Query | Winner | Median | Runner-up | Median | Speedup |\n", .{});
-    try md.print(allocator, "|---|---|---:|---|---:|---:|\n", .{});
-    try report.writeWinners(&md, allocator, rows, scale_label, &full_retention_names, true);
     try md.print(allocator, "\n</details>\n\n", .{});
 
     try md.print(allocator, "See `schematic.svg` in this directory for a floor-by-floor map of placed sensors.\n\n", .{});
 
     // Cost estimate — cloud-equivalent $/year per backend + naive vs optimised
-    const all_backend_names = comptime blk: {
-        var names: [runner.backends.len][]const u8 = undefined;
-        for (runner.backends, 0..) |b, i| names[i] = b.name;
-        break :blk names;
-    };
     // Real-time queries are ~3 of 12 patterns; estimate their fraction of
     // total query volume (latest_* are high-frequency, ~1/sec each, while
     // historical/aggregate are ~1/min — so real-time is the majority of
     // total query count).
     const realtime_query_fraction = 0.7;
 
-    const cost_estimates = try cost_model.estimateAll(allocator, rows, &all_backend_names, cost_model.DEFAULT_WORKLOAD, cost_model.DEFAULT_PRICING);
-    defer allocator.free(cost_estimates);
+    const all_backend_names_inner = comptime blk: {
+        var names: [runner.backends.len][]const u8 = undefined;
+        for (runner.backends, 0..) |b, i| names[i] = b.name;
+        break :blk names;
+    };
+
+    const cost_estimates_for_table = try cost_model.estimateAll(allocator, rows, &all_backend_names_inner, cost_model.DEFAULT_WORKLOAD, cost_model.DEFAULT_PRICING);
+    defer allocator.free(cost_estimates_for_table);
+
     var cost_rows: std.ArrayList(report.CostRow) = .empty;
     defer cost_rows.deinit(allocator);
-    for (cost_estimates) |e| {
+    for (cost_estimates_for_table) |e| {
         try cost_rows.append(allocator, .{
             .backend = e.backend,
             .storage_gb = e.storage_tb * 1024.0,
@@ -748,16 +777,16 @@ fn writeRecommendationReport(
             .total_cost_year = e.total_cost_year,
         });
     }
-    const naive_cost = cost_model.naiveTotalCost(rows, &all_backend_names, cost_model.DEFAULT_WORKLOAD, cost_model.DEFAULT_PRICING);
-    const optimised_cost = cost_model.optimisedCost(rows, compound.realtime.winner, compound.historical.winner, realtime_query_fraction, cost_model.DEFAULT_WORKLOAD, cost_model.DEFAULT_PRICING);
+    const naive_cost = cost_model.naiveTotalCost(rows, &all_backend_names_inner, cost_model.DEFAULT_WORKLOAD, cost_model.DEFAULT_PRICING);
+    const optimised_cost = cost_model.optimisedCost(rows, track_winners.realtime_winner, track_winners.historical_winner, realtime_query_fraction, cost_model.DEFAULT_WORKLOAD, cost_model.DEFAULT_PRICING);
 
     try cost_model.writeCostSection(
         &md,
         allocator,
         rows,
-        &all_backend_names,
-        compound.realtime.winner,
-        compound.historical.winner,
+        &all_backend_names_inner,
+        track_winners.realtime_winner,
+        track_winners.historical_winner,
         realtime_query_fraction,
         cost_model.DEFAULT_WORKLOAD,
         cost_model.DEFAULT_PRICING,
@@ -786,10 +815,10 @@ fn writeRecommendationReport(
         bim_path,
         scale_label,
         sensor_type_counts.items,
-        compound,
-        type_recommendations,
+        track_winners,
+        type_track_winners,
         rows,
-        &full_retention_names,
+        query_rankings,
         growth,
         sim_stats,
         cost_rows.items,

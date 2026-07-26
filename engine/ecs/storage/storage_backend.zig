@@ -253,3 +253,61 @@ pub fn assertImplements(comptime T: type) void {
 //      a given type. No effect on already-stored readings.
 
 // ---------------------------------------------------------------------------
+// Shared dictionary encoding — Parquet-style PLAIN_DICTIONARY column,
+// used by Lake (insert-time) and Columnar (lazy compress-time) for their
+// sensor_id column. One partition (a (sensor_type, day) bucket) holds its
+// own small dictionary of unique sensor_ids + a u16 index per row — 2
+// bytes/row instead of 4 for a raw u32, as long as the partition's
+// distinct-sensor-id count stays under 65,536.
+// ---------------------------------------------------------------------------
+
+pub const MAX_DICTIONARY_ENTRIES: usize = @as(usize, std.math.maxInt(u16)) + 1;
+
+/// Looks up `value` in `dict`, or appends it as a new entry; returns its
+/// index. Errors instead of overflowing the u16 index space once `dict`
+/// would grow past MAX_DICTIONARY_ENTRIES distinct values — reachable at
+/// the platform's 100,000-sensor Phase 1 target if one sensor_type/day
+/// partition ends up with more than 65,536 distinct sensor_ids (e.g. a
+/// fast-sampling type with a skewed distribution).
+pub fn dictionaryIndex(allocator: std.mem.Allocator, dict: *std.ArrayList(u32), value: u32) !u16 {
+    for (dict.items, 0..) |existing, i| {
+        if (existing == value) return @intCast(i);
+    }
+    if (dict.items.len >= MAX_DICTIONARY_ENTRIES) return error.PartitionDictionaryFull;
+    const idx: u16 = @intCast(dict.items.len);
+    try dict.append(allocator, value);
+    return idx;
+}
+
+test "dictionaryIndex: assigns sequential indices, reuses them for repeated values" {
+    const allocator = std.testing.allocator;
+    var dict: std.ArrayList(u32) = .empty;
+    defer dict.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u16, 0), try dictionaryIndex(allocator, &dict, 100));
+    try std.testing.expectEqual(@as(u16, 1), try dictionaryIndex(allocator, &dict, 200));
+    // Repeat of an existing value returns its original index, no new entry.
+    try std.testing.expectEqual(@as(u16, 0), try dictionaryIndex(allocator, &dict, 100));
+    try std.testing.expectEqual(@as(usize, 2), dict.items.len);
+}
+
+test "dictionaryIndex: errors instead of overflowing u16 when a partition's dictionary is full" {
+    const allocator = std.testing.allocator;
+    var dict: std.ArrayList(u32) = .empty;
+    defer dict.deinit(allocator);
+
+    // Fill to exactly MAX_DICTIONARY_ENTRIES distinct values.
+    var i: u32 = 0;
+    while (i < MAX_DICTIONARY_ENTRIES) : (i += 1) {
+        try dict.append(allocator, i);
+    }
+
+    // A brand-new value can't be assigned a u16 index anymore.
+    try std.testing.expectError(error.PartitionDictionaryFull, dictionaryIndex(allocator, &dict, 999_999));
+
+    // Looking up a value already in the full dictionary still works —
+    // only *new* entries are rejected.
+    try std.testing.expectEqual(@as(u16, 42), try dictionaryIndex(allocator, &dict, 42));
+}
+
+// ---------------------------------------------------------------------------

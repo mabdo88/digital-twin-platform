@@ -272,3 +272,145 @@ fn findRule(rules: []const PlacementRule, etype: ElementType) ?PlacementRule {
 }
 
 // ---------------------------------------------------------------------------
+// Tests — this file had none until 2026-07-20, despite owning all the
+// data-driven placement-cap logic CLAUDE.md's "placement rules must be data"
+// principle depends on (max_per_type, max_total_sensors,
+// default_unknown_area_m2). A regression here would silently over- or
+// under-place sensors with no test to catch it.
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+const zero_vec = Vec3{ .x = 0, .y = 0, .z = 0 };
+
+test "place: max_per_type caps a single sensor type across many elements, never exceeds it" {
+    const allocator = testing.allocator;
+
+    // 50 spaces, each with a 500m2 zone (temperature density 1.0/100m2 ->
+    // round(500*1.0/100) = 5 temperature sensors per space, 250 total) —
+    // comfortably over a deliberately small cap of 12.
+    var elements: [50]BuildingElement = undefined;
+    var zones: [50]ZoneMetadata = undefined;
+    for (0..50) |i| {
+        const id: u32 = @intCast(i + 1);
+        elements[i] = .{ .ifc_id = id, .name = "", .element_type = .space, .parent_id = null, .position = zero_vec };
+        zones[i] = .{ .zone_id = id, .name = "", .zone_type = .space, .floor_level = 0, .area_m2 = 500 };
+    }
+
+    var placement = try place(allocator, &elements, &zones, .{ .max_per_type = 12, .max_total_sensors = 10_000 });
+    defer placement.deinit();
+
+    var temp_count: u32 = 0;
+    for (placement.sensors) |s| {
+        if (s.sensor_type == .temperature) temp_count += 1;
+    }
+    try testing.expectEqual(@as(u32, 12), temp_count);
+}
+
+test "place: max_total_sensors is a hard ceiling across all types combined, and stops placement outright" {
+    const allocator = testing.allocator;
+
+    // 20 spaces, each placing 5 sensor types (temperature, humidity,
+    // occupancy, co2, air_quality) at a 100m2 default area -> 1 of each
+    // per space, 5 per space, 100 total if uncapped. Cap at 7 total.
+    var elements: [20]BuildingElement = undefined;
+    for (0..20) |i| {
+        elements[i] = .{ .ifc_id = @intCast(i + 1), .name = "", .element_type = .space, .parent_id = null, .position = zero_vec };
+    }
+
+    var placement = try place(allocator, &elements, &.{}, .{ .max_total_sensors = 7 });
+    defer placement.deinit();
+
+    try testing.expectEqual(@as(usize, 7), placement.sensors.len);
+    try testing.expectEqual(@as(usize, 7), placement.locations.len);
+}
+
+test "place: unknown or zero-area zone falls back to default_unknown_area_m2; a known area is used directly" {
+    const allocator = testing.allocator;
+
+    // Element 1's zone has a real, large area (400m2 -> round(400*1/100)=4
+    // temperature sensors). Element 2 has no matching ZoneMetadata at all
+    // (area_of.get returns null) -> falls back to a custom
+    // default_unknown_area_m2 of 300 -> round(300*1/100)=3.
+    const elements = [_]BuildingElement{
+        .{ .ifc_id = 1, .name = "", .element_type = .space, .parent_id = null, .position = zero_vec },
+        .{ .ifc_id = 2, .name = "", .element_type = .space, .parent_id = null, .position = zero_vec },
+    };
+    const zones = [_]ZoneMetadata{
+        .{ .zone_id = 1, .name = "", .zone_type = .space, .floor_level = 0, .area_m2 = 400 },
+        // No entry for zone_id = 2 — its area is unknown.
+    };
+
+    var placement = try place(allocator, &elements, &zones, .{ .default_unknown_area_m2 = 300 });
+    defer placement.deinit();
+
+    var temp_by_element = [_]u32{ 0, 0 };
+    for (placement.sensors) |s| {
+        if (s.sensor_type == .temperature) temp_by_element[s.element_id - 1] += 1;
+    }
+    try testing.expectEqual(@as(u32, 4), temp_by_element[0]);
+    try testing.expectEqual(@as(u32, 3), temp_by_element[1]);
+}
+
+test "place: equipment elements get exactly 1 sensor per rule type regardless of zone area — never area-scaled" {
+    const allocator = testing.allocator;
+
+    // flow_moving_device (pump) sitting in a zone with a huge area — if
+    // equipment were mistakenly area-scaled like a space, this would place
+    // far more than 1 of each rule sensor type (vibration, flow).
+    const elements = [_]BuildingElement{
+        .{ .ifc_id = 1, .name = "", .element_type = .space, .parent_id = null, .position = zero_vec },
+        .{ .ifc_id = 2, .name = "", .element_type = .flow_moving_device, .parent_id = 1, .position = zero_vec },
+    };
+    const zones = [_]ZoneMetadata{
+        .{ .zone_id = 1, .name = "", .zone_type = .space, .floor_level = 0, .area_m2 = 50_000 },
+    };
+
+    var placement = try place(allocator, &elements, &zones, .{});
+    defer placement.deinit();
+
+    var vibration_count: u32 = 0;
+    var flow_count: u32 = 0;
+    for (placement.sensors) |s| {
+        if (s.element_id != 2) continue;
+        if (s.sensor_type == .vibration) vibration_count += 1;
+        if (s.sensor_type == .flow) flow_count += 1;
+    }
+    try testing.expectEqual(@as(u32, 1), vibration_count);
+    try testing.expectEqual(@as(u32, 1), flow_count);
+}
+
+test "place: containing_zone resolves to self for zone elements, to a known parent zone, or to 0 when unresolved" {
+    const allocator = testing.allocator;
+
+    const elements = [_]BuildingElement{
+        // A space IS its own zone.
+        .{ .ifc_id = 1, .name = "", .element_type = .space, .parent_id = null, .position = zero_vec },
+        // A beam whose parent_id points at a known zone.
+        .{ .ifc_id = 2, .name = "", .element_type = .beam, .parent_id = 1, .position = zero_vec },
+        // A beam whose parent_id points at nothing registered as a zone.
+        .{ .ifc_id = 3, .name = "", .element_type = .beam, .parent_id = 999, .position = zero_vec },
+    };
+    const zones = [_]ZoneMetadata{
+        .{ .zone_id = 1, .name = "", .zone_type = .space, .floor_level = 0, .area_m2 = 100 },
+    };
+
+    var placement = try place(allocator, &elements, &zones, .{});
+    defer placement.deinit();
+
+    var zone_of_element = [_]?u32{ null, null, null };
+    for (placement.locations) |loc| {
+        // Sensors are appended in element-iteration order and locations
+        // mirror sensors 1:1, so find each element's first sensor's location
+        // via placement.sensors to map sensor_id -> element_id -> zone_id.
+        for (placement.sensors) |s| {
+            if (s.sensor_id != loc.sensor_id) continue;
+            const idx = s.element_id - 1;
+            if (zone_of_element[idx] == null) zone_of_element[idx] = loc.zone_id;
+        }
+    }
+    try testing.expectEqual(@as(?u32, 1), zone_of_element[0]); // space -> self
+    try testing.expectEqual(@as(?u32, 1), zone_of_element[1]); // beam -> known parent
+    try testing.expectEqual(@as(?u32, 0), zone_of_element[2]); // beam -> unresolved parent
+}
+
+// ---------------------------------------------------------------------------

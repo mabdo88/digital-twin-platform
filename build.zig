@@ -17,6 +17,7 @@ pub fn build(b: *std.Build) void {
         "engine/bim_test.zig",
         "engine/synthetic_test.zig",
         "engine/sim_test.zig",
+        "engine/main.zig",
     };
     for (test_targets) |t| {
         const cmd = b.addSystemCommand(&.{
@@ -29,6 +30,26 @@ pub fn build(b: *std.Build) void {
         });
         test_step.dependOn(&cmd.step);
     }
+
+    // End-to-end pipeline tests against real IFC files (engine/
+    // integration_test.zig) — deliberately NOT part of `test` above.
+    // Sim duration is derived from the building's own placed sensor
+    // types' retention (up to ~7 years for structural sensors), and a
+    // multi-year simulated run in -ODebug turns into a multi-hour
+    // wall-clock one (same reasoning as dt/dtb being forced ReleaseFast
+    // below) — running it under the main Debug test suite would risk
+    // hanging `zig build test` on a real building file. ReleaseFast here
+    // keeps it fast (~seconds) without slowing down the everyday suite.
+    const integration_test_step = b.step("test-integration", "Run end-to-end pipeline tests against real IFC files (ReleaseFast)");
+    const integration_test_cmd = b.addSystemCommand(&.{
+        b.graph.zig_exe,
+        "test",
+        "engine/integration_test.zig",
+        "-OReleaseFast",
+        "--cache-dir",
+        ".zig-cache",
+    });
+    integration_test_step.dependOn(&integration_test_cmd.step);
 
     // Benchmark runner — standalone exe that runs the full latency suite
     // and writes Markdown + JSON reports to ./benchmark-results/.

@@ -141,3 +141,48 @@ pub fn pruneOlderThan(self: *Self, sensor_type: SensorType, cutoff_timestamp: i6
 }
 
 // ---------------------------------------------------------------------------
+// Tests — this file had none until 2026-07-20. pruneOlderThan's in-place
+// compaction (the same shape every flat backend uses) is the one piece of
+// logic here complex enough for a regression to silently corrupt data: it
+// must remove ONLY readings matching both `sensor_type` and the cutoff,
+// leaving every other type's readings, and later readings of the pruned
+// type, untouched.
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+
+test "pruneOlderThan: removes only matching-type readings older than cutoff; other types and newer same-type readings survive" {
+    const allocator = testing.allocator;
+    var backend = try Self.init(allocator);
+    defer backend.deinit();
+
+    // Interleaved: temperature at ts 1,2,3 and humidity at ts 1,2,3.
+    var t: i64 = 1;
+    while (t <= 3) : (t += 1) {
+        try backend.insert(.{ .sensor_id = 1, .timestamp = t, .value = 0, .sensor_type = .temperature });
+        try backend.insert(.{ .sensor_id = 2, .timestamp = t, .value = 0, .sensor_type = .humidity });
+    }
+    try testing.expectEqual(@as(usize, 6), backend.count());
+
+    // Cutoff 3: removes temperature ts<3 (ts=1,2), keeps temperature ts=3
+    // and every humidity reading regardless of timestamp.
+    try backend.pruneOlderThan(.temperature, 3);
+
+    try testing.expectEqual(@as(usize, 4), backend.count());
+    var temp_count: usize = 0;
+    var humidity_count: usize = 0;
+    for (backend.readings.items) |r| {
+        switch (r.sensor_type) {
+            .temperature => {
+                temp_count += 1;
+                try testing.expectEqual(@as(i64, 3), r.timestamp);
+            },
+            .humidity => humidity_count += 1,
+            else => unreachable,
+        }
+    }
+    try testing.expectEqual(@as(usize, 1), temp_count);
+    try testing.expectEqual(@as(usize, 3), humidity_count);
+}
+
+// ---------------------------------------------------------------------------

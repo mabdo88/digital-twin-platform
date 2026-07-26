@@ -239,3 +239,96 @@ pub fn allSensorIds(self: *const Self, allocator: std.mem.Allocator) ![]u32 {
 pub fn pruneOlderThan(_: *Self, _: SensorType, _: i64) !void {}
 
 // ---------------------------------------------------------------------------
+// Tests — this file had none until 2026-07-20 (.cascade/digital-twin/
+// backend-audit.md's 2026-07-20 entry: four backend files, RingBuffer
+// included, had lost all dedicated regression tests somewhere between the
+// 2026-07-01 "8 new regression tests... one for RingBuffer specifically
+// forcing a wrapped buffer" entry and the current tree — cross-backend
+// correctness was still covered by runner.zig's dynamic equivalence suite,
+// but nothing exercised RingBuffer's own eviction mechanism in isolation).
+//
+// `insert`'s circular overwrite — not `pruneOlderThan`, which is a genuine
+// no-op here (see its doc comment above) — is the mechanism that actually
+// produces RingBuffer's coverage gaps: the same gaps `scoreBackends`'
+// UNCOVERED_QUERY_PENALTY (report.zig) exists to charge against a
+// recommendation. A silent regression here (e.g. evicting the wrong slot,
+// or `head`/`len` losing sync with `buffer.len` after `setRetentionHint`
+// gives two sensor types different capacities) would corrupt exactly the
+// data the penalty is trying to score honestly.
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+
+test "RingBuffer insert: wraparound evicts oldest-first, keeping exactly the last `capacity` readings" {
+    const allocator = testing.allocator;
+    var rb = try Self.init(allocator);
+    defer rb.deinit();
+
+    const sensor_id: u32 = 1;
+    const capacity: usize = 3;
+    try rb.setRetentionHint(.temperature, capacity);
+
+    // Insert capacity + 2 readings with distinct increasing timestamps —
+    // forces the buffer past one full wraparound (head cycles back to 0
+    // mid-insert), so physical slot order and logical (oldest-to-newest)
+    // order diverge.
+    var i: i64 = 0;
+    while (i < @as(i64, @intCast(capacity)) + 2) : (i += 1) {
+        try rb.insert(.{ .sensor_id = sensor_id, .sensor_type = .temperature, .timestamp = i, .value = @floatFromInt(i) });
+    }
+
+    const all = try rb.rangeByTime(allocator, .{ .sensor_id = sensor_id, .start_time = 0, .end_time = 1000 });
+    defer allocator.free(all);
+
+    // Only the last `capacity` readings survive (timestamps 2,3,4 — 0 and
+    // 1 were evicted), in ascending order despite the physical buffer's
+    // wrapped layout.
+    try testing.expectEqual(capacity, all.len);
+    for (all, 0..) |r, idx| {
+        try testing.expectEqual(@as(i64, @intCast(idx)) + 2, r.timestamp);
+    }
+
+    try testing.expectEqual(@as(i64, 4), rb.getLatestBySensor(sensor_id).?.timestamp);
+    // count() must track only what's actually resident, never the total
+    // ever inserted — capacity + 2 inserts, capacity survivors.
+    try testing.expectEqual(capacity, rb.count());
+}
+
+test "RingBuffer insert: two sensor types with different setRetentionHint capacities evict independently, each using its own buffer length" {
+    const allocator = testing.allocator;
+    var rb = try Self.init(allocator);
+    defer rb.deinit();
+
+    // Different capacities for different types, set before either sensor's
+    // first insert — the documented contract (setRetentionHint's doc
+    // comment): a hint only affects sensors of that type allocated after
+    // it's set. Getting this wrong (e.g. reintroducing a single backend-
+    // wide capacity field for wraparound math) would make one sensor's
+    // modulo arithmetic silently corrupt using the other type's capacity.
+    try rb.setRetentionHint(.temperature, 2);
+    try rb.setRetentionHint(.humidity, 4);
+
+    const temp_id: u32 = 10;
+    const humid_id: u32 = 20;
+
+    var i: i64 = 0;
+    while (i < 5) : (i += 1) {
+        try rb.insert(.{ .sensor_id = temp_id, .sensor_type = .temperature, .timestamp = i, .value = 0 });
+        try rb.insert(.{ .sensor_id = humid_id, .sensor_type = .humidity, .timestamp = i, .value = 0 });
+    }
+
+    const temp_all = try rb.rangeByTime(allocator, .{ .sensor_id = temp_id, .start_time = 0, .end_time = 1000 });
+    defer allocator.free(temp_all);
+    const humid_all = try rb.rangeByTime(allocator, .{ .sensor_id = humid_id, .start_time = 0, .end_time = 1000 });
+    defer allocator.free(humid_all);
+
+    // temperature (capacity 2): keeps only the last 2 of 5 -> timestamps 3,4.
+    try testing.expectEqual(@as(usize, 2), temp_all.len);
+    try testing.expectEqual(@as(i64, 3), temp_all[0].timestamp);
+    try testing.expectEqual(@as(i64, 4), temp_all[1].timestamp);
+
+    // humidity (capacity 4): keeps the last 4 of 5 -> timestamps 1,2,3,4.
+    try testing.expectEqual(@as(usize, 4), humid_all.len);
+    try testing.expectEqual(@as(i64, 1), humid_all[0].timestamp);
+    try testing.expectEqual(@as(i64, 4), humid_all[3].timestamp);
+}

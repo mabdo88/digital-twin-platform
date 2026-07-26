@@ -232,6 +232,12 @@ When starting a task, you will receive a **rule-aware implementation prompt**. I
 **Unit tests:** `zig build test`. All golden-result tests must pass; backends must
 produce identical output.
 
+**Integration tests:** `zig build test-integration`. Drives the real `dt` CLI
+entry point (`main.runPipeline`) against real IFC files in `assets/IFC/` and
+asserts on the actual written report files. Kept separate from `zig build test`
+(and built `-OReleaseFast`) because simulated duration is retention-derived and
+would be far slower under `-ODebug` — see CLAUDE.md §7.
+
 **Benchmarks:** `zig build bench`. Records latency, throughput, memory for every
 query on every backend. Publish the full results table in the PR.
 

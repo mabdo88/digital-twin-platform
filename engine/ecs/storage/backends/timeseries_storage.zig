@@ -90,14 +90,14 @@ pub fn insert(self: *Self, reading: SensorReading) !void {
         {
             try part.readings.append(self.allocator, reading);
             self.total_count += 1;
-            self.updateLatest(reading);
+            try self.updateLatest(reading);
             return;
         }
     }
     try part.readings.append(self.allocator, reading);
     part.sorted = false;
     self.total_count += 1;
-    self.updateLatest(reading);
+    try self.updateLatest(reading);
 }
 
 pub fn count(self: *const Self) usize {
@@ -140,7 +140,12 @@ pub fn iterateAll(self: *const Self, allocator: std.mem.Allocator) ![]const Sens
 
 pub fn getLatestBySensor(self: *const Self, sensor_id: u32) ?SensorReading {
     const self_mut: *Self = @constCast(self);
-    if (self_mut.latest_dirty) self_mut.rebuildLatest();
+    // getLatestBySensor's return type is fixed by the StorageBackend
+    // interface (?SensorReading, no error union) — an OOM here has nowhere
+    // to propagate to, unlike rangeByTime/allSensorIds below, which are
+    // already fallible and `try` this same rebuild. Swallowing is the
+    // structural floor for this one call site, not a choice.
+    if (self_mut.latest_dirty) self_mut.rebuildLatest() catch {};
     return self_mut.latest_by_sensor.get(sensor_id);
 }
 
@@ -154,6 +159,18 @@ pub fn rangeByTime(self: *const Self, allocator: std.mem.Allocator, q: RangeQuer
     const start_day = @divFloor(q.start_time, PARTITION_MS);
     const end_day = @divFloor(q.end_time, PARTITION_MS);
 
+    // When scoped to one sensor, narrow the partition scan to that
+    // sensor's own type instead of walking every type's partitions and
+    // filtering per-row — a sensor's type is fixed across all its
+    // readings, and latest_by_sensor already caches it. A sensor with no
+    // resident readings (no entry here) has nothing to return.
+    var only_type: ?SensorType = null;
+    if (q.sensor_id) |sid| {
+        if (self_mut.latest_dirty) try self_mut.rebuildLatest();
+        const latest = self.latest_by_sensor.get(sid) orelse return &.{};
+        only_type = latest.sensor_type;
+    }
+
     var result: std.ArrayList(SensorReading) = .empty;
     defer result.deinit(allocator);
 
@@ -161,6 +178,9 @@ pub fn rangeByTime(self: *const Self, allocator: std.mem.Allocator, q: RangeQuer
     while (it.next()) |entry| {
         const key = entry.key_ptr.*;
         if (key.day_index < start_day or key.day_index > end_day) continue;
+        if (only_type) |t| {
+            if (key.sensor_type != t) continue;
+        }
 
         const part = entry.value_ptr;
         if (!part.sorted) self_mut.sortPartition(part);
@@ -197,6 +217,36 @@ pub fn rangeByTime(self: *const Self, allocator: std.mem.Allocator, q: RangeQuer
     return result.toOwnedSlice(allocator);
 }
 
+test "rangeByTime: scoping to one sensor returns only that sensor's readings when another type shares the range" {
+    const allocator = std.testing.allocator;
+    var backend = try Self.init(allocator);
+    defer backend.deinit();
+
+    // Two sensors of DIFFERENT types, overlapping time range/day partition.
+    try backend.insert(.{ .sensor_id = 1, .timestamp = 1000, .value = 10.0, .sensor_type = .temperature });
+    try backend.insert(.{ .sensor_id = 2, .timestamp = 1500, .value = 20.0, .sensor_type = .humidity });
+    try backend.insert(.{ .sensor_id = 1, .timestamp = 2000, .value = 11.0, .sensor_type = .temperature });
+
+    const result = try backend.rangeByTime(allocator, .{ .sensor_id = 1, .start_time = 0, .end_time = 3000 });
+    defer allocator.free(result);
+
+    try std.testing.expectEqual(@as(usize, 2), result.len);
+    for (result) |r| try std.testing.expectEqual(@as(u32, 1), r.sensor_id);
+}
+
+test "rangeByTime: a sensor_id with no resident readings returns empty" {
+    const allocator = std.testing.allocator;
+    var backend = try Self.init(allocator);
+    defer backend.deinit();
+
+    try backend.insert(.{ .sensor_id = 1, .timestamp = 1000, .value = 10.0, .sensor_type = .temperature });
+
+    const result = try backend.rangeByTime(allocator, .{ .sensor_id = 999, .start_time = 0, .end_time = 3000 });
+    defer allocator.free(result);
+
+    try std.testing.expectEqual(@as(usize, 0), result.len);
+}
+
 /// Zone/floor topology bookkeeping delegates to the shared ZoneIndex — see
 /// storage_backend.zig's doc comment for the contract.
 pub fn registerZone(self: *Self, sensor_id: u32, zone_id: u32) !void {
@@ -224,7 +274,7 @@ pub fn allSensorIds(self: *const Self, allocator: std.mem.Allocator) ![]u32 {
     defer result.deinit(allocator);
 
     const self_mut: *Self = @constCast(self);
-    if (self_mut.latest_dirty) self_mut.rebuildLatest();
+    if (self_mut.latest_dirty) try self_mut.rebuildLatest();
     var it = self_mut.latest_by_sensor.keyIterator();
     while (it.next()) |k| try result.append(allocator, k.*);
 
@@ -301,28 +351,28 @@ fn sortPartition(_: *Self, part: *Partition) void {
     part.sorted = true;
 }
 
-fn updateLatest(self: *Self, reading: SensorReading) void {
+fn updateLatest(self: *Self, reading: SensorReading) !void {
     if (self.latest_dirty) return;
     if (self.latest_by_sensor.get(reading.sensor_id)) |current| {
         if (reading.timestamp > current.timestamp) {
-            self.latest_by_sensor.put(reading.sensor_id, reading) catch {};
+            try self.latest_by_sensor.put(reading.sensor_id, reading);
         }
     } else {
-        self.latest_by_sensor.put(reading.sensor_id, reading) catch {};
+        try self.latest_by_sensor.put(reading.sensor_id, reading);
     }
 }
 
-fn rebuildLatest(self: *Self) void {
+fn rebuildLatest(self: *Self) !void {
     self.latest_by_sensor.clearRetainingCapacity();
     var it = self.partitions.iterator();
     while (it.next()) |entry| {
         for (entry.value_ptr.readings.items) |r| {
             if (self.latest_by_sensor.get(r.sensor_id)) |current| {
                 if (r.timestamp > current.timestamp) {
-                    self.latest_by_sensor.put(r.sensor_id, r) catch {};
+                    try self.latest_by_sensor.put(r.sensor_id, r);
                 }
             } else {
-                self.latest_by_sensor.put(r.sensor_id, r) catch {};
+                try self.latest_by_sensor.put(r.sensor_id, r);
             }
         }
     }

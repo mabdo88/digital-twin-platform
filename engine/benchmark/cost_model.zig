@@ -21,6 +21,7 @@
 
 const std = @import("std");
 const report = @import("report.zig");
+const metrics = @import("../ecs/systems/metrics_system.zig");
 
 // ---------------------------------------------------------------------------
 // Pricing data — public cloud rates, mid-2026. Disclosed, not researched
@@ -164,8 +165,8 @@ pub fn estimateAll(
 /// The "naive" baseline: what would it cost to run EVERY backend
 /// simultaneously (hot tier + warm tier + cold tier + cache)? This is the
 /// naive-vs-optimised comparison — the optimised deployment picks the
-/// compound recommendation's two winners; the naive approach just runs
-/// everything.
+/// two-track recommendation's real-time and historical winners (see
+/// report.TrackWinners); the naive approach just runs everything.
 pub fn naiveTotalCost(
     rows: []const report.RunRow,
     backend_names: []const []const u8,
@@ -195,7 +196,12 @@ pub fn optimisedCost(
     pricing: PricingTier,
 ) f64 {
     const rt_mem = maxMemoryForBackend(rows, realtime_winner);
-    const hist_mem = maxMemoryForBackend(rows, historical_winner);
+    // Same backend deployed once serves both tracks — count its storage
+    // once, not twice, when the real-time and historical winners coincide.
+    const hist_mem: usize = if (std.mem.eql(u8, realtime_winner, historical_winner))
+        0
+    else
+        maxMemoryForBackend(rows, historical_winner);
 
     const rt_storage_tb = @as(f64, @floatFromInt(rt_mem)) / BYTES_PER_TB;
     const hist_storage_tb = @as(f64, @floatFromInt(hist_mem)) / BYTES_PER_TB;
@@ -265,6 +271,55 @@ pub fn writeCostSection(
     try w.print(allocator, "\n**Savings: ${d:.0}/yr ({d:.0}%)** by running only the recommended backends instead of all of them.\n\n", .{
         savings, savings_pct,
     });
+}
+
+test "optimisedCost: does not double-count storage when the same backend wins both tracks" {
+    const zero_stats: metrics.LatencyStats = .{
+        .iterations = 1,
+        .median_ns = 0,
+        .p95_ns = 0,
+        .p99_ns = 0,
+        .min_ns = 0,
+        .max_ns = 0,
+        .mean_ns = 0,
+        .total_ns = 0,
+    };
+    const one_tib: usize = 1024 * 1024 * 1024 * 1024;
+    const rows = [_]report.RunRow{
+        .{ .scale = "S", .query = "Q", .backend = "TimeSeries", .memory_bytes = one_tib, .stats = zero_stats },
+    };
+
+    const workload = WorkloadAssumptions{ .queries_per_year = 1_000_000 };
+    const cost = optimisedCost(&rows, "TimeSeries", "TimeSeries", 0.5, workload, DEFAULT_PRICING);
+
+    // 1 TiB storage counted ONCE ($1200) + 0.5M queries to each track ($2.50
+    // each) = $1205, not $2405 (which double-billed the 1 TiB storage).
+    try std.testing.expectApproxEqAbs(@as(f64, 1205.0), cost, 0.001);
+}
+
+test "optimisedCost: sums storage for two distinct winners" {
+    const zero_stats: metrics.LatencyStats = .{
+        .iterations = 1,
+        .median_ns = 0,
+        .p95_ns = 0,
+        .p99_ns = 0,
+        .min_ns = 0,
+        .max_ns = 0,
+        .mean_ns = 0,
+        .total_ns = 0,
+    };
+    const one_tib: usize = 1024 * 1024 * 1024 * 1024;
+    const rows = [_]report.RunRow{
+        .{ .scale = "S", .query = "Q", .backend = "RingBuffer", .memory_bytes = one_tib, .stats = zero_stats },
+        .{ .scale = "S", .query = "Q", .backend = "Lake", .memory_bytes = one_tib, .stats = zero_stats },
+    };
+
+    const workload = WorkloadAssumptions{ .queries_per_year = 1_000_000 };
+    const cost = optimisedCost(&rows, "RingBuffer", "Lake", 0.5, workload, DEFAULT_PRICING);
+
+    // Two distinct backends, 1 TiB each, genuinely both deployed: $2400
+    // storage + $5 query = $2405.
+    try std.testing.expectApproxEqAbs(@as(f64, 2405.0), cost, 0.001);
 }
 
 // ---------------------------------------------------------------------------

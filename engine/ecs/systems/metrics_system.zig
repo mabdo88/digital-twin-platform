@@ -62,8 +62,13 @@ pub fn sampleMemory(world: anytype) usize {
 /// Returns LatencyStats with median, p95, p99.
 ///
 /// `query_fn` is any callable; `args` is a tuple of its arguments.
-/// One warmup call is made (not counted), then each iteration is timed
-/// individually with the monotonic Io clock.
+/// When `iterations > 1`, one warmup call is made first (not counted) to
+/// prime caches/branch predictors before collecting a stable percentile
+/// spread. When `iterations == 1` there is no warmup: that path (the live
+/// per-building simulation, CLAUDE.md §3.4) deliberately measures a
+/// genuine single execution against real accumulated state — "nothing to
+/// resample" — so a warmup would silently execute the query twice and
+/// report a warmed second call's latency instead of the true one-shot cost.
 pub fn timeQuery(
     allocator: std.mem.Allocator,
     io: Io,
@@ -71,8 +76,9 @@ pub fn timeQuery(
     comptime query_fn: anytype,
     args: anytype,
 ) !LatencyStats {
-    // Warmup — prime caches, branch predictors
-    _ = try @call(.auto, query_fn, args);
+    if (iterations > 1) {
+        _ = try @call(.auto, query_fn, args);
+    }
 
     const samples = try allocator.alloc(i64, iterations);
     defer allocator.free(samples);
@@ -156,6 +162,47 @@ pub fn timeMutation(
 
 fn nsToUs(ns: i64) f64 {
     return @as(f64, @floatFromInt(ns)) / 1000.0;
+}
+
+const CallCounter = struct {
+    calls: usize = 0,
+    fn call(self: *@This()) !void {
+        self.calls += 1;
+    }
+};
+
+test "timeQuery: iterations == 1 executes the query exactly once — no silent warmup double-count" {
+    const allocator = std.testing.allocator;
+    var threaded: Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var counter = CallCounter{};
+    _ = try timeQuery(allocator, io, 1, CallCounter.call, .{&counter});
+
+    // The live per-building simulation path (CLAUDE.md §3.4) calls
+    // timeQuery with iterations = 1 specifically because "single-shot is
+    // the honest measurement... there is nothing to resample." An
+    // unconditional warmup call would silently execute the query twice
+    // per checkpoint and report a warmed second call's latency, not the
+    // true one-shot cost.
+    try std.testing.expectEqual(@as(usize, 1), counter.calls);
+}
+
+test "timeQuery: iterations > 1 still warms up once before the timed loop" {
+    const allocator = std.testing.allocator;
+    var threaded: Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var counter = CallCounter{};
+    _ = try timeQuery(allocator, io, 5, CallCounter.call, .{&counter});
+
+    // 1 untimed warmup + 5 timed iterations. The internal regression suite
+    // (runner.zig, iterations = 25) benefits from priming caches/branch
+    // predictors before collecting a stable percentile spread — unlike the
+    // iterations == 1 live-sim path, there IS something being resampled.
+    try std.testing.expectEqual(@as(usize, 6), counter.calls);
 }
 
 // ---------------------------------------------------------------------------

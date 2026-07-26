@@ -12,6 +12,7 @@
 
 const std = @import("std");
 const sb = @import("../ecs/storage/storage_backend.zig");
+const escapeXml = @import("report.zig").escapeXml;
 
 /// One sensor marker on the schematic.
 pub const SensorPoint = struct {
@@ -134,9 +135,15 @@ pub fn writeSchematic(
     var svg: std.ArrayList(u8) = .empty;
     defer svg.deinit(allocator);
 
+    // title/z.name below are vendor-controlled (IFC filename, Name
+    // attribute) — escape so a bare &, <, > can't break this generated
+    // SVG's XML structure.
+    const escaped_title = try escapeXml(allocator, title);
+    defer allocator.free(escaped_title);
+
     try svg.print(allocator, "<svg viewBox=\"0 0 {d:.0} {d:.0}\" xmlns=\"http://www.w3.org/2000/svg\" font-family=\"monospace\">\n", .{ PANEL_W + 2 * MARGIN, total_h + 60 });
     try svg.print(allocator, "<rect width=\"100%\" height=\"100%\" fill=\"#0f1419\"/>\n", .{});
-    try svg.print(allocator, "<text x=\"{d:.0}\" y=\"30\" fill=\"#e6edf3\" font-size=\"18\" font-weight=\"bold\">{s}</text>\n", .{ MARGIN, title });
+    try svg.print(allocator, "<text x=\"{d:.0}\" y=\"30\" fill=\"#e6edf3\" font-size=\"18\" font-weight=\"bold\">{s}</text>\n", .{ MARGIN, escaped_title });
 
     for (floors, 0..) |floor_id, idx| {
         const panel_y = MARGIN + 40 + @as(f64, @floatFromInt(idx)) * (PANEL_H + MARGIN);
@@ -156,7 +163,9 @@ pub fn writeSchematic(
             const px = project(z.x, bounds.min_x, bounds.max_x, px_lo, px_hi);
             const py = project(z.y, bounds.min_y, bounds.max_y, py_lo, py_hi);
             try svg.print(allocator, "<rect x=\"{d:.1}\" y=\"{d:.1}\" width=\"10\" height=\"10\" fill=\"none\" stroke=\"#4ea8de\" stroke-width=\"1.5\"/>\n", .{ px - 5, py - 5 });
-            try svg.print(allocator, "<text x=\"{d:.1}\" y=\"{d:.1}\" fill=\"#4ea8de\" font-size=\"10\">{s}</text>\n", .{ px + 7, py - 7, z.name });
+            const escaped_zone_name = try escapeXml(allocator, z.name);
+            defer allocator.free(escaped_zone_name);
+            try svg.print(allocator, "<text x=\"{d:.1}\" y=\"{d:.1}\" fill=\"#4ea8de\" font-size=\"10\">{s}</text>\n", .{ px + 7, py - 7, escaped_zone_name });
         }
 
         for (sensors) |s| {
@@ -198,6 +207,42 @@ pub fn writeSchematic(
     var dir = try cwd.openDir(io, dir_path, .{});
     defer dir.close(io);
     try dir.writeFile(io, .{ .sub_path = "schematic.svg", .data = svg.items });
+}
+
+test "writeSchematic: a zone name with an XML-special character produces valid escaped SVG" {
+    const allocator = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const cwd = std.Io.Dir.cwd();
+    const out_dir = "zig-cache-test-schematic-escape";
+    defer cwd.deleteTree(io, out_dir) catch {};
+
+    // "M&E Room" is a real Revit-export room name (Mechanical & Electrical)
+    // — a bare '&' here is illegal XML.
+    const zones = [_]ZoneLabel{.{ .name = "M&E Room", .x = 0, .y = 0, .floor_id = 0 }};
+    try writeSchematic(allocator, io, out_dir, "Test <Building>", &.{}, &zones);
+
+    var dir = try cwd.openDir(io, out_dir, .{});
+    defer dir.close(io);
+    const svg = try dir.readFileAlloc(io, "schematic.svg", allocator, .limited(1024 * 1024));
+    defer allocator.free(svg);
+
+    try std.testing.expect(std.mem.indexOf(u8, svg, "M&amp;E Room") != null);
+    try std.testing.expect(std.mem.indexOf(u8, svg, "Test &lt;Building&gt;") != null);
+    // No bare '&' outside of a recognized entity anywhere in the output.
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, svg, i, "&")) |pos| {
+        const rest = svg[pos..];
+        const is_entity = std.mem.startsWith(u8, rest, "&amp;") or
+            std.mem.startsWith(u8, rest, "&lt;") or
+            std.mem.startsWith(u8, rest, "&gt;") or
+            std.mem.startsWith(u8, rest, "&quot;") or
+            std.mem.startsWith(u8, rest, "&apos;");
+        try std.testing.expect(is_entity);
+        i = pos + 1;
+    }
 }
 
 // ---------------------------------------------------------------------------

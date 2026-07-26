@@ -191,11 +191,21 @@ whether ClickHouse answers in 80 ms or 800 ms. Absolute numbers are approximate;
 ## 7. Build, test & run
 
 ```sh
-zig build            # compile the platform
-zig build test       # run unit + golden-result tests
-zig build bench      # run the full benchmark suite
+zig build                 # compile the platform
+zig build test            # run unit + golden-result tests (fast, -ODebug)
+zig build test-integration # run end-to-end pipeline tests against real IFC files (-OReleaseFast — see below)
+zig build bench           # run the full benchmark suite
 zig build run -- --bim path/to/model.ifc --out results-dir
 ```
+
+`test-integration` (added 2026-07-20, `engine/integration_test.zig`) drives `main.zig`'s
+`runPipeline` directly against real files in `assets/IFC/` and asserts on the actual
+written output (`recommendation.md`/`.html`, `simulation.json`, `schematic.svg`) —
+exercising the real CLI entry point, not just individual internal functions. It is
+**deliberately not part of `test`**: sim duration is derived from the building's own
+placed sensor types' retention (up to ~7 years for structural sensors), and a
+multi-year simulated run in `-ODebug` turns into a multi-hour wall-clock one (§3.4) —
+same reason `dt`/`dtb` are forced `ReleaseFast` regardless of `-Doptimize`.
 
 > **Agent note:** if these commands are not yet wired in `build.zig`, wiring them is a
 > legitimate early task — but do it as its own change, documented in the PR.
@@ -270,18 +280,33 @@ The same folder also holds **status docs** (read as current state, not as proced
   three written by `engine/benchmark/report.zig` (`latency.json`, `latency.md`,
   `benchmark.html`). The per-building path (`dt --bim ...`) writes
   `recommendation.md`, `simulation.json`, and `schematic.svg`.
-- **Tiered strategies — resolved:** the platform now emits **compound recommendations**
-  via `report.recommendCompound`: a real-time track (all backends compete, RingBuffer
-  wins on `latest_*` queries) and a historical track (full-retention backends only;
-  RingBuffer excluded). The final recommendation per building/type is a deployment
-  combo: "<real-time winner> for live queries + <historical winner> for everything
-  else." `main.zig` consumes this for both building-level and per-type reports.
-- **RingBuffer eviction sizing — resolved:** flat capacity of 10 readings per
-  sensor for ALL types (no per-type formula). `main.zig` calls
-  `setRetentionHint(sensor_type, 10)` for every placed type before ingest.
-  RingBuffer is a deliberately tiny real-time-only cache; its existing eviction
-  (11th write evicts oldest) handles it. See `storage-redesign-plan.md` for the
-  full reasoning.
+- **Tiered strategies — resolved, revised 2026-07-20:** the platform emits a two-track
+  recommendation via `report.pickTrackWinners`: a real-time track (all backends
+  compete, RingBuffer wins on `latest_*` queries) and a historical track
+  (full-retention backends only; RingBuffer excluded). The final recommendation per
+  building/type is a deployment combo: "<real-time winner> for live queries +
+  <historical winner> for everything else." `main.zig` consumes this for both
+  building-level and per-type reports. Superseded the original weighted-ratio
+  scorer (`report.recommendCompound`/`scoreBackends`, removed) after it didn't hold
+  up under scrutiny: every backend already answers `latest_*` via an O(1) cached
+  lookup, so the real-time track's weighted score mostly measured lookup-overhead
+  noise rather than a real architectural difference, and a single slow outlier
+  query could blow the historical track's weighted average up to 4+ digits with no
+  interpretable meaning. `pickTrackWinners` instead counts, per family, how many
+  queries each backend wins in `report.perQueryResults`' own already-computed
+  per-query dashboard — honest about being "who wins the most queries," nothing
+  more. See `.cascade/digital-twin/backend-audit.md`'s 2026-07-20 entry.
+- **RingBuffer eviction sizing — resolved:** one flat capacity applied to every
+  placed type (still no per-type formula), but derived from the building's
+  fastest-sampling placed sensor type rather than a hard-coded constant —
+  revised 2026-07-07 (`simulation.deriveRingBufferCap`/`ringBufferCapForFrequency`),
+  superseding the original 2026-07-01 flat-10 decision. `simulation.zig` calls
+  `setRetentionHint(sensor_type, cap)` for every placed type before ingest,
+  where `cap = max(10, ceil(fastest placed type's frequency_hz))` — e.g. a
+  50Hz type yields a 50-reading cap, 100Hz yields 100. RingBuffer is a
+  deliberately tiny real-time-only cache; its existing eviction (capacity+1th
+  write evicts oldest) handles it. See `storage-redesign-plan.md` for the
+  original reasoning and `sequential-execution-and-audit.md` for the revision.
 - **Calibration:** DuckDB is the primary calibration; vendor benchmarks are optional
   metadata. Not yet built (Phase 8).
 
