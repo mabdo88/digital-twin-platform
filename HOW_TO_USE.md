@@ -257,6 +257,14 @@ zig build test
 This runs every unit test and golden-result equivalence test (every
 backend must produce identical query results on the same seeded dataset).
 
+For a deeper check, `zig build test-integration` runs the real CLI pipeline
+(parse → place sensors → simulate → write reports) end-to-end against real
+sample files in `assets/IFC/` and asserts on the actual written
+`recommendation.md`/`.html`, `simulation.json`, and `schematic.svg`. It's a
+separate step (built `-OReleaseFast`) because simulated duration depends on
+the building's own retention windows — up to ~7 years of simulated time —
+which would be minutes-to-hours slower under `-ODebug`.
+
 ---
 
 ## Troubleshooting

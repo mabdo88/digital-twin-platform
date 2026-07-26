@@ -34,9 +34,10 @@ apples-to-apples through one shared interface.
 **For developers:** Clone the repo and build with Zig:
 
 ```sh
-zig build                # compile to zig-out/bin/ (dt/dtb always build ReleaseFast)
-zig build test           # run all unit + golden-result equivalence tests
-zig build bench          # run the full benchmark suite, write reports to ./benchmark-results/
+zig build                 # compile to zig-out/bin/ (dt/dtb always build ReleaseFast)
+zig build test            # run all unit + golden-result equivalence tests (fast, -ODebug)
+zig build test-integration # run end-to-end pipeline tests against real IFC files (-OReleaseFast)
+zig build bench           # run the full benchmark suite, write reports to ./benchmark-results/
 zig-out/bin/dt --bim path/to/model.ifc   # run against a real building (see HOW_TO_USE.md)
 ```
 
