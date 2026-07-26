@@ -155,16 +155,18 @@ Placed 1520 sensors (0.0s).
 [5/6] Computing recommendations...
 
 === Recommendation (LargeHospitalComplex) ===
-Real-time track (latest_* queries — all backends compete):
-Backend              Score     Coverage
-Hierarchical         1.000         100%
-...
-Historical track (aggregation/historical/spatial/anomaly — full-retention backends only):
-...
+Real-time: Hierarchical (wins 4/4 live queries)
+Historical: Hierarchical (wins 7/8 historical queries)
+
 Deployment combo: Hierarchical (live) + Hierarchical (historical)
 
+=== Recommendation by Sensor Type (LargeHospitalComplex) ===
+temperature    live: Hierarchical | historical: Hierarchical
+occupancy      live: RingBuffer | historical: Columnar
+...
+
 [6/6] Writing reports...
-  Wrote recommendation.md + simulation.json to benchmark-results/
+  Wrote recommendation.md + recommendation.html + simulation.json to benchmark-results/
   Wrote schematic.svg to benchmark-results/
 ```
 
@@ -203,16 +205,17 @@ deployments split hot and cold paths:
   queries; only full-retention backends compete (a cache that evicted
   the data can't fake-win a query it can't actually answer).
 
-Within each track:
+Each track's winner is decided by **counting wins**: for every query in
+that track, whichever backend has the lowest median latency gets a point,
+and the backend with the most points wins the track — reported as "wins N
+of M" (e.g. "wins 4/4 live queries"). This replaced an earlier weighted
+Score/Coverage model that didn't hold up under scrutiny (see CLAUDE.md
+§10 — a single slow outlier query could blow a weighted average up to
+4+ digits with no interpretable meaning). The full per-query breakdown —
+who won each individual query, and at what cost per million queries — is
+in `recommendation.md`'s per-query dashboard.
 
-- **Score** = weighted average of (this backend's median latency / the
-  per-query winner's median latency), across every query in this
-  building's derived mix. **1.00 = this backend won every weighted
-  query.** Higher is worse.
-- **Coverage** = fraction of the weighted queries this backend has data
-  for. Check coverage before trusting a score.
-
-All scores come from the **steady-state checkpoint** — the building at
+All wins are counted at the **steady-state checkpoint** — the building at
 retention-full, actively-evicting age — while the growth-curve table shows
 how each query's latency evolved from day 1 to get there.
 

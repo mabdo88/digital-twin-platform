@@ -8,10 +8,10 @@ Pick the executable for your platform and save it somewhere on your computer.
 
 | Platform | File | Size |
 |----------|------|------|
-| **Windows** (x86-64) | `dt.exe` | 1.6 MB |
-| **Linux** (x86-64) | `dt-linux` | 9.0 MB |
+| **Windows** (x86-64) | `dt.exe` | 1.7 MB |
+| **Linux** (x86-64) | `dt-linux` | 9.3 MB |
 | **macOS** (Intel/x86-64) | `dt-macos-x86_64` | 1.3 MB |
-| **macOS** (Apple Silicon/ARM) | `dt-macos-aarch64` | 1.1 MB |
+| **macOS** (Apple Silicon/ARM) | `dt-macos-aarch64` | 1.2 MB |
 
 ### Quick start
 
@@ -43,7 +43,7 @@ See [`HOW_TO_USE.md`](../HOW_TO_USE.md) in the root directory for:
 If you prefer to build it yourself or need a different target:
 
 ```sh
-git clone <this-repo>
+git clone https://github.com/mabdo88/digital-twin-platform.git
 cd digital-twin-platform
 zig build
 zig-out/bin/dt --bim model.ifc
