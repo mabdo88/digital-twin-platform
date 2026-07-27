@@ -112,8 +112,12 @@ pub const DEFAULT_RULES = [_]PlacementRule{
 };
 
 /// Set of equipment element types that get EquipmentMetadata but no sensors.
-/// Used by isEquipmentType() in resolveHierarchy (ifc_parser.zig) and by
-/// tests that count equipment.
+/// Used by isEquipmentType() below (this file's own placement decisions)
+/// and by tests that count equipment. ifc_parser.zig's resolveHierarchy
+/// independently hand-lists this same 11-type set inline in a switch arm
+/// (it decides whether to emit EquipmentMetadata; this decides whether to
+/// place a sensor) — the two lists are not single-sourced, so a new
+/// equipment ElementType needs adding to both.
 pub const EQUIPMENT_TYPES = [_]ElementType{
     .flow_terminal,
     .flow_fitting,
@@ -128,8 +132,9 @@ pub const EQUIPMENT_TYPES = [_]ElementType{
     .cable_segment,
 };
 
-/// Returns true if the ElementType is one of the granular equipment types
-/// (used by ifc_parser.zig to decide whether to emit EquipmentMetadata).
+/// Returns true if the ElementType is one of the granular equipment types —
+/// used by place() below to give equipment a fixed 1 sensor instead of the
+/// area-based density that applies to zones/rooms.
 pub fn isEquipmentType(et: ElementType) bool {
     inline for (EQUIPMENT_TYPES) |t| if (et == t) return true;
     return false;

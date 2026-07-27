@@ -70,10 +70,6 @@ const generateDatasetScaled = fixtures.generateDatasetScaled;
 const insertDataset = fixtures.insertDataset;
 const DatasetSpec = fixtures.DatasetSpec;
 const scale_tiers = fixtures.scale_tiers;
-const NUM_SENSORS = fixtures.NUM_SENSORS;
-const READINGS_PER_SENSOR = fixtures.READINGS_PER_SENSOR;
-const BASE_TIMESTAMP = fixtures.BASE_TIMESTAMP;
-const MS_PER_HOUR = fixtures.MS_PER_HOUR;
 
 // ---------------------------------------------------------------------------
 // Equivalence tests — every backend must return identical results for every

@@ -330,6 +330,13 @@ pub fn rangeByTime(self: *const Self, allocator: std.mem.Allocator, q: RangeQuer
         if (part.max_ts < q.start_time or part.min_ts > q.end_time) continue;
 
         if (!part.sorted) self_mut.ensurePartitionSorted(part);
+        // OOM here only costs this partition its memory-saving compression
+        // pass for this call — the scan below reads the raw timestamps/
+        // sensor_ids/values columns directly (ts_items, a few lines down),
+        // which stay valid regardless of whether compression succeeded.
+        // Unlike getLatestBySensor above, this call *could* propagate (the
+        // caller is already `!`), but doing so would abort a query that can
+        // otherwise complete correctly over a slightly-less-compact partition.
         self_mut.ensurePartitionCompressed(part) catch {};
         self_mut.ensureGranuleIndex(part);
 
@@ -504,21 +511,31 @@ fn ensurePartitionSorted(self: *Self, part: *Partition) void {
         }
     }.lt);
 
-    permuteColumn(u32, self.allocator, part.sensor_ids.items, idx) catch return;
-    permuteColumn(i64, self.allocator, part.timestamps.items, idx) catch return;
-    permuteColumn(f32, self.allocator, part.values.items, idx) catch return;
+    // Pre-allocate every column's scratch buffer before permuting any of
+    // them: sensor_ids/timestamps/values must move in lockstep, so if one
+    // allocation fails partway through, the partition must come out of this
+    // function either fully sorted or fully untouched — never with one
+    // column reordered and the others not, which would silently pair each
+    // row with the wrong sensor_id/timestamp/value forever after (the
+    // original order is unrecoverable once even one column is permuted).
+    const sid_tmp = self.allocator.alloc(u32, n) catch return;
+    defer self.allocator.free(sid_tmp);
+    const ts_tmp = self.allocator.alloc(i64, n) catch return;
+    defer self.allocator.free(ts_tmp);
+    const val_tmp = self.allocator.alloc(f32, n) catch return;
+    defer self.allocator.free(val_tmp);
+
+    applyPermutation(u32, part.sensor_ids.items, sid_tmp, idx);
+    applyPermutation(i64, part.timestamps.items, ts_tmp, idx);
+    applyPermutation(f32, part.values.items, val_tmp, idx);
 
     part.sorted = true;
     part.compressed = false;
     part.index_valid = false;
 }
 
-fn permuteColumn(comptime T: type, allocator: std.mem.Allocator, items: []T, idx: []const usize) !void {
-    const tmp = try allocator.alloc(T, items.len);
-    defer allocator.free(tmp);
-    for (0..items.len) |i| {
-        tmp[i] = items[idx[i]];
-    }
+fn applyPermutation(comptime T: type, items: []T, tmp: []T, idx: []const usize) void {
+    for (0..items.len) |i| tmp[i] = items[idx[i]];
     @memcpy(items, tmp);
 }
 
@@ -753,21 +770,6 @@ fn mergeParts(self: *Self) !void {
     }
 
     self.parts_merged = true;
-}
-
-/// Decodes `ts_deltas` back into absolute timestamps. Used by tests to
-/// prove the compressed column round-trips losslessly — the same encoding
-/// `ensureCompressed` builds and `memoryUsed` reports the cost of.
-fn decodeTimestamps(allocator: std.mem.Allocator, deltas: []const u8, n: usize) ![]i64 {
-    const result = try allocator.alloc(i64, n);
-    var pos: usize = 0;
-    var prev: i64 = 0;
-    for (0..n) |i| {
-        const delta = zigzagDecode(readVarint(deltas, &pos));
-        prev +%= delta;
-        result[i] = prev;
-    }
-    return result;
 }
 
 /// Maps signed deltas to unsigned so small magnitudes (positive or

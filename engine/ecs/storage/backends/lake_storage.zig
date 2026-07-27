@@ -448,17 +448,9 @@ fn compactPartition(self: *Self, part: *Partition, cutoff_timestamp: i64) !void 
         try appendVarint(self.allocator, &new_ts_deltas, zigzagEncode(new_delta));
         new_last_ts = prev_ts;
 
-        // Re-encode sensor_id into new dictionary.
-        var dict_idx: u16 = 0;
-        for (new_sid_dict.items, 0..) |d_sid, j| {
-            if (d_sid == sid) {
-                dict_idx = @intCast(j);
-                break;
-            }
-        } else {
-            dict_idx = @intCast(new_sid_dict.items.len);
-            try new_sid_dict.append(self.allocator, sid);
-        }
+        // Re-encode sensor_id into new dictionary — same helper insert()
+        // uses, so the u16-overflow guard applies here too.
+        const dict_idx = try sb.dictionaryIndex(self.allocator, &new_sid_dict, sid);
         try new_sid_indices.append(self.allocator, dict_idx);
         try new_values.append(self.allocator, val);
         new_count += 1;
