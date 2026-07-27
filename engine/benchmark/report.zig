@@ -691,7 +691,7 @@ fn writeHtmlReport(
     try html.print(allocator, "<h1>Digital Twin <span class=\"accent\">Multi-Scale Benchmark</span></h1>\n", .{});
     try html.print(allocator, "<div class=\"subtitle\">{d} specialized backends · {d} scales · pick by workload, not by average</div>\n", .{ backend_roster.len, unique_scales.items.len });
     try html.print(allocator, "<div class=\"meta-row\">\n", .{});
-    try html.print(allocator, "<span class=\"chip\"><strong>Iterations</strong>25 / measurement</span>\n", .{});
+    try html.print(allocator, "<span class=\"chip\"><strong>Iterations</strong>{d} / measurement</span>\n", .{fixtures.scale_tiers[0].iterations});
     try html.print(allocator, "<span class=\"chip\"><strong>Seed</strong>{d}</span>\n", .{fixtures.SEED});
     try html.print(allocator, "<span class=\"chip\"><strong>Backends</strong>{d} (", .{backend_roster.len});
     for (backend_roster, 0..) |b, i| {

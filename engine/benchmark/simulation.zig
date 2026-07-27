@@ -49,9 +49,8 @@ pub const SIM_START_MS: i64 = 1_700_000_000_000; // 2023-11-14T22:13:20Z
 /// the oldest) keeps only the most recent capacity. `setRetentionHint` is a
 /// genuine no-op on every full-retention backend, so applying it
 /// unconditionally caps only RingBuffer. Because RingBuffer thus holds a
-/// fraction of the data most queries need, it competes only in the compound
-/// recommendation's real-time track (report.recommendCompound), never the
-/// historical one.
+/// fraction of the data most queries need, it competes only in the
+/// real-time track (report.pickTrackWinners), never the historical one.
 pub const RINGBUFFER_CAP_FLOOR: usize = 10;
 
 /// RingBuffer capacity for a building whose fastest-sampling placed type
@@ -570,8 +569,8 @@ const DaySource = union(enum) {
 /// `replay_dir`); every later backend replays that file — generation
 /// happens once, but only ONE backend's history is ever resident in RAM.
 /// The final (steady-state) checkpoint additionally times the type-scoped
-/// per-type queries and emits the RunRows that feed recommendCompound —
-/// the headline recommendation is grounded in steady state; earlier
+/// per-type queries and emits the RunRows that feed report.pickTrackWinners
+/// — the headline recommendation is grounded in steady state; earlier
 /// checkpoints only feed the growth curve.
 ///
 /// The caller owns `replay_dir` and deletes REPLAY_FILE_NAME after the run.
