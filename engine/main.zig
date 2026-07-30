@@ -677,6 +677,10 @@ fn writeRecommendationReport(
     }
 
     try md.print(allocator, "\n> Honesty headline: relative rankings are reliable; absolute numbers are approximate (CLAUDE.md §6).\n\n", .{});
+    // Points at the calibration pass without claiming it ran for this
+    // building — it never does. Calibration validates the query
+    // implementations these numbers come from, on its own fixed dataset.
+    try md.print(allocator, "> Independently checked: the 12 query implementations behind these numbers are validated against DuckDB by `zig build calibrate` (same data, same questions, answers compared). That pass runs on its own fixed dataset and is not part of this building's run.\n\n", .{});
 
     {
         var storey_count: u32 = 0;

@@ -18,6 +18,7 @@
 
 const std = @import("std");
 const sb = @import("../ecs/storage/storage_backend.zig");
+const world_mod = @import("../ecs/world.zig");
 
 // ---------------------------------------------------------------------------
 // Topology — how the synthetic sensor grid maps onto zones and floors.
@@ -58,6 +59,39 @@ pub fn sensorTypeForScaled(sensor_id: u32) sb.SensorType {
         2 => .co2,
         3 => .occupancy,
         else => .energy,
+    };
+}
+
+// ---------------------------------------------------------------------------
+// The fixture's topology convention, as functions rather than formulas
+// inlined at each use site. `insertDataset` below registers exactly these
+// values into the World; anything that needs to describe the same fixture
+// to an outside system (calibration/duckdb_adapter.zig exports them as a
+// `sensors` dimension table for DuckDB) must derive them from here rather
+// than re-deriving the arithmetic — a second copy of these three formulas
+// is a silent-divergence bug waiting to happen, and it would make an
+// outside engine disagree with us for reasons that have nothing to do with
+// storage layout.
+// ---------------------------------------------------------------------------
+
+/// Zone a sensor belongs to under the fixture convention.
+pub fn zoneOf(sensor_id: u32) u32 {
+    return sensor_id / SENSORS_PER_ZONE;
+}
+
+/// Floor a zone belongs to under the fixture convention.
+pub fn floorOf(zone_id: u32) u32 {
+    return zone_id / ZONES_PER_FLOOR;
+}
+
+/// Fixture spatial convention: a corridor grid, 5 m apart along X, 3 m per
+/// floor along Y. The live path registers real parsed ZoneLocation.position
+/// instead (see insertDataset's comment).
+pub fn positionOf(sensor_id: u32) world_mod.Position {
+    return .{
+        .x = @as(f32, @floatFromInt(sensor_id % 10)) * 5.0,
+        .y = @as(f32, @floatFromInt(sensor_id / 10)) * 3.0,
+        .z = 0.0,
     };
 }
 
@@ -170,20 +204,15 @@ pub fn insertDataset(world: anytype, readings: []const sb.SensorReading) !void {
         try world.insert(r);
         if (!registered.contains(r.sensor_id)) {
             try registered.put(r.sensor_id, {});
-            const zone_id = r.sensor_id / SENSORS_PER_ZONE;
-            const floor_id = zone_id / ZONES_PER_FLOOR;
+            const zone_id = zoneOf(r.sensor_id);
+            const floor_id = floorOf(zone_id);
             try world.registerZone(r.sensor_id, zone_id);
             try world.registerFloor(zone_id, floor_id);
             // Fixture spatial convention (this file is the one sanctioned
             // home for synthetic topology, same as the zone/floor formulas
-            // above): a corridor grid, 5 m apart along X, 3 m per floor
-            // along Y. The live path registers real parsed
+            // above). The live path registers real parsed
             // ZoneLocation.position instead.
-            try world.registerPosition(r.sensor_id, .{
-                .x = @as(f32, @floatFromInt(r.sensor_id % 10)) * 5.0,
-                .y = @as(f32, @floatFromInt(r.sensor_id / 10)) * 3.0,
-                .z = 0.0,
-            });
+            try world.registerPosition(r.sensor_id, positionOf(r.sensor_id));
         }
     }
 }

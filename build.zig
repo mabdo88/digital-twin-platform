@@ -17,6 +17,7 @@ pub fn build(b: *std.Build) void {
         "engine/bim_test.zig",
         "engine/synthetic_test.zig",
         "engine/sim_test.zig",
+        "engine/calibrate_main.zig",
         "engine/main.zig",
     };
     for (test_targets) |t| {
@@ -89,4 +90,27 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(main_exe);
     const run_step = b.step("run", "Build dt (ReleaseFast; run zig-out/bin/dt directly to pass --bim/--out flags)");
     run_step.dependOn(&run_main.step);
+
+    // Optional DuckDB calibration pass — checks our answers and our
+    // cost profile against a real SQL engine (CLAUDE.md §6, Phase 8).
+    // ReleaseFast for the same reason as dt/dtb: it measures.
+    //
+    // Nothing about DuckDB is a build dependency. This step compiles and
+    // runs with no duckdb binary present; the pass reports itself skipped
+    // and exits 0, so `zig build calibrate` is safe in any environment.
+    const calibrate_exe = b.addExecutable(.{
+        .name = "dtc",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("engine/calibrate_main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_calibrate = b.addRunArtifact(calibrate_exe);
+    b.installArtifact(calibrate_exe);
+    // No arg forwarding here — this Zig version has no `b.args`, and the
+    // `run` step above sets the convention: run zig-out/bin/dtc directly to
+    // pass flags.
+    const calibrate_step = b.step("calibrate", "Run the optional DuckDB calibration pass (ReleaseFast); run zig-out/bin/dtc directly to pass --duckdb/--out flags");
+    calibrate_step.dependOn(&run_calibrate.step);
 }
