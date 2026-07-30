@@ -13,6 +13,16 @@ benchmark-results-office/
 # Run outputs from older commits — same category as smoke-out*/house-results.
 output/
 
+# `zig build calibrate` output — regenerable, same category as
+# benchmark-results/. Includes the exported CSV fixture (~30 MB).
+calibration-results/
+
+# Local copy of the DuckDB CLI for the optional calibration pass. A
+# machine-local, platform-specific third-party binary: developers who want
+# the pass download their own (see CLAUDE.md §7), and nothing in the build
+# depends on it being here.
+tools/
+
 # subagent-driven-development scratch state (progress ledger, task briefs,
 # review packages) — never tracked.
 .superpowers/

@@ -35,6 +35,12 @@ rather than assumes.
   **storage abstraction** — the same queries run unchanged across every backend.
 - **Domain:** Digital twin / building IoT.
 - **No external database dependencies.** Every storage backend is pure in-process Zig.
+  **One documented exception, and it is not a backend:** the optional calibration pass
+  (`engine/calibration/duckdb_adapter.zig`, `zig build calibrate`) shells out to a
+  `duckdb` CLI binary via `std.process.run` to check our query answers against a real
+  SQL engine (§6). It is not linked, not a build dependency, and not on any code path
+  `dt`/`dtb` use — with no binary present the pass reports itself skipped and exits 0.
+  Nothing else in the repo may talk to an external engine.
 - **Headless.** No Vulkan, no GLFW, no rendering of any kind.
 - **Cross-platform.** Must build and run unmodified on Windows, Linux, and macOS.
   Use only `std.fs` / `std.process` / `std.Io` — no OS-specific APIs, no shell-outs
@@ -144,7 +150,8 @@ engine/
 │   ├── cost_model.zig          // Cloud-cost estimation
 │   └── report.zig              // Report generation (MD + JSON + HTML)
 ├── calibration/
-│   └── duckdb_adapter.zig      // Optional real-engine validation
+│   └── duckdb_adapter.zig      // Optional real-engine validation (§6)
+├── calibrate_main.zig          // `dtc` entry point (engine/ level, see its header)
 └── main.zig                    // Entry point
 ```
 
@@ -183,8 +190,27 @@ planners, allocator strategies, durability (WAL/fsync), concurrent connections.
 **Honest headline (must appear in every report):** the benchmarks tell you whether a
 columnar layout beats a time-series log *for your workload*. They do **not** tell you
 whether ClickHouse answers in 80 ms or 800 ms. Absolute numbers are approximate;
-**relative rankings are reliable.** The optional DuckDB calibration pass and a
-±2× sanity check guard against gross magnitude errors.
+**relative rankings are reliable.**
+
+**The DuckDB calibration pass** (`zig build calibrate`, built 2026-07-30) is the one
+outside witness. Every other test compares our backends against *each other*, which
+cannot catch a mistake all of them share; calibration hands the same rows to DuckDB and
+asks the same 12 questions. What it checks, in order of how much it establishes:
+
+1. **Value agreement** — DuckDB's answers vs ours, per backend per query. A mismatch is
+   a real defect in our query/storage layer. Exact to a 1e-5 relative tolerance;
+   verified sensitive enough to catch a one-hour error in a 24-hour window.
+2. **Cost-profile agreement** — Spearman rank correlation on per-query latency. Coarse
+   by construction (12 points, DuckDB's timer resolves to whole milliseconds); catches
+   a badly wrong cost profile, not a subtly wrong one.
+3. **Slower-than-DuckDB guard** — flags any query where we are >2× slower than DuckDB.
+
+Note what calibration **cannot** do: it cannot validate the storage-layout rankings.
+DuckDB is columnar-only with no analogue of a per-sensor append log or a ring buffer, so
+"TimeSeries vs Columnar" is not a question any outside engine can answer. Only half of
+AGENT.md's original symmetric "±2× either way" gate is implemented, and deliberately —
+being ~10,000× faster than a planner-bearing DBMS on a scoped query is the expected
+outcome, so gating on it would fire everywhere and mean nothing.
 
 ---
 
@@ -195,8 +221,15 @@ zig build                 # compile the platform
 zig build test            # run unit + golden-result tests (fast, -ODebug)
 zig build test-integration # run end-to-end pipeline tests against real IFC files (-OReleaseFast — see below)
 zig build bench           # run the full benchmark suite
+zig build calibrate       # optional: validate our query answers against DuckDB
 zig build run -- --bim path/to/model.ifc --out results-dir
 ```
+
+`calibrate` needs a `duckdb` CLI binary and skips cleanly (exit 0) without one, so it is
+safe to run anywhere. It probes PATH first, then `./tools/duckdb` — the gitignored spot
+to drop a local copy without installing it system-wide. Run `zig-out/bin/dtc` directly to
+pass `--duckdb <path>`, `--out <dir>`, `--sensors`, `--readings`, or `--iterations`.
+Exit 1 means it ran and disagreed with us, which is a defect to investigate, not a flake.
 
 `test-integration` (added 2026-07-20, `engine/integration_test.zig`) drives `main.zig`'s
 `runPipeline` directly against real files in `assets/IFC/` and asserts on the actual
@@ -307,8 +340,18 @@ The same folder also holds **status docs** (read as current state, not as proced
   deliberately tiny real-time-only cache; its existing eviction (capacity+1th
   write evicts oldest) handles it. See `storage-redesign-plan.md` for the
   original reasoning and `sequential-execution-and-audit.md` for the revision.
-- **Calibration:** DuckDB is the primary calibration; vendor benchmarks are optional
-  metadata. Not yet built (Phase 8).
+- **Calibration — resolved 2026-07-30, built:** DuckDB is the calibration, via a CLI
+  subprocess (`zig build calibrate`); vendor benchmarks remain optional metadata and are
+  still not built. Three decisions were forced and are recorded here rather than
+  hard-coded silently: (1) **transport** — a CLI subprocess, not linked `libduckdb`,
+  because the pass has to be optional and `zig build` must never depend on DuckDB;
+  (2) **criterion** — value agreement is the primary check, not the latency comparison
+  AGENT.md described, because our no-planner backends are always faster and that
+  comparison cannot detect a defect; (3) **dataset** — a dedicated 876k-row seeded
+  fixture, not the 50k-row regression fixture (too small for DuckDB's timings to mean
+  anything) nor a real per-building sim run (~163M readings). Result at build time: 0
+  value mismatches across 4 backends × 12 queries. See §6 and
+  `.cascade/digital-twin/backend-audit.md`'s 2026-07-30 entry.
 
 If a task forces one of these decisions, surface it in the PR description rather than
 quietly hard-coding a choice.

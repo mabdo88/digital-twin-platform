@@ -202,14 +202,29 @@ cloud pricing), and recommendations change sensibly as workload changes.
 ### Phase 8: Calibration & Validation
 **Goal:** Compare against DuckDB to catch gross errors (±2× sanity check).
 
-- [ ] Optional DuckDB adapter: ingest the same benchmark workload into DuckDB.
-- [ ] Compare median latencies (DuckDB should be faster; we're measuring *relative*
-      storage wins, not absolute speed).
-- [ ] Flag if any backend is >2× slower than DuckDB or >2× faster (likely measurement bug).
-- [ ] Document calibration in the report.
+- [x] Optional DuckDB adapter: ingest the same benchmark workload into DuckDB.
+      Built 2026-07-30 as `engine/calibration/duckdb_adapter.zig` + `zig build calibrate`.
+      A CLI subprocess, not a linked library, so DuckDB is never a build dependency.
+- [x] Compare latencies (DuckDB should be faster; we're measuring *relative*
+      storage wins, not absolute speed) — reported as a Spearman rank correlation on
+      the per-query cost profile, plus per-query speedups as raw data.
+- [x] **Superseded, not implemented as written:** "flag if any backend is >2× slower
+      than DuckDB or >2× faster". Only the "slower" half is a gate. The "faster" half
+      would fire on essentially every query — our backends have no SQL parse, no
+      planner and no page cache, so measured speedups run from 3× to 130,000× and are
+      the expected outcome, not a measurement bug. Replaced by a **value-agreement**
+      check as the primary criterion: DuckDB's computed answers vs ours, per backend
+      per query. That is what actually catches a defect, and it is not subject to
+      timing noise. See CLAUDE.md §6.
+- [x] Document calibration in the report — `latency.md`, `benchmark.html` and the
+      per-building `recommendation.md` each carry a note pointing at the pass and its
+      own report, without claiming calibration numbers they don't have.
 
-**Hand off when:** Calibration runs without crashing, DuckDB numbers are plausible,
-and reports include a calibration note.
+**Handed off 2026-07-30:** calibration runs clean, DuckDB's numbers are plausible
+(fixed per-query floor measured at ~0.6 ms against several ms of real work), and 0
+value mismatches across 4 backends × 12 query patterns. The check was verified to
+have teeth by deliberately widening one SQL window by one hour and confirming it
+failed on all four backends.
 
 ---
 

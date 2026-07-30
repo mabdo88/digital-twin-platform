@@ -268,6 +268,36 @@ separate step (built `-OReleaseFast`) because simulated duration depends on
 the building's own retention windows — up to ~7 years of simulated time —
 which would be minutes-to-hours slower under `-ODebug`.
 
+### Checking the answers against a real database (optional)
+
+Both of the above compare this platform against *itself*: every backend must
+agree with every other backend. That can't catch a mistake they all share. For
+that there is one more step:
+
+```sh
+zig build calibrate
+```
+
+It generates a fixed 876,000-row sensor dataset, loads it into
+[DuckDB](https://duckdb.org) as well as into our own backends, asks both the
+same 12 questions, and compares the answers. A disagreement means a real defect
+in this platform, not a tuning issue. Results land in
+`calibration-results/calibration.md`.
+
+You need the DuckDB CLI for this. Without it the step prints a short note and
+exits successfully, so it's safe to run either way. It looks on your `PATH`
+first, then in `./tools/duckdb`; to point it somewhere else, run the binary
+directly:
+
+```sh
+zig-out/bin/dtc --duckdb /path/to/duckdb
+```
+
+Exit code 1 means it ran and disagreed with us — worth investigating, not a
+flake. What it can't tell you: which storage layout is best. DuckDB has no
+equivalent of our per-sensor log or ring buffer, so that comparison isn't one
+any outside engine can make.
+
 ---
 
 ## Troubleshooting

@@ -532,6 +532,11 @@ pub fn writeReports(
     try md.print(allocator, "- Historical rollups (Q7, Q8) exclude RingBuffer (evicts old data).\n\n", .{});
 
     try md.print(allocator, "> Honesty headline: **relative rankings are reliable; absolute numbers are approximate.**\n\n", .{});
+    // Deliberately states only that the pass exists and where its verdict
+    // lives — this report has no calibration numbers of its own, and
+    // implying otherwise would be the kind of unearned claim §6 exists to
+    // prevent. Calibration runs on its own dataset, on demand.
+    try md.print(allocator, "> Independently checked: `zig build calibrate` runs the same 12 query patterns through DuckDB on identical data and compares the answers. Its verdict is written to `calibration-results/calibration.md` and is **not** part of this run.\n\n", .{});
 
     // Per-scale sections
     for (fixtures.scale_tiers) |ds| {
@@ -702,6 +707,9 @@ fn writeHtmlReport(
     try html.print(allocator, "<span class=\"chip\"><strong>Scales</strong>{d}</span>\n", .{unique_scales.items.len});
     try html.print(allocator, "</div>\n", .{});
     try html.print(allocator, "<div class=\"honesty\"><strong>⚠ Honesty headline:</strong> relative rankings are reliable; absolute numbers are approximate.</div>\n", .{});
+    // Same wording and same reason as the Markdown note above: point at the
+    // calibration pass, claim nothing about this run's numbers.
+    try html.print(allocator, "<div class=\"honesty\"><strong>Independently checked:</strong> <code>zig build calibrate</code> runs the same 12 query patterns through DuckDB on identical data and compares the answers. Its verdict is written to <code>calibration-results/calibration.md</code> and is <strong>not</strong> part of this run.</div>\n", .{});
     try html.print(allocator, "</header>\n", .{});
 
     // Section 1: Per-query latency by scale

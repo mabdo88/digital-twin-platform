@@ -39,8 +39,15 @@ zig build                 # compile to zig-out/bin/ (dt/dtb always build Release
 zig build test            # run all unit + golden-result equivalence tests (fast, -ODebug)
 zig build test-integration # run end-to-end pipeline tests against real IFC files (-OReleaseFast)
 zig build bench           # run the full benchmark suite, write reports to ./benchmark-results/
+zig build calibrate       # optional: check our query answers against a real DuckDB
 zig-out/bin/dt --bim path/to/model.ifc   # run against a real building (see HOW_TO_USE.md)
 ```
 
 Requires Zig master (tested against 0.16.0 / 0.17.0-dev). No external
 dependencies.
+
+`calibrate` is the one step that can use an outside tool: it hands the same
+data to the [DuckDB](https://duckdb.org) CLI and checks that a real SQL engine
+computes the same answers our backends do. It is entirely optional — with no
+`duckdb` binary present it reports itself skipped and exits 0, and nothing else
+in the build touches it.
