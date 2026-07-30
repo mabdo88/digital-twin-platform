@@ -779,7 +779,10 @@ fn resolveHierarchy(arena: Allocator, entities: *std.AutoHashMapUnmanaged(u32, E
                     .area_m2 = 0,
                 });
             },
-            .flow_terminal, .flow_fitting, .flow_controller, .flow_moving_device, .flow_storage_device, .energy_conversion_device, .distribution_control_element, .building_element_proxy, .electric_appliance, .alarm, .cable_segment => {
+            // Equipment: the type set is single-sourced in components.zig
+            // (`isEquipment`) because sensor_placer needs the same answer for
+            // its own placement decision — see that function's comment.
+            else => if (components.isEquipment(etype)) {
                 const props = equipment_props.get(e.id);
                 try equipment.append(arena, .{
                     .element_id = e.id,
@@ -787,7 +790,6 @@ fn resolveHierarchy(arena: Allocator, entities: *std.AutoHashMapUnmanaged(u32, E
                     .model = if (props) |p| (p.model orelse "") else "",
                 });
             },
-            else => {},
         }
     }
 

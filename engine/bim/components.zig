@@ -73,6 +73,48 @@ pub const ElementType = enum {
     other,
 };
 
+/// Is this one of the granular MEP/electrical equipment types — the subset
+/// that carries EquipmentMetadata and is counted as an individual item
+/// rather than an area?
+///
+/// Single-sourced here, on the enum's own module, because two independent
+/// consumers need exactly the same answer: `ifc_parser.resolveHierarchy`
+/// (whether to emit EquipmentMetadata for an element) and
+/// `sensor_placer.place` (fixed 1 sensor per type instead of the area-based
+/// density that applies to zones). They previously hand-listed the same 11
+/// types separately, with nothing to catch them diverging.
+///
+/// The switch is deliberately exhaustive — no `else` arm — so adding a new
+/// ElementType above is a compile error until it is classified here.
+pub fn isEquipment(et: ElementType) bool {
+    return switch (et) {
+        .flow_terminal,
+        .flow_fitting,
+        .flow_controller,
+        .flow_moving_device,
+        .flow_storage_device,
+        .energy_conversion_device,
+        .distribution_control_element,
+        .building_element_proxy,
+        .electric_appliance,
+        .alarm,
+        .cable_segment,
+        => true,
+
+        .project,
+        .site,
+        .building,
+        .storey,
+        .space,
+        .wall,
+        .slab,
+        .beam,
+        .flow_segment,
+        .other,
+        => false,
+    };
+}
+
 /// What kind of zone this is — the subset of ElementType that participates
 /// in zone-level queries (storey, space). Used to discriminate ZoneMetadata
 /// rows from non-zone BuildingElement rows without re-parsing the type.

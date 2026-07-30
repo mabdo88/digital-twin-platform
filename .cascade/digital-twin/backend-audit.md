@@ -319,3 +319,19 @@ Same spirit as the 2026-07-07 pass, requested explicitly ("check every storage o
 **Not changed:** `main.zig`'s twice-computed `all_backend_names` comptime array (harmless redundancy, both call sites are comptime-identical by construction) — logged but left alone, low severity, and CLAUDE.md's anti-premature-abstraction rule argues against restructuring call sites just to remove a few duplicated lines. Also not changed: `ifc_validation_test.zig` is a one-line stub (`// Tests removed.`) that this file and `docs/IFC_SUPPORT.md` still describe as running real end-to-end validation against two Revit IFC fixtures — that's a real coverage gap, not just a stale comment, and restoring it is a test-writing task outside this cleanup pass's scope.
 
 **Verification.** Full suite green (`zig build test` — 57 tests — and `zig build test-integration` — 80 tests including two real end-to-end IFC runs) after every fix in this entry, not just the comment corrections.
+
+---
+
+## Equipment-type list drift closed: single-sourced on the enum, guarded by exhaustiveness (2026-07-30)
+
+**Closes the item the 2026-07-27 entry above flagged but deliberately left open.** That pass found `sensor_placer.zig`'s `EQUIPMENT_TYPES` and `ifc_parser.resolveHierarchy`'s inline switch arm hand-listing the same 11 equipment `ElementType`s independently, and chose to correct the misleading comment rather than unify — on the grounds that unifying "would mean threading a cross-module dependency between the parser and the placer."
+
+**That premise was wrong, which is why this is now fixed rather than re-flagged.** No parser↔placer dependency is needed: both modules already import `components.zig`, where `ElementType` itself is defined. The classification is a property of the taxonomy, not of either consumer, so it belongs there. Added `components.isEquipment(ElementType) bool`; `sensor_placer` now calls it directly (its local `EQUIPMENT_TYPES` array and `isEquipmentType` wrapper deleted — both were only used at one call site inside that file, despite the old comment claiming tests consumed the array), and `resolveHierarchy`'s eleven-type switch arm collapsed into `else => if (components.isEquipment(etype))`.
+
+**The real win is the guard, not the deduplication.** `isEquipment` is written as an **exhaustive** switch — every `ElementType` listed explicitly, no `else` arm — so adding a member to the enum is a **compile error** until it is classified as equipment or not. That is strictly stronger than what a shared list would have given: a shared array removes the second copy but still silently accepts a new type as non-equipment. Note this deliberately rules out the more compact `else => false`, which would compile fine and reintroduce exactly the silent-default behavior the guard exists to prevent — keep the arms exhaustive if this function is ever edited.
+
+**Verified the guard actually fires** rather than assuming it: temporarily added a `drift_probe_tmp` member to `ElementType` and confirmed `zig build` fails with `components.zig:91:12: error: switch must handle all possibilities` / `note: unhandled enumeration value: 'drift_probe_tmp'`, then reverted the probe.
+
+**No new test.** With one source of truth, a test asserting "the parser and the placer agree" would be tautological, and one asserting `isEquipment`'s table would just restate the table it's checking. The compile-time exhaustiveness check is the coverage; behavior is otherwise unchanged (the new `else` arm reaches the same 11 types, and `.other` is still skipped earlier via `continue`).
+
+**Verification.** `zig build test` (39 + 2 tests) and `zig build test-integration` (80 tests, including the two real end-to-end IFC runs) both green.
