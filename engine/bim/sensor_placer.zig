@@ -111,35 +111,6 @@ pub const DEFAULT_RULES = [_]PlacementRule{
     },
 };
 
-/// Set of equipment element types that get EquipmentMetadata but no sensors.
-/// Used by isEquipmentType() below (this file's own placement decisions)
-/// and by tests that count equipment. ifc_parser.zig's resolveHierarchy
-/// independently hand-lists this same 11-type set inline in a switch arm
-/// (it decides whether to emit EquipmentMetadata; this decides whether to
-/// place a sensor) — the two lists are not single-sourced, so a new
-/// equipment ElementType needs adding to both.
-pub const EQUIPMENT_TYPES = [_]ElementType{
-    .flow_terminal,
-    .flow_fitting,
-    .flow_controller,
-    .flow_moving_device,
-    .flow_storage_device,
-    .energy_conversion_device,
-    .distribution_control_element,
-    .building_element_proxy,
-    .electric_appliance,
-    .alarm,
-    .cable_segment,
-};
-
-/// Returns true if the ElementType is one of the granular equipment types —
-/// used by place() below to give equipment a fixed 1 sensor instead of the
-/// area-based density that applies to zones/rooms.
-pub fn isEquipmentType(et: ElementType) bool {
-    inline for (EQUIPMENT_TYPES) |t| if (et == t) return true;
-    return false;
-}
-
 pub const PlacementConfig = struct {
     rules: []const PlacementRule = &DEFAULT_RULES,
     /// Effective area used when the matching ZoneMetadata.area_m2 is 0 (the
@@ -209,7 +180,7 @@ pub fn place(
         // Effective area: real zone area if known, else fallback.
         // Equipment types (individual items, not area-based) get fixed
         // 1 sensor per type — density doesn't apply to a single pump.
-        const is_equipment = isEquipmentType(elem.element_type);
+        const is_equipment = components.isEquipment(elem.element_type);
         const raw_area: f64 = area_of.get(elem.ifc_id) orelse 0;
         const eff_area: f64 = if (raw_area > 0) raw_area else config.default_unknown_area_m2;
 
