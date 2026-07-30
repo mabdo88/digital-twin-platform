@@ -1,6 +1,6 @@
 .{
     .name = .digital_twin_platform,
-    .version = "0.0.0",
+    .version = "1.1.0",
     .fingerprint = 0x106470eedd3980aa,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{},
